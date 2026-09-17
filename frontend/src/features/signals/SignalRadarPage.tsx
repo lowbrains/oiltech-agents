@@ -36,15 +36,18 @@ const EMPTY_FEEDBACK_DRAFT: FeedbackDraft = {
   comment: "",
 };
 
+// Шкала заказчика (список Виктора от 13.09). Это оценка ЧЕЛОВЕКА и она намеренно
+// отличается от maturity выше: та — оценка модели. «Наблюдать» встречается в обеих,
+// поэтому машинная подписана в карточке как «Зрелость», а эта — как «Оценка сигнала».
 const VERDICT_LABELS: Array<{ value: FeedbackDraft["verdict"]; label: string }> = [
-  { value: "", label: "Без вердикта" },
-  { value: "approved", label: "Полезный сигнал" },
-  { value: "reject", label: "Шум" },
-  { value: "merge_duplicate", label: "Дубль" },
-  { value: "needs_better_source", label: "Нужен источник сильнее" },
-  { value: "wrong_domain", label: "Не наша тема" },
-  { value: "bad_translation", label: "Плохой перевод" },
-  { value: "too_generic", label: "Слишком общее" },
+  { value: "", label: "Не оценено" },
+  { value: "strong_signal", label: "Сильный сигнал — вынести в дайджест / обсуждать" },
+  { value: "approved", label: "Полезный сигнал — релевантно, сохранить в базе" },
+  { value: "watch_later", label: "Наблюдать — рано, нужен следующий milestone" },
+  { value: "background_material", label: "Фоновый материал — benchmark или контекст" },
+  { value: "reject", label: "Низкая ценность / шум — по теме, но без новой ценности" },
+  { value: "wrong_domain", label: "Не релевантно — вне интересов Компании" },
+  { value: "merge_duplicate", label: "Дубль — тот же сигнал или технологический кластер" },
 ];
 
 export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: Props) {
@@ -240,11 +243,25 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                 <div className="signalRadarCardTop">
                   <div>
                     <div className="signalRadarMeta">
+                      {/* ID виден всегда: без него нельзя сослаться на дубль
+                          в поле «ID дубля» — заказчик спрашивал, где его взять. */}
+                      <span className="signalIdBadge">#{signal.id}</span>
                       <span className="signalTheme">{signal.theme}</span>
-                      <span>{MATURITY_LABELS[signal.maturity] || signal.maturity}</span>
+                      <span>Зрелость: {MATURITY_LABELS[signal.maturity] || signal.maturity}</span>
                       <span>{Math.round(Number(signal.score || 0))} баллов</span>
                       <span>{signal.evidence_count} ссылок</span>
                     </div>
+                    {/* Издатели показываются сразу, до раскрытия: «давай источник
+                        сделаем открытым сразу» — по нему судят о доверии к сигналу. */}
+                    {signal.evidence?.length ? (
+                      <div className="signalPublishers">
+                        {[...new Set((signal.evidence || []).map((item) => item.publisher).filter(Boolean))].map(
+                          (publisher) => (
+                            <span className="signalPublisherChip" key={publisher as string}>{publisher}</span>
+                          ),
+                        )}
+                      </div>
+                    ) : null}
                     <h2>{signal.title_ru || signal.title}</h2>
                   </div>
                   <div className="signalRadarActions">
@@ -253,7 +270,7 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                     </button>
                     {isAdmin ? (
                       <button type="button" className="ghostButton compactButton" onClick={() => toggleFeedback(signal.id)}>
-                        ОС
+                        Обратная связь
                       </button>
                     ) : null}
                     <button
@@ -297,7 +314,7 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                   <div className="signalFeedbackBox">
                     <div className="signalFeedbackGrid">
                       <label>
-                        <span>Вердикт</span>
+                        <span>Оценка сигнала</span>
                         <select
                           value={(feedbackDrafts[signal.id] || EMPTY_FEEDBACK_DRAFT).verdict}
                           onChange={(event) =>
@@ -320,15 +337,15 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                       </label>
                     </div>
                     <label className="signalFeedbackField">
-                      <span>Причина</span>
+                      <span>Обоснование оценки</span>
                       <input
                         value={(feedbackDrafts[signal.id] || EMPTY_FEEDBACK_DRAFT).reason}
                         onChange={(event) => updateFeedbackDraft(signal.id, { reason: event.target.value })}
-                        placeholder="почему полезно, шум, дубль или нужен источник сильнее"
+                        placeholder="чем обоснована оценка"
                       />
                     </label>
                     <label className="signalFeedbackField">
-                      <span>Правильный заголовок</span>
+                      <span>Рекомендуемый заголовок</span>
                       <input
                         value={(feedbackDrafts[signal.id] || EMPTY_FEEDBACK_DRAFT).correctedTitle}
                         onChange={(event) => updateFeedbackDraft(signal.id, { correctedTitle: event.target.value })}
@@ -336,7 +353,7 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                       />
                     </label>
                     <label className="signalFeedbackField">
-                      <span>Правильная суть</span>
+                      <span>Рекомендуемая формулировка сути</span>
                       <textarea
                         value={(feedbackDrafts[signal.id] || EMPTY_FEEDBACK_DRAFT).correctedThesis}
                         onChange={(event) => updateFeedbackDraft(signal.id, { correctedThesis: event.target.value })}
@@ -346,7 +363,7 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                     <textarea
                       value={(feedbackDrafts[signal.id] || EMPTY_FEEDBACK_DRAFT).comment}
                       onChange={(event) => updateFeedbackDraft(signal.id, { comment: event.target.value })}
-                      placeholder="Дополнительная ОС: термины, поисковый угол, сильный источник..."
+                      placeholder="Рекомендации AI-агенту: термины, поисковый угол, сильный источник..."
                     />
                     <div className="signalFeedbackActions">
                       <span>{signal.feedback_count || 0} ОС сохранено</span>

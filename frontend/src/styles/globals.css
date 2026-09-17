@@ -5266,6 +5266,34 @@ button {
   background: rgba(226, 232, 240, 0.88);
 }
 
+/* ID сигнала: моноширинный, чтобы номер читался и переносился в поле «ID дубля». */
+.signalRadarMeta .signalIdBadge {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #0f172a;
+  background: rgba(203, 213, 225, 0.9);
+  user-select: all;
+}
+
+/* Издатели до раскрытия карточки: по ним судят о доверии к сигналу. */
+.signalPublishers {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.signalPublisherChip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 1px 7px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  border-radius: 999px;
+  color: var(--text-soft);
+  font-size: 0.69rem;
+  font-weight: 600;
+}
+
 .signalRadarBody {
   display: grid;
   grid-template-columns: minmax(0, 1.1fr) minmax(280px, 0.9fr);

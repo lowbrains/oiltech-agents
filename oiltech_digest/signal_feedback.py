@@ -237,11 +237,18 @@ def _normalize_verdict(value: Any) -> str | None:
     }
     verdict = aliases.get(verdict, verdict)
     allowed = {
+        # Шкала заказчика (список Виктора от 13.09): оценка человека, а не модели.
+        "strong_signal",
         "approved",
+        "watch_later",
+        "background_material",
         "reject",
-        "merge_duplicate",
-        "needs_better_source",
         "wrong_domain",
+        "merge_duplicate",
+        # Ниже — вердикты прежней шкалы. С экрана убраны (заказчик их не просил),
+        # но приём оставлен: в signal_feedback_events уже лежат строки с ними,
+        # и запрет сделал бы прошлую разметку невалидной задним числом.
+        "needs_better_source",
         "bad_translation",
         "too_generic",
     }
@@ -249,10 +256,26 @@ def _normalize_verdict(value: Any) -> str | None:
 
 
 def _verdict_score(verdict: str) -> float:
+    """Вес вердикта в памяти агента: чему учить на этой пометке.
+
+    Веса прежних вердиктов НЕ трогаем. Они уже проставлены разметке, лежащей в
+    signal_feedback_events, и пересчёт задним числом переписал бы смысл прошлых
+    оценок. Новые значения шкалы заказчика добавлены рядом.
+
+    «Наблюдать» и «фоновый материал» — положительные, но слабые: это не брак, а
+    «рано» и «полезно как контекст». Отрицательными их делать нельзя, иначе агент
+    выучит, что такие находки искать не надо.
+    """
+    if verdict == "strong_signal":
+        return 100
     if verdict == "approved":
         return 90
     if verdict == "merge_duplicate":
         return 85
+    if verdict == "watch_later":
+        return 40
+    if verdict == "background_material":
+        return 25
     if verdict in {"reject", "wrong_domain", "too_generic"}:
         return -80
     if verdict in {"bad_translation", "needs_better_source"}:

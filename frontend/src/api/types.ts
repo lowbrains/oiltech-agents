@@ -258,7 +258,19 @@ export type SignalFeedbackPayload = {
   signal_title?: string | null;
   source?: string | null;
   comment: string;
-  verdict?: "approved" | "reject" | "merge_duplicate" | "needs_better_source" | "wrong_domain" | "bad_translation" | "too_generic" | null;
+  verdict?:
+    | "strong_signal"
+    | "approved"
+    | "watch_later"
+    | "background_material"
+    | "reject"
+    | "wrong_domain"
+    | "merge_duplicate"
+    // Прежняя шкала: с экрана убрана, но в старых записях встречается.
+    | "needs_better_source"
+    | "bad_translation"
+    | "too_generic"
+    | null;
   reason?: string | null;
   corrected_title?: string | null;
   corrected_thesis?: string | null;
