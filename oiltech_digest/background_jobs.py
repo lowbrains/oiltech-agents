@@ -62,12 +62,20 @@ def enqueue_daily_signal_discovery(*, force: bool = False) -> dict[str, Any]:
             "lookback_hours": lookback_hours,
         }
 
+    # Маршрут спрашиваем у политики, а не прибиваем к 'ru'. Радар генерирует
+    # поисковые запросы через OpenAI, а OpenAI отвечает РФ-адресам 403
+    # unsupported_country_region_territory — поэтому жёсткий регион 'ru' ронял
+    # ежедневную задачу КАЖДЫЙ раз, молча: сигналы стояли с 13.09.
+    # Остальные ИИ-стадии давно ходят этим же маршрутом, через внешний воркер.
+    from oiltech_digest import network_policy
+
+    decision = network_policy.route_ai_processing()
     job = enqueue(
         "signal_discovery",
         daily_signal_discovery_payload(),
-        queue_name="ai",
-        execution_region="ru",
-        capability="openai",
+        queue_name=decision.queue_name,
+        execution_region=decision.execution_region,
+        capability=decision.capability,
         max_attempts=1,
     )
     return {"enqueued": True, "job": job, "lookback_hours": lookback_hours}

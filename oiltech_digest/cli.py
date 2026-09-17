@@ -1516,12 +1516,17 @@ def cmd_enqueue_signal_discovery(args: argparse.Namespace) -> None:
         "web_only": args.web_only,
         "web_query_limit": args.web_query_limit,
     }
+    # См. background_jobs.enqueue_daily_signal_discovery: маршрут решает политика,
+    # иначе задача уезжает на РФ-адрес и OpenAI отвечает 403 по географии.
+    from oiltech_digest import network_policy
+
+    decision = network_policy.route_ai_processing()
     job = repository.create_background_job(
         "signal_discovery",
         payload,
-        queue_name="ai" if not args.offline else "default",
-        execution_region="ru",
-        capability="openai" if not args.offline else None,
+        queue_name=decision.queue_name if not args.offline else "default",
+        execution_region=decision.execution_region if not args.offline else "ru",
+        capability=decision.capability if not args.offline else None,
     )
     print(f"enqueue-signal-discovery: job id={job['id']} queue={job['queue_name']}")
 

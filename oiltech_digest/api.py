@@ -1728,13 +1728,16 @@ def enqueue_signal_discovery(payload: SignalDiscoveryRequest, user: dict[str, An
         raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
     if payload.max_signals < 1 or payload.max_signals > 50:
         raise HTTPException(status_code=400, detail="max_signals must be between 1 and 50")
+    # Не-offline прогон радара зовёт OpenAI, поэтому маршрут берём у политики:
+    # прямой вызов с РФ-адреса возвращает 403 unsupported_country_region_territory.
+    decision = network_policy.route_ai_processing()
     job = background_jobs.enqueue(
         "signal_discovery",
         payload.model_dump(),
         user_id=int(user["id"]),
-        queue_name="ai" if not payload.offline else "default",
-        execution_region="ru",
-        capability="openai" if not payload.offline else None,
+        queue_name=decision.queue_name if not payload.offline else "default",
+        execution_region=decision.execution_region if not payload.offline else "ru",
+        capability=decision.capability if not payload.offline else None,
     )
     return {"ok": True, "job": _job_payload(job)}
 
