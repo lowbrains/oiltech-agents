@@ -43,21 +43,25 @@
 контейнеру имя сервиса псевдонимом в каждой сети, и два `app` в сети MVP-1 заставили бы
 Caddy раскидывать запросы заказчика между MVP-1 и агентами.
 
-**Не сделано — поддомен и живая генерация:**
+**Поддомен работает с 18.09: https://agents.oiltech-digest.ru** — сертификат Let's
+Encrypt, отдаётся фронтенд агентов с новым радаром (8 вердиктов, ID сигнала,
+источник). Проверено снаружи; основной сайт MVP-1 не задет. Сделано:
 
-1. DNS: A-запись `agents.oiltech-digest.ru → 109.68.213.12` (панель Timeweb, владелец).
-   18.09 не резолвится, общей записи `*.oiltech-digest.ru` нет.
-2. Подключить `agents-app` к сети MVP-1:
-   `docker compose -f docker-compose.yml -f docker-compose.server.yml up -d --no-deps agents-app`,
-   проверить `docker exec oiltech_caddy getent hosts app` — должен вернуть ОДИН адрес (MVP-1).
-3. В `Caddyfile` MVP-1 блок `agents.oiltech-digest.ru { encode zstd gzip
-   reverse_proxy agents-app:8000 }`, затем `docker compose exec caddy caddy reload
-   --config /etc/caddy/Caddyfile` — только после п.1, иначе Caddy будет безуспешно
-   выпускать сертификат.
+1. DNS A-запись `agents` → 109.68.213.12 (владелец, Timeweb).
+2. `agents-app` подключён к сети MVP-1 (`docker-compose.server.yml`); проверено, что
+   `getent hosts app` в контейнере Caddy — один адрес, приложение MVP-1.
+3. Блок в `Caddyfile` MVP-1 (коммит `1119aa7` в electromop/oiltech-digest).
+   ⚠️ `Caddyfile` смонтирован ОДНИМ ФАЙЛОМ: после `git reset` контейнер видит старую
+   копию, и `caddy reload` перечитал бы её. Грузить без простоя так:
+   `docker exec -i oiltech_caddy caddy reload --config /dev/stdin --adapter caddyfile < Caddyfile`.
+
+**Не сделано — живая генерация сигналов:**
+
 4. NL: второй контейнер внешнего воркера для агентов — `CORE_API_URL=https://agents.oiltech-digest.ru`,
-   токен из `.worker-token`. Без него агент не зовёт модель (с РФ-адреса OpenAI — 403).
+   токен из `/root/oiltech-agents/.worker-token`. Без него агент не зовёт модель (с РФ-адреса OpenAI — 403).
 5. Планировщик агентов не запущен намеренно: второй полный конвейер удвоит сбор и расход
-   на ИИ (~$74 → ~$150/мес) на сервере с 1,9 ГБ. Включать после замера памяти.
+   на ИИ (~$74 → ~$150/мес) на сервере с 1,9 ГБ. Включать после замера памяти; лента и
+   дайджест в копии агентов — снимок на 18.09, рабочие — на основном сайте.
 
 ## Agent skills
 
