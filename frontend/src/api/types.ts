@@ -241,6 +241,7 @@ export type Signal = {
   user_comment?: string | null;
   user_status_updated_at?: string | null;
   feedback_count?: number;
+  merged_count?: number;
   evidence?: SignalEvidence[];
 };
 

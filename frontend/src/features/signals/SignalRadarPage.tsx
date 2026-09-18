@@ -250,6 +250,10 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                       <span>Зрелость: {MATURITY_LABELS[signal.maturity] || signal.maturity}</span>
                       <span>{Math.round(Number(signal.score || 0))} баллов</span>
                       <span>{signal.evidence_count} ссылок</span>
+                      {/* Дубли того же события скрыты, их ссылки — в этой карточке. */}
+                      {Number(signal.merged_count || 0) > 0 ? (
+                        <span>Объединено дублей: {signal.merged_count}</span>
+                      ) : null}
                     </div>
                     {/* Издатели показываются сразу, до раскрытия: «давай источник
                         сделаем открытым сразу» — по нему судят о доверии к сигналу. */}

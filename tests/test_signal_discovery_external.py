@@ -78,6 +78,7 @@ def core_repository(monkeypatch):
         lambda memory_type=None, status="active", limit=50: MEMORY.get(memory_type, [])[:limit],
     )
     monkeypatch.setattr(repository, "list_reviewed_signal_urls", lambda: ["https://known.example/old/"])
+    monkeypatch.setattr(repository, "list_signals_for_dedup", lambda: [])
 
 
 def _take_database_away(monkeypatch):
@@ -90,6 +91,7 @@ def _take_database_away(monkeypatch):
         "list_signal_radar_topics",
         "list_reviewed_signal_urls",
         "list_signal_article_evidence",
+        "list_signals_for_dedup",
     ):
         monkeypatch.setattr(repository, name, no_database)
 
@@ -165,6 +167,7 @@ def test_core_applies_external_result_and_records_generation_run(monkeypatch):
     monkeypatch.setattr(
         repository, "finish_signal_generation_run", lambda run_id, **kwargs: finished.append((run_id, kwargs))
     )
+    monkeypatch.setattr(repository, "signal_key_owners", lambda keys: {})
     accepted = _signal(DRILLING, "Accepted")
     accepted.update({"signal_key": "k1", "evidence_count": 1,
                      "evidence": [{"source_url": "https://new.example/rig", "title": "Accepted"}]})
@@ -195,8 +198,9 @@ def test_core_applies_external_result_and_records_generation_run(monkeypatch):
     assert summary["signals"] == 1
     assert summary["topics"][0] == {
         "topic": DRILLING, "web_status": "ok", "queries": 2, "results": 3, "total_evidence": 2,
-        "skipped_reviewed": 0, "clusters": 2, "signals": 1,
+        "skipped_reviewed": 0, "clusters": 2, "signals": 1, "duplicates": 0,
     }
+    assert summary["dedup"] is None  # результат воркера без дедупа (старая сборка NL) пишется как раньше
 
 
 class _FakeClient:

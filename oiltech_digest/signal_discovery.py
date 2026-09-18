@@ -16,6 +16,7 @@ import re
 from typing import Any, Callable, Iterator
 
 from oiltech_digest import config as app_config
+from oiltech_digest import signal_dedup
 from oiltech_digest.db import repository
 from oiltech_digest.processing.domain_glossary import enforce_glossary_text, glossary_prompt_block
 from oiltech_digest.processing.openai_client import AIResponse
@@ -471,10 +472,15 @@ def build_discovery_snapshot(config: SignalDiscoveryConfig, *, for_external: boo
         known_urls = repository.list_reviewed_signal_urls()
     except Exception:  # noqa: BLE001 - фильтр разобранного — улучшение, а не условие прогона
         known_urls = []
+    try:
+        existing_signals = repository.list_signals_for_dedup()
+    except Exception:  # noqa: BLE001 - без сверки с базой дедуп ограничится карточками прогона
+        existing_signals = []
     snapshot: dict[str, Any] = {
         "topics": [{key: topic.get(key) for key in _TOPIC_SNAPSHOT_FIELDS if key in topic} for topic in topics],
         "article_evidence": article_evidence,
         "known_urls": sorted({_normalize_url_for_key(url) for url in known_urls if url}),
+        "existing_signals": existing_signals,
     }
     if for_external:
         try:
@@ -552,7 +558,63 @@ def run_discovery(
                 "clusters": len(clusters),
                 "candidates": candidates,
             })
-    return {"topics": topics_out}
+    return {"topics": topics_out, "dedup": _dedupe_run(config, snapshot, topics_out, beat)}
+
+
+def _dedupe_run(
+    config: SignalDiscoveryConfig,
+    snapshot: dict[str, Any],
+    topics_out: list[dict[str, Any]],
+    beat: Callable[[], None],
+) -> dict[str, Any]:
+    """Сверить принятых кандидатов между собой и с сохранёнными карточками.
+
+    Решение кладётся в кандидата (duplicate_of) и в existing_merges — пишет их ядро."""
+    if config.offline:
+        return {"skipped": "offline"}
+    nodes: list[dict[str, Any]] = []
+    for row in snapshot.get("existing_signals") or []:
+        nodes.append({
+            "kind": "existing",
+            "id": int(row["id"]),
+            "reviewed": bool(row.get("reviewed") or row.get("verdict")),
+            "verdict": row.get("verdict"),
+            "fresh": bool(row.get("fresh")),
+            "urls": row.get("evidence_urls") or [],
+            "signal": row,
+        })
+    refs: dict[int, dict[str, Any]] = {}
+    for topic in topics_out:
+        for candidate in topic["candidates"]:
+            if candidate["rejected"]:
+                continue
+            signal = candidate["signal"]
+            refs[len(nodes)] = candidate
+            nodes.append({
+                "kind": "new",
+                "reviewed": False,
+                "fresh": True,
+                "order": len(refs),
+                "urls": [item.get("source_url") for item in signal.get("evidence") or [] if item.get("source_url")],
+                "signal": signal,
+            })
+    result = signal_dedup.dedupe(nodes, client_factory=lambda: make_client(False), heartbeat=beat)
+    existing_merges = []
+    for index, (primary_index, reason) in result["assigned"].items():
+        primary = nodes[primary_index]
+        if index in refs:
+            refs[index]["duplicate_of"] = (
+                {"signal_id": primary["id"]} if primary["kind"] == "existing"
+                else {"signal_key": primary["signal"]["signal_key"]}
+            )
+            refs[index]["duplicate_reason"] = reason
+        elif primary["kind"] == "existing":
+            existing_merges.append({"signal_id": nodes[index]["id"], "into": primary["id"], "reason": reason})
+    return {
+        **result["stats"],
+        "duplicates_new": sum(1 for index in result["assigned"] if index in refs),
+        "existing_merges": existing_merges,
+    }
 
 
 def apply_discovery(
@@ -564,31 +626,27 @@ def apply_discovery(
     """Ядро: записать сигналы из результата run_discovery и собрать итог."""
     all_signals: list[dict[str, Any]] = []
     topic_results = []
+    duplicates: list[tuple[str, dict[str, Any]]] = []
+    stored_keys: dict[str, int] = {}
+    owners = _key_owners(config, run)
     for topic in run.get("topics") or []:
         topic_name = str(topic.get("topic") or "")
         judged = []
+        topic_duplicates = 0
         for candidate in topic.get("candidates") or []:
             signal = candidate["signal"]
-            cluster = signal.get("evidence") or []
             rejected = bool(candidate.get("rejected"))
-            signal_id = None
-            if not rejected and not config.dry_run:
-                signal_id = repository.upsert_signal(signal)
-                signal["id"] = signal_id
-                for item in cluster:
-                    repository.upsert_signal_evidence(signal_id, item)
-                signal["evidence_count"] = repository.refresh_signal_evidence_count(signal_id)
-            if generation_run_id is not None:
-                repository.create_signal_training_example(
-                    generation_run_id=generation_run_id,
-                    signal_id=signal_id,
-                    topic=topic_name,
-                    signal_key=signal["signal_key"],
-                    pipeline_verdict="rejected" if rejected else "accepted",
-                    input_payload=candidate.get("training_input") or {},
-                    raw_output=candidate.get("raw_output") or {},
-                    normalized_output=signal,
-                )
+            if not rejected:
+                _reconcile_with_owner(candidate, owners.get(str(signal.get("signal_key") or "")))
+            if not rejected and candidate.get("duplicate_of"):
+                # Главная карточка группы может стоять в другой теме дальше по списку —
+                # дубли пишем, когда все главные уже сохранены.
+                duplicates.append((topic_name, candidate))
+                topic_duplicates += 1
+                continue
+            signal_id = _store_candidate(config, topic_name, candidate, generation_run_id)
+            if signal_id is not None:
+                stored_keys[signal["signal_key"]] = signal_id
             if rejected:
                 continue
             judged.append(signal)
@@ -601,7 +659,27 @@ def apply_discovery(
             "web_search": topic.get("web_search"),
             "clusters": topic.get("clusters", 0),
             "signals": judged,
+            "duplicates": topic_duplicates,
         })
+    dedup = dict(run.get("dedup") or {})
+    merged = 0
+    for topic_name, candidate in duplicates:
+        if _merge_duplicate(config, topic_name, candidate, stored_keys, generation_run_id):
+            merged += 1
+        elif not config.dry_run:
+            # Главной карточки нет (удалена, не записана) — сигнал не теряем.
+            signal_id = _store_candidate(config, topic_name, candidate, generation_run_id)
+            candidate["signal"]["id"] = signal_id
+            all_signals.append(candidate["signal"])
+    merged_existing = 0
+    if not config.dry_run:
+        for merge in dedup.pop("existing_merges", None) or []:
+            if repository.mark_signal_merged(int(merge["signal_id"]), int(merge["into"]), str(merge.get("reason") or "")):
+                merged_existing += 1
+    else:
+        dedup.pop("existing_merges", None)
+    if dedup or merged or merged_existing:
+        dedup.update({"merged_new": merged, "merged_existing": merged_existing})
     all_signals.sort(key=lambda item: (float(item.get("score") or 0), int(item.get("evidence_count") or 0)), reverse=True)
     return {
         "dry_run": config.dry_run,
@@ -614,7 +692,108 @@ def apply_discovery(
         "all_signals": len(all_signals),
         "topic_results": topic_results,
         "generation_run_id": generation_run_id,
+        "dedup": dedup or None,
     }
+
+
+def _key_owners(config: SignalDiscoveryConfig, run: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    if config.dry_run:
+        return {}
+    keys = sorted({
+        str(candidate["signal"].get("signal_key") or "")
+        for topic in run.get("topics") or []
+        for candidate in topic.get("candidates") or []
+        if not candidate.get("rejected") and candidate["signal"].get("signal_key")
+    })
+    return repository.signal_key_owners(keys) if keys else {}
+
+
+def _reconcile_with_owner(candidate: dict[str, Any], owner: dict[str, Any] | None) -> None:
+    """Кандидат с ключом уже сохранённой карточки — это она же, найденная снова.
+
+    Скрытая дублем — повтор идёт в её главную: иначе upsert записал бы его в скрытую
+    строку, и сигнал пропал бы с экрана. Разобранная человеком — обновляется сама, как
+    до дедупа: судья не переспорит разбор, и её ссылка не уедет в чужую карточку.
+    Видимая неразобранная, которую судья счёл дублем другой, скрывается вместе с ним."""
+    if not owner:
+        return
+    if owner.get("merged_into_signal_id") is not None:
+        candidate["duplicate_of"] = {"signal_id": int(owner["merged_into_signal_id"])}
+        candidate["duplicate_reason"] = "та же ссылка уже склеена с этой карточкой"
+    elif owner.get("reviewed"):
+        candidate.pop("duplicate_of", None)
+    elif candidate.get("duplicate_of"):
+        candidate["key_owner_id"] = int(owner["id"])
+
+
+def _store_candidate(
+    config: SignalDiscoveryConfig,
+    topic_name: str,
+    candidate: dict[str, Any],
+    generation_run_id: int | None,
+) -> int | None:
+    signal = candidate["signal"]
+    cluster = signal.get("evidence") or []
+    rejected = bool(candidate.get("rejected"))
+    signal_id = None
+    if not rejected and not config.dry_run:
+        signal_id = repository.upsert_signal(signal)
+        signal["id"] = signal_id
+        for item in cluster:
+            repository.upsert_signal_evidence(signal_id, item)
+        signal["evidence_count"] = repository.refresh_signal_evidence_count(signal_id)
+    if generation_run_id is not None:
+        repository.create_signal_training_example(
+            generation_run_id=generation_run_id,
+            signal_id=signal_id,
+            topic=topic_name,
+            signal_key=signal["signal_key"],
+            pipeline_verdict="rejected" if rejected else "accepted",
+            input_payload=candidate.get("training_input") or {},
+            raw_output=candidate.get("raw_output") or {},
+            normalized_output=signal,
+        )
+    return signal_id
+
+
+def _merge_duplicate(
+    config: SignalDiscoveryConfig,
+    topic_name: str,
+    candidate: dict[str, Any],
+    stored_keys: dict[str, int],
+    generation_run_id: int | None,
+) -> bool:
+    """Ссылки дубля — в главную карточку, новой карточки нет. False — главной не нашлось."""
+    signal = candidate["signal"]
+    target = candidate.get("duplicate_of") or {}
+    if config.dry_run:
+        return True
+    target_id = target.get("signal_id") or stored_keys.get(str(target.get("signal_key") or ""))
+    target_id = repository.resolve_signal_merge_root(int(target_id)) if target_id else None
+    if target_id is None:
+        return False
+    owner_id = candidate.get("key_owner_id")
+    if owner_id and owner_id != target_id:
+        # Ключ дубля — у видимой карточки: это тот же материал, она тоже дубль главной.
+        repository.mark_signal_merged(int(owner_id), target_id, str(candidate.get("duplicate_reason") or ""))
+    for item in signal.get("evidence") or []:
+        repository.upsert_signal_evidence(target_id, item)
+    repository.refresh_signal_evidence_count(target_id)
+    if owner_id and owner_id != target_id:
+        repository.refresh_signal_evidence_count(int(owner_id))
+    repository.touch_signal(target_id)
+    if generation_run_id is not None:
+        repository.create_signal_training_example(
+            generation_run_id=generation_run_id,
+            signal_id=target_id,
+            topic=topic_name,
+            signal_key=signal["signal_key"],
+            pipeline_verdict="duplicate",
+            input_payload=candidate.get("training_input") or {},
+            raw_output={**(candidate.get("raw_output") or {}), "duplicate_reason": candidate.get("duplicate_reason")},
+            normalized_output=signal,
+        )
+    return True
 
 
 def discover_signals(config: SignalDiscoveryConfig) -> dict[str, Any]:
@@ -718,12 +897,14 @@ def apply_external_result(result: dict[str, Any], *, job_id: int) -> dict[str, A
             "skipped_reviewed": row.get("skipped_reviewed"),
             "clusters": row.get("clusters"),
             "signals": len(row.get("signals") or []),
+            "duplicates": row.get("duplicates", 0),
         })
     summary = {
         "generation_run_id": generation_run_id,
         "signals": applied["all_signals"],
         "persisted": 0 if config.dry_run else applied["all_signals"],
         "topics": topics,
+        "dedup": applied.get("dedup"),
     }
     if generation_run_id is not None:
         repository.finish_signal_generation_run(generation_run_id, status="ok", result={

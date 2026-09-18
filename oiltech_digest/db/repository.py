@@ -1039,6 +1039,136 @@ def refresh_signal_evidence_count(signal_id: int) -> int:
         return int(row[0]) if row else 0
 
 
+# Разобранная карточка — у неё есть суждение человека: вердикт, комментарий или статус,
+# отличный от «наблюдать» (дайджест, архив, шум, дубль). Дедуп такую не прячет и не
+# склеивает с другой разобранной; её ссылки радар не приносит повторно.
+_SIGNAL_REVIEWED_SQL = """(
+  EXISTS (SELECT 1 FROM signal_feedback_events sfe_r
+          WHERE sfe_r.signal_id = {alias}.id
+            AND (COALESCE(sfe_r.verdict, '') <> '' OR sfe_r.event_type = 'comment_added'))
+  OR EXISTS (SELECT 1 FROM user_signal_states uss_r
+             WHERE uss_r.signal_id = {alias}.id AND uss_r.status <> 'watch')
+)"""
+
+
+def list_signals_for_dedup(*, window_days: int = 30, fresh_days: int = 3, limit: int = 300) -> list[dict]:
+    """Сохранённые карточки радара для сверки дублей на внешнем воркере (базы у него нет).
+
+    Разобранные Виктором — всегда, любого возраста: по ним видно, что он уже одобрил
+    или отклонил, и повтор того же события не должен вернуться новой карточкой.
+    Неразобранные — за окно. fresh — появилась за последние дни: только такие
+    неразобранные карточки сверяются между собой (см. signal_dedup._eligible)."""
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            """
+            SELECT s.id, s.signal_key, s.title, s.title_ru, s.theme,
+                   left(s.summary, 400) AS summary,
+                   s.companies_json AS companies, s.score, s.evidence_count,
+                   (s.first_seen_at >= now() - make_interval(days => %s)) AS fresh,
+                   v.verdict,
+                   {reviewed} AS reviewed,
+                   COALESCE(ev.urls, ARRAY[]::text[]) AS evidence_urls
+            FROM signals s
+            LEFT JOIN LATERAL (
+              SELECT sfe.verdict
+              FROM signal_feedback_events sfe
+              WHERE sfe.signal_id = s.id AND COALESCE(sfe.verdict, '') <> ''
+              ORDER BY sfe.created_at DESC, sfe.id DESC
+              LIMIT 1
+            ) v ON TRUE
+            LEFT JOIN LATERAL (
+              SELECT array_agg(top.source_url ORDER BY top.strength DESC, top.id) AS urls
+              FROM (
+                SELECT source_url, strength, id
+                FROM signal_evidence
+                WHERE signal_id = s.id
+                ORDER BY strength DESC, id
+                LIMIT 10
+              ) top
+            ) ev ON TRUE
+            WHERE s.merged_into_signal_id IS NULL
+              AND ({reviewed} OR s.last_seen_at >= now() - make_interval(days => %s))
+            ORDER BY {reviewed} DESC, s.last_seen_at DESC, s.id DESC
+            LIMIT %s
+            """.format(reviewed=_SIGNAL_REVIEWED_SQL.format(alias="s")),
+            (fresh_days, window_days, limit),
+        )
+        rows = cur.fetchall()
+    return [
+        {**row, "score": float(row["score"] or 0), "companies": list(row["companies"] or []),
+         "evidence_urls": list(row["evidence_urls"] or [])}
+        for row in rows
+    ]
+
+
+def resolve_signal_merge_root(signal_id: int) -> int | None:
+    """Главная карточка группы: идти по merged_into_signal_id до видимой. None — нет такой."""
+    with get_connection() as conn:
+        current = int(signal_id)
+        for _ in range(10):
+            row = conn.execute("SELECT merged_into_signal_id FROM signals WHERE id = %s", (current,)).fetchone()
+            if row is None:
+                return None
+            if row[0] is None:
+                return current
+            current = int(row[0])
+    return None
+
+
+def mark_signal_merged(signal_id: int, into_signal_id: int, reason: str = "") -> bool:
+    """Скрыть карточку-дубль со ссылкой на главную. Не удаляет: пометку снимает UPDATE.
+
+    Разобранную карточку не прячем, даже если судья счёл её дублем: между выдачей
+    задачи и её завершением её могли успеть разобрать или выбрать в дайджест."""
+    root = resolve_signal_merge_root(into_signal_id)
+    if root is None or root == int(signal_id):
+        return False
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            UPDATE signals
+            SET merged_into_signal_id = %s, merge_reason = %s, updated_at = now()
+            WHERE id = %s
+              AND merged_into_signal_id IS NULL
+              AND NOT {reviewed}
+            RETURNING id
+            """.format(reviewed=_SIGNAL_REVIEWED_SQL.format(alias="signals")),
+            (root, (reason or "")[:500] or None, int(signal_id)),
+        ).fetchone()
+        if row is not None:
+            # Группа всегда в один шаг: всё, что было склеено с этой карточкой, — к корню.
+            conn.execute(
+                "UPDATE signals SET merged_into_signal_id = %s, updated_at = now() WHERE merged_into_signal_id = %s",
+                (root, int(signal_id)),
+            )
+        conn.commit()
+        return row is not None
+
+
+def touch_signal(signal_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE signals SET last_seen_at = now(), updated_at = now() WHERE id = %s", (int(signal_id),))
+        conn.commit()
+
+
+def signal_key_owners(keys: list[str]) -> dict[str, dict]:
+    """Каким сохранённым карточкам уже принадлежат ключи кандидатов: id, склеена ли, разобрана ли."""
+    if not keys:
+        return {}
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            """
+            SELECT s.signal_key, s.id, s.merged_into_signal_id, {reviewed} AS reviewed
+            FROM signals s
+            WHERE s.signal_key = ANY(%s)
+            """.format(reviewed=_SIGNAL_REVIEWED_SQL.format(alias="s")),
+            (list(keys),),
+        )
+        return {row["signal_key"]: row for row in cur.fetchall()}
+
+
 def create_signal_generation_run(
     *,
     config_payload: dict,
@@ -1208,7 +1338,8 @@ def list_signal_training_examples(
 
 def list_signals(*, maturity: str | None = None, theme: str | None = None, limit: int = 50,
                  user_id: int | None = None) -> list[dict]:
-    clauses = []
+    # Дубли скрыты: их ссылки уже в главной карточке (signal_dedup).
+    clauses = ["s.merged_into_signal_id IS NULL"]
     params: list = []
     if maturity:
         clauses.append("s.maturity = %s")
@@ -1235,7 +1366,8 @@ def list_signals(*, maturity: str | None = None, theme: str | None = None, limit
                              SELECT 1 FROM signal_evidence se
                              WHERE se.signal_id = s.id AND se.source_url = sfe.source_url
                            ))
-                   ) AS feedback_count
+                   ) AS feedback_count,
+                   (SELECT COUNT(*) FROM signals m WHERE m.merged_into_signal_id = s.id) AS merged_count
             FROM signals s
             LEFT JOIN user_signal_states uss ON uss.signal_id = s.id AND uss.user_id = %s
             {where}
@@ -1282,10 +1414,11 @@ def list_signal_evidence(signal_id: int, *, limit: int = 20) -> list[dict]:
             SELECT *
             FROM signal_evidence
             WHERE signal_id = %s
+               OR signal_id IN (SELECT id FROM signals WHERE merged_into_signal_id = %s)
             ORDER BY strength DESC, published_at DESC NULLS LAST, created_at DESC
             LIMIT %s
             """,
-            (signal_id, limit),
+            (signal_id, signal_id, limit),
         )
         return cur.fetchall()
 
@@ -1702,13 +1835,16 @@ def list_reviewed_signal_urls() -> list[str]:
     with get_connection() as conn:
         cur = conn.execute(
             """
-            SELECT DISTINCT e.source_url
-            FROM signal_evidence e
-            WHERE e.signal_id IN (
-                SELECT f.signal_id FROM signal_feedback_events f
+            WITH reviewed AS (
+                SELECT f.signal_id AS id FROM signal_feedback_events f
                 WHERE f.signal_id IS NOT NULL
                   AND (f.verdict IS NOT NULL OR f.event_type = 'comment_added')
             )
+            SELECT DISTINCT e.source_url
+            FROM signal_evidence e
+            WHERE e.signal_id IN (SELECT id FROM reviewed)
+               -- ссылки скрытых дублей разобранной карточки — тоже разобраны
+               OR e.signal_id IN (SELECT s.id FROM signals s WHERE s.merged_into_signal_id IN (SELECT id FROM reviewed))
             UNION
             SELECT DISTINCT f.source_url
             FROM signal_feedback_events f

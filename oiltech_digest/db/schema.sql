@@ -700,6 +700,10 @@ ALTER TABLE article_cards ADD COLUMN IF NOT EXISTS summary_generated_at TIMESTAM
 ALTER TABLE article_cards ADD COLUMN IF NOT EXISTS title_ru TEXT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS title_ru TEXT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS summary TEXT;
+-- Дедуп радара (18.09): дубль не удаляем, а скрываем со ссылкой на главную карточку.
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS merged_into_signal_id BIGINT REFERENCES signals(id) ON DELETE SET NULL;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS merge_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_signals_merged_into ON signals(merged_into_signal_id) WHERE merged_into_signal_id IS NOT NULL;
 ALTER TABLE signal_evidence ADD COLUMN IF NOT EXISTS title_ru TEXT;
 ALTER TABLE signal_evidence ADD COLUMN IF NOT EXISTS summary_ru TEXT;
 ALTER TABLE signal_feedback_events ALTER COLUMN article_id DROP NOT NULL;
