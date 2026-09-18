@@ -2766,3 +2766,74 @@ def test_feedback_reasons_use_official_wording():
     assert labels["bad_translation"] == "Некорректный перевод"
     assert labels["bad_source"] == "Низкое качество источника"
     assert labels["good"] == "Ценный сигнал"
+
+
+def test_external_worker_claim_hydrates_signal_discovery_payload(monkeypatch):
+    from oiltech_digest import signal_discovery
+
+    monkeypatch.setattr(api.config, "EXTERNAL_WORKER_TOKEN_HASH", api._sha256_hex("secret"))
+    monkeypatch.setattr(api.repository, "requeue_expired_external_leases", lambda: 0)
+    monkeypatch.setattr(
+        signal_discovery,
+        "build_external_payload",
+        lambda payload: {"kind": "signal_discovery", "config": {"web_only": payload["web_only"]},
+                         "snapshot": {"topics": [{"name": "Бурение"}]}},
+    )
+    monkeypatch.setattr(
+        api.repository,
+        "claim_external_background_job",
+        lambda **kwargs: {
+            "id": 13, "kind": "signal_discovery", "queue_name": "external-ai", "execution_region": "external",
+            "capability": "openai", "status": "running", "progress": 10, "attempts": 1, "max_attempts": 1,
+            "run_after": None, "payload_json": {"web_only": True}, "result_json": None, "error_message": None,
+            "created_at": None, "started_at": None, "finished_at": None,
+        },
+    )
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/external-worker/claim",
+        headers={"Authorization": "Bearer secret"},
+        json={"worker_id": "eu-1", "queues": ["external-ai"], "capabilities": ["openai"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["job"]["payload"] == {
+        "kind": "signal_discovery",
+        "config": {"web_only": True},
+        "snapshot": {"topics": [{"name": "Бурение"}]},
+    }
+
+
+def test_external_worker_complete_applies_signal_discovery_and_keeps_only_summary(monkeypatch):
+    from oiltech_digest import signal_discovery
+
+    monkeypatch.setattr(api.config, "EXTERNAL_WORKER_TOKEN_HASH", api._sha256_hex("secret"))
+    applied = []
+    completed = []
+    monkeypatch.setattr(api.repository, "get_background_job", lambda job_id: {"id": job_id, "kind": "signal_discovery"})
+    monkeypatch.setattr(api.repository, "begin_external_background_job_finalize", lambda job_id, **kwargs: True)
+    monkeypatch.setattr(
+        signal_discovery,
+        "apply_external_result",
+        lambda result, **kwargs: applied.append((result, kwargs)) or {"signals": 2, "topics": []},
+    )
+    monkeypatch.setattr(
+        api.repository,
+        "finish_external_background_job",
+        lambda job_id, **kwargs: completed.append((job_id, kwargs)) or True,
+    )
+    client = TestClient(api.app)
+    worker_result = {"signal_discovery": True, "config": {"web_only": True},
+                     "run": {"topics": [{"topic": "Бурение", "candidates": [{"signal": {"title": "x" * 5000}}]}]}}
+
+    response = client.post(
+        "/api/external-worker/jobs/10/complete",
+        headers={"Authorization": "Bearer secret"},
+        json={"lease_token": "lease", "result": worker_result},
+    )
+
+    assert response.status_code == 200
+    assert applied == [(worker_result, {"job_id": 10})]
+    # В задаче остаётся итог, а не мегабайты кандидатов.
+    assert completed[0][1]["result"] == {"signal_discovery": True, "applied": {"signals": 2, "topics": []}}

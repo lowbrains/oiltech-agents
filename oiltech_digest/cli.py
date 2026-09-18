@@ -1609,6 +1609,20 @@ def cmd_import_signal_feedback(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_retire_signal_query_hints(args: argparse.Namespace) -> None:
+    from oiltech_digest.signal_feedback import retire_query_hints_from_negative_feedback
+
+    result = retire_query_hints_from_negative_feedback(dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return
+    print(
+        "retire-signal-query-hints: "
+        f"active_before={result['active_before']} kept={result['kept']} "
+        f"retired={result['retired']} dry_run={result['dry_run']}"
+    )
+
+
 def cmd_export_signal_training_jsonl(args: argparse.Namespace) -> None:
     from oiltech_digest.signal_training import export_signal_training_jsonl
 
@@ -2353,6 +2367,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_import_signal_feedback.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     p_import_signal_feedback.add_argument("--json", action="store_true")
     p_import_signal_feedback.set_defaults(func=cmd_import_signal_feedback)
+
+    p_retire_hints = sub.add_parser(
+        "retire-signal-query-hints",
+        help="погасить поисковые подсказки радара, выведенные из отклонённых сигналов",
+    )
+    p_retire_hints.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
+    p_retire_hints.add_argument("--json", action="store_true")
+    p_retire_hints.set_defaults(func=cmd_retire_signal_query_hints)
 
     p_export_signal_training = sub.add_parser(
         "export-signal-training-jsonl",

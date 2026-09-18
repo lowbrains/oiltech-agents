@@ -7,16 +7,27 @@ can be fed later through the same evidence shape.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, fields, replace
 import hashlib
+import json
 import re
-from typing import Any
+from typing import Any, Callable, Iterator
 
+from oiltech_digest import config as app_config
 from oiltech_digest.db import repository
 from oiltech_digest.processing.domain_glossary import enforce_glossary_text, glossary_prompt_block
 from oiltech_digest.processing.openai_client import AIResponse
 from oiltech_digest.processing.pipeline import make_client
-from oiltech_digest.signal_feedback import apply_feedback_glossary, feedback_prompt_block, feedback_query_hints
+from oiltech_digest.signal_feedback import (
+    apply_feedback_glossary,
+    feedback_prompt_block,
+    feedback_query_hints,
+    memory_snapshot_rows,
+    topic_term_stems,
+    use_memory_snapshot,
+)
 
 
 INDUSTRY_CONTEXT_RE = re.compile(
@@ -335,6 +346,21 @@ SIGNAL_JUDGE_INSTRUCTIONS = """Ты аналитик технологическ�
 - имеет факты: компания, внедрение, поставщик, объект, цифры, зрелость или внятный why now;
 - не является обычным маркетинговым анонсом без признаков применения.
 
+Правила заказчика (выведены из его разбора 38 сигналов, 15–16.09.2026) — reject, если:
+- нет конкретного события: нового продукта, внедрения, заказчика, контракта, KPI или
+  технологического milestone. Обзор трендов, explainer, evergreen-страница услуг и каталог
+  поставщика — это не сигнал;
+- событие старое: проверяй дату САМОГО события внутри материала, а не дату находки.
+  Старше 12 месяцев или подборка кейсов прошлых лет — исторический контекст, reject;
+- отрасль чужая (розничная и городская доставка, оборона, наука без промышленного
+  применения) и перенос в нефтегаз/промышленную эксплуатацию не показан;
+- это повтор уже известного решения (тот же продукт или поставщик) без нового события;
+- технологический смысл пришлось бы додумать: если evidence о другом (рейтинг
+  подрядчиков, итоги года), не превращай его в технологию.
+Проект самой «Газпром нефти» — не внешний сигнал: начни summary со слов
+«Внутренний benchmark», score не выше 50. Цифры эффекта из материалов поставщика
+помечай в why_not_noise как vendor-reported; без независимого подтверждения — не выше watch.
+
 Верни один сигнал или reject. Не добавляй фактов, которых нет во входе.
 score возвращай по шкале 0-100, где 40 = слабый watch, 70 = хороший shortlist,
 85+ = proven. theme возвращай на русском, кроме устоявшихся аббревиатур HSE/PTW/AI."""
@@ -396,31 +422,100 @@ def seed_default_radar_topics() -> int:
     return repository.seed_signal_radar_topics(DEFAULT_RADAR_TOPICS)
 
 
-def discover_signals(config: SignalDiscoveryConfig) -> dict[str, Any]:
+# Разведка разрезана на три слоя, как остальные ИИ-стадии (см. external_ai):
+#   1. build_discovery_snapshot — ядро читает базу: темы, статьи, (для воркера) теги и память ОС;
+#   2. run_discovery — ни одного обращения к базе: запросы, поиск, кластеры, судья;
+#   3. apply_discovery — ядро пишет сигналы, подтверждения и примеры обучения.
+# Раньше всё шло одной функцией с базой внутри, и маршрут «через внешний воркер»
+# (ca23016) упирался в воркер без базы и без этого вида задач: с 13.09 радар не
+# отработал по расписанию ни разу — 134 запуска, все 403 с РФ-адреса.
+
+# Теги для прогона без базы. None — читать из repository, как на ядре.
+_TAGS_SNAPSHOT: ContextVar[list[dict[str, Any]] | None] = ContextVar("signal_discovery_tags", default=None)
+
+_TOPIC_SNAPSHOT_FIELDS = ("name", "description", "query_seeds_json", "query_seeds", "industry_scope_json", "tag_id")
+_TAG_SNAPSHOT_FIELDS = (
+    "id", "parent_id", "name", "name_en", "parent_name", "parent_name_en", "description",
+    "keywords_json", "keywords_en_json", "negative_keywords_json",
+)
+
+
+def _jsonable(value: Any) -> Any:
+    return json.loads(json.dumps(value, default=str))
+
+
+def _topic_name(topic: dict[str, Any], config: SignalDiscoveryConfig) -> str:
+    return str(topic.get("name") or config.topic or "").strip()
+
+
+def build_discovery_snapshot(config: SignalDiscoveryConfig, *, for_external: bool = False) -> dict[str, Any]:
+    """Всё, что разведке нужно из базы, одним JSON-снимком.
+
+    for_external=True добавляет теги и память ОС: у внешнего воркера базы нет, и без
+    снимка эти обогащения молча отваливались бы в except — тот же класс, что тематики
+    гейта 17.09 (фича, которая на проде пустая, а в тестах зелёная)."""
     topics = _selected_topics(config.topic)
     if not topics:
         topics = [{"name": config.topic or "HSE technology radar", "query_seeds_json": []}]
-
-    generation_run_id = None
-    if config.persist_training_examples and not config.dry_run:
-        generation_run_id = repository.create_signal_generation_run(
-            config_payload=asdict(config),
-            trigger="signal_discovery",
-            background_job_id=config.background_job_id,
-        )
-    all_signals: list[dict[str, Any]] = []
-    topic_results = []
-    try:
+    article_evidence: dict[str, list[dict[str, Any]]] = {}
+    if not config.web_only:
         for topic in topics:
-            topic_name = str(topic.get("name") or config.topic or "").strip()
-            article_rows = []
-            if not config.web_only:
-                article_rows = repository.list_signal_article_evidence(
-                    topic=topic_name,
-                    days=config.days,
-                    limit=config.limit,
-                    min_score=config.min_score,
-                )
+            name = _topic_name(topic, config)
+            article_evidence[name] = repository.list_signal_article_evidence(
+                topic=name,
+                days=config.days,
+                limit=config.limit,
+                min_score=config.min_score,
+            )
+    try:
+        known_urls = repository.list_reviewed_signal_urls()
+    except Exception:  # noqa: BLE001 - фильтр разобранного — улучшение, а не условие прогона
+        known_urls = []
+    snapshot: dict[str, Any] = {
+        "topics": [{key: topic.get(key) for key in _TOPIC_SNAPSHOT_FIELDS if key in topic} for topic in topics],
+        "article_evidence": article_evidence,
+        "known_urls": sorted({_normalize_url_for_key(url) for url in known_urls if url}),
+    }
+    if for_external:
+        try:
+            tags = repository.list_enabled_tags()
+        except Exception:  # noqa: BLE001 - без тегов разведка беднее, но работает
+            tags = []
+        snapshot["tags"] = [{key: tag.get(key) for key in _TAG_SNAPSHOT_FIELDS} for tag in tags]
+        snapshot["memory"] = memory_snapshot_rows()
+    return _jsonable(snapshot)
+
+
+@contextmanager
+def use_discovery_snapshot(snapshot: dict[str, Any]) -> Iterator[None]:
+    """Включить теги и память ОС из снимка, если они в нём есть."""
+    tags_token = _TAGS_SNAPSHOT.set(snapshot["tags"]) if snapshot.get("tags") is not None else None
+    try:
+        if snapshot.get("memory") is not None:
+            with use_memory_snapshot(snapshot["memory"]):
+                yield
+        else:
+            yield
+    finally:
+        if tags_token is not None:
+            _TAGS_SNAPSHOT.reset(tags_token)
+
+
+def run_discovery(
+    config: SignalDiscoveryConfig,
+    snapshot: dict[str, Any],
+    *,
+    heartbeat: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Средний слой: без базы. Возвращает кандидатов в сигналы по каждой теме."""
+    beat = heartbeat or (lambda: None)
+    known_urls = set(snapshot.get("known_urls") or [])
+    topics_out = []
+    with use_discovery_snapshot(snapshot):
+        for topic in snapshot.get("topics") or []:
+            beat()
+            topic_name = _topic_name(topic, config)
+            article_rows = (snapshot.get("article_evidence") or {}).get(topic_name) or []
             db_evidence = [_article_to_evidence(row, topic_name) for row in article_rows if _has_industry_context(row)]
             evidence = list(db_evidence)
             web_search = None
@@ -428,73 +523,215 @@ def discover_signals(config: SignalDiscoveryConfig) -> dict[str, Any]:
                 web_search = _search_web_evidence(topic, config)
                 evidence.extend(web_search["evidence"])
             evidence = _dedupe_evidence(evidence)
-            clusters = _cluster_evidence(evidence, topic_name)
-            judged = []
+            fresh = [item for item in evidence if _normalize_url_for_key(str(item.get("source_url") or "")) not in known_urls]
+            skipped_reviewed = len(evidence) - len(fresh)
+            clusters = _cluster_evidence(fresh, topic_name)
+            candidates = []
             for cluster in clusters[: config.max_signals]:
+                beat()
                 signal, raw_output = judge_signal_snapshot(cluster, topic_name, offline=config.offline)
+                if topic.get("tag_id") is not None:
+                    # Тема радара = тематика заказчика: фильтр «Тема» на экране — это его 13 тегов,
+                    # а не свободный текст модели (было 34 разных «темы» на 38 сигналов).
+                    signal["theme"] = topic_name
                 signal["signal_key"] = _signal_key(signal, cluster)
                 signal["evidence_count"] = len({str(item.get("source_url") or "") for item in cluster if item.get("source_url")})
                 signal["evidence"] = cluster
-                rejected = _is_rejected_signal(signal)
-                signal_id = None
-                if not rejected and not config.dry_run:
-                    signal_id = repository.upsert_signal(signal)
-                    signal["id"] = signal_id
-                    for item in cluster:
-                        repository.upsert_signal_evidence(signal_id, item)
-                    signal["evidence_count"] = repository.refresh_signal_evidence_count(signal_id)
-                if generation_run_id is not None:
-                    repository.create_signal_training_example(
-                        generation_run_id=generation_run_id,
-                        signal_id=signal_id,
-                        topic=topic_name,
-                        signal_key=signal["signal_key"],
-                        pipeline_verdict="rejected" if rejected else "accepted",
-                        input_payload=_training_input_payload(topic_name, cluster, web_search, offline=config.offline),
-                        raw_output=raw_output,
-                        normalized_output=signal,
-                    )
-                if rejected:
-                    continue
-                judged.append(signal)
-                all_signals.append(signal)
-            topic_results.append({
+                candidates.append({
+                    "signal": signal,
+                    "raw_output": raw_output,
+                    "rejected": _is_rejected_signal(signal),
+                    "training_input": _training_input_payload(topic_name, cluster, web_search, offline=config.offline),
+                })
+            topics_out.append({
                 "topic": topic_name,
                 "article_evidence": len(db_evidence),
                 "total_evidence": len(evidence),
+                "skipped_reviewed": skipped_reviewed,
                 "web_search": web_search,
                 "clusters": len(clusters),
-                "signals": judged,
+                "candidates": candidates,
             })
+    return {"topics": topics_out}
 
-        all_signals.sort(key=lambda item: (float(item.get("score") or 0), int(item.get("evidence_count") or 0)), reverse=True)
-        result = {
-            "dry_run": config.dry_run,
-            "offline": config.offline,
-            "web_search": config.web_search or config.web_only,
-            "web_only": config.web_only,
-            "days": config.days,
-            "topics": [str(t.get("name") or "") for t in topics],
-            "signals": all_signals[: config.max_signals],
-            "topic_results": topic_results,
-            "generation_run_id": generation_run_id,
-        }
-        if generation_run_id is not None:
-            repository.finish_signal_generation_run(generation_run_id, status="ok", result={
-                "topics": len(topics),
-                "signals": len(all_signals),
-                "returned_signals": len(result["signals"]),
-            })
-        return result
+
+def apply_discovery(
+    config: SignalDiscoveryConfig,
+    run: dict[str, Any],
+    *,
+    generation_run_id: int | None = None,
+) -> dict[str, Any]:
+    """Ядро: записать сигналы из результата run_discovery и собрать итог."""
+    all_signals: list[dict[str, Any]] = []
+    topic_results = []
+    for topic in run.get("topics") or []:
+        topic_name = str(topic.get("topic") or "")
+        judged = []
+        for candidate in topic.get("candidates") or []:
+            signal = candidate["signal"]
+            cluster = signal.get("evidence") or []
+            rejected = bool(candidate.get("rejected"))
+            signal_id = None
+            if not rejected and not config.dry_run:
+                signal_id = repository.upsert_signal(signal)
+                signal["id"] = signal_id
+                for item in cluster:
+                    repository.upsert_signal_evidence(signal_id, item)
+                signal["evidence_count"] = repository.refresh_signal_evidence_count(signal_id)
+            if generation_run_id is not None:
+                repository.create_signal_training_example(
+                    generation_run_id=generation_run_id,
+                    signal_id=signal_id,
+                    topic=topic_name,
+                    signal_key=signal["signal_key"],
+                    pipeline_verdict="rejected" if rejected else "accepted",
+                    input_payload=candidate.get("training_input") or {},
+                    raw_output=candidate.get("raw_output") or {},
+                    normalized_output=signal,
+                )
+            if rejected:
+                continue
+            judged.append(signal)
+            all_signals.append(signal)
+        topic_results.append({
+            "topic": topic_name,
+            "article_evidence": topic.get("article_evidence", 0),
+            "total_evidence": topic.get("total_evidence", 0),
+            "skipped_reviewed": topic.get("skipped_reviewed", 0),
+            "web_search": topic.get("web_search"),
+            "clusters": topic.get("clusters", 0),
+            "signals": judged,
+        })
+    all_signals.sort(key=lambda item: (float(item.get("score") or 0), int(item.get("evidence_count") or 0)), reverse=True)
+    return {
+        "dry_run": config.dry_run,
+        "offline": config.offline,
+        "web_search": config.web_search or config.web_only,
+        "web_only": config.web_only,
+        "days": config.days,
+        "topics": [str(topic.get("topic") or "") for topic in run.get("topics") or []],
+        "signals": all_signals[: config.max_signals],
+        "all_signals": len(all_signals),
+        "topic_results": topic_results,
+        "generation_run_id": generation_run_id,
+    }
+
+
+def discover_signals(config: SignalDiscoveryConfig) -> dict[str, Any]:
+    """Прогон целиком на ядре (CLI, локальная очередь, тесты)."""
+    generation_run_id = None
+    if config.persist_training_examples and not config.dry_run:
+        generation_run_id = repository.create_signal_generation_run(
+            config_payload=asdict(config),
+            trigger="signal_discovery",
+            background_job_id=config.background_job_id,
+        )
+    try:
+        snapshot = build_discovery_snapshot(config)
+        run = run_discovery(config, snapshot)
+        result = apply_discovery(config, run, generation_run_id=generation_run_id)
     except Exception as exc:
         if generation_run_id is not None:
             repository.finish_signal_generation_run(
                 generation_run_id,
                 status="failed",
-                result={"topics_completed": len(topic_results), "signals": len(all_signals)},
+                result={},
                 error_message=str(exc)[:1000],
             )
         raise
+    if generation_run_id is not None:
+        repository.finish_signal_generation_run(generation_run_id, status="ok", result={
+            "topics": len(result["topics"]),
+            "signals": result["all_signals"],
+            "returned_signals": len(result["signals"]),
+        })
+    return result
+
+
+def config_from_payload(payload: dict[str, Any], *, background_job_id: int | None = None) -> SignalDiscoveryConfig:
+    """Параметры задачи из payload — те же умолчания, что у локального обработчика."""
+    return SignalDiscoveryConfig(
+        topic=str(payload["topic"]) if payload.get("topic") else None,
+        days=int(payload.get("days") or 14),
+        limit=int(payload.get("limit") or 80),
+        min_score=float(payload.get("min_score") or 40),
+        offline=bool(payload.get("offline", True)),
+        dry_run=bool(payload.get("dry_run", False)),
+        max_signals=int(payload.get("max_signals") or 10),
+        web_search=bool(payload.get("web_search", False)),
+        web_only=bool(payload.get("web_only", False)),
+        web_query_limit=int(payload.get("web_query_limit") or 8),
+        background_job_id=background_job_id,
+    )
+
+
+def build_external_payload(job_payload: dict[str, Any]) -> dict[str, Any]:
+    """Ядро, в момент выдачи задачи воркеру: параметры + снимок базы."""
+    config = config_from_payload(job_payload)
+    config_dict = {key: value for key, value in asdict(config).items() if key != "background_job_id"}
+    return {
+        "kind": "signal_discovery",
+        "config": config_dict,
+        "snapshot": build_discovery_snapshot(config, for_external=True),
+    }
+
+
+def process_external_payload(payload: dict[str, Any], heartbeat: Callable[[], None] | None = None) -> dict[str, Any]:
+    """Сторона воркера: в базу не ходит, возвращает кандидатов ядру."""
+    allowed = {item.name for item in fields(SignalDiscoveryConfig)}
+    config = SignalDiscoveryConfig(**{
+        key: value for key, value in (payload.get("config") or {}).items() if key in allowed
+    })
+    run = run_discovery(config, payload.get("snapshot") or {}, heartbeat=heartbeat)
+    return {"signal_discovery": True, "config": payload.get("config") or {}, "run": run}
+
+
+def apply_external_result(result: dict[str, Any], *, job_id: int) -> dict[str, Any]:
+    """Ядро, при завершении задачи: записать сигналы и вернуть компактный итог.
+
+    Полный результат (все кандидаты с подтверждениями и промптами) в result_json задачи
+    не кладём — он осядет в signal_training_examples; в задаче остаются счётчики."""
+    allowed = {item.name for item in fields(SignalDiscoveryConfig)}
+    config = replace(
+        SignalDiscoveryConfig(**{
+            key: value for key, value in (result.get("config") or {}).items() if key in allowed
+        }),
+        background_job_id=job_id,
+    )
+    generation_run_id = None
+    if config.persist_training_examples and not config.dry_run:
+        generation_run_id = repository.create_signal_generation_run(
+            config_payload=asdict(config),
+            trigger="signal_discovery_external",
+            background_job_id=job_id,
+        )
+    applied = apply_discovery(config, result.get("run") or {}, generation_run_id=generation_run_id)
+    topics = []
+    for row in applied["topic_results"]:
+        web = row.get("web_search") or {}
+        topics.append({
+            "topic": row["topic"],
+            "web_status": web.get("status"),
+            "queries": len(web.get("queries") or []),
+            "results": web.get("results"),
+            "total_evidence": row.get("total_evidence"),
+            "skipped_reviewed": row.get("skipped_reviewed"),
+            "clusters": row.get("clusters"),
+            "signals": len(row.get("signals") or []),
+        })
+    summary = {
+        "generation_run_id": generation_run_id,
+        "signals": applied["all_signals"],
+        "persisted": 0 if config.dry_run else applied["all_signals"],
+        "topics": topics,
+    }
+    if generation_run_id is not None:
+        repository.finish_signal_generation_run(generation_run_id, status="ok", result={
+            "topics": len(topics),
+            "signals": applied["all_signals"],
+            "returned_signals": len(applied["signals"]),
+        })
+    return summary
 
 
 def judge_signal(evidence: list[dict[str, Any]], topic: str, *, offline: bool = True) -> dict[str, Any]:
@@ -519,8 +756,41 @@ def list_signals(*, maturity: str | None = None, theme: str | None = None, limit
     return repository.list_signals(maturity=maturity, theme=theme, limit=limit)
 
 
+def topics_from_tags(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Темы радара = корневые тематики заказчика (13), без служебного приёмника.
+
+    Пункт 12 Виктора: сигналы раскладывать по его тегам. Прежние 21 тема (4 HSE +
+    17 направлений из сида) давали 25 из 38 сигналов с темой «HSE/…» — отсюда
+    «меньше в основных, больше в технологических»."""
+    topics = []
+    for tag in tags:
+        if tag.get("parent_id") is not None:
+            continue
+        name = str(tag.get("name") or "").strip()
+        if not name or name == repository.SYSTEM_TAG_UNCLASSIFIED:
+            continue
+        topics.append({
+            "name": name,
+            "description": str(tag.get("description") or "").strip(),
+            "query_seeds_json": [],
+            "tag_id": tag.get("id"),
+        })
+    return topics
+
+
+def _radar_topics() -> list[dict]:
+    if app_config.SIGNAL_RADAR_TOPIC_SOURCE == "tags":
+        try:
+            topics = topics_from_tags(repository.list_enabled_tags())
+        except Exception:  # noqa: BLE001 - без справочника тегов откатываемся на таблицу тем
+            topics = []
+        if topics:
+            return topics
+    return repository.list_signal_radar_topics(enabled_only=True)
+
+
 def _selected_topics(topic: str | None) -> list[dict]:
-    rows = repository.list_signal_radar_topics(enabled_only=True)
+    rows = _radar_topics()
     if not topic:
         return rows or DEFAULT_RADAR_TOPICS
     topic_l = topic.lower()
@@ -568,7 +838,13 @@ def _search_web_evidence(topic: dict[str, Any], config: SignalDiscoveryConfig) -
     topic_name = str(topic.get("name") or config.topic or "").strip()
     tag_context = _topic_tag_context(topic_name)
     seed_queries = _topic_seed_queries(topic, year=2026, tag_context=tag_context)
-    feedback_queries = feedback_query_hints(topic_name, limit=config.web_query_limit)
+    topic_terms = topic_term_stems(
+        topic_name,
+        str(topic.get("description") or ""),
+        *(tag_context.get("keywords_ru") or []),
+        *(tag_context.get("keywords_en") or []),
+    )
+    feedback_queries = feedback_query_hints(topic_name, limit=config.web_query_limit, topic_terms=topic_terms)
     generation_topic = _query_generation_topic(topic, tag_context)
     generated_queries = generate_search_queries(
         generation_topic,
@@ -616,10 +892,12 @@ def _topic_seed_queries(topic: dict[str, Any], *, year: int, tag_context: dict[s
 
 
 def _topic_tag_context(topic_name: str) -> dict[str, Any]:
-    try:
-        tags = repository.list_enabled_tags()
-    except Exception:  # noqa: BLE001 - tag context is an enrichment, not a hard dependency for search
-        tags = []
+    tags = _TAGS_SNAPSHOT.get()
+    if tags is None:
+        try:
+            tags = repository.list_enabled_tags()
+        except Exception:  # noqa: BLE001 - tag context is an enrichment, not a hard dependency for search
+            tags = []
     selected = _select_topic_tags(topic_name, tags)
     return {
         "tags": selected,
@@ -634,6 +912,17 @@ def _select_topic_tags(topic_name: str, tags: list[dict[str, Any]]) -> list[dict
     if not topic_name or not tags:
         return []
     topic_norm = _norm_match_text(topic_name)
+    # Тема = тематика заказчика по имени — берём её и её подтеги, и только их. Иначе
+    # пересечение по общим словам («оборудование», «промышленных») притягивало соседние
+    # тематики, и «Добыча…» искала заодно ключами «Бурения…».
+    exact = [tag for tag in tags if _norm_match_text(str(tag.get("name") or "")) == topic_norm]
+    if exact:
+        exact_ids = {int(tag["id"]) for tag in exact if tag.get("id") is not None}
+        return [
+            tag for tag in tags
+            if (tag.get("id") is not None and int(tag["id"]) in exact_ids)
+            or (tag.get("parent_id") is not None and int(tag["parent_id"]) in exact_ids)
+        ][:24]
     direct_ids: set[int] = set()
     direct_parent_ids: set[int] = set()
     for tag in tags:

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import csv
 import hashlib
+import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from oiltech_digest.db import repository
 
@@ -20,6 +23,59 @@ FEEDBACK_MEMORY_TYPES = {
     "signal_verdict",
     "signal_duplicate",
 }
+
+# Из каких вердиктов можно учиться ИСКАТЬ. Подсказки поиска раньше выводились из
+# каждого отзыва подряд: заголовок отклонённого сигнала («ритейлер арендует БПЛА»,
+# «добыча лития» школьного проекта) становился поисковым запросом, и чем больше
+# заказчик браковал литий, тем больше радар его искал («сейчас там один литий»).
+# Брак, дубль и «слишком общее» — повод НЕ искать такое, а не искать ещё.
+QUERY_HINT_VERDICTS = {"strong_signal", "approved", "watch_later", "needs_better_source", "bad_translation"}
+NEGATIVE_VERDICTS = {"reject", "wrong_domain", "too_generic", "merge_duplicate"}
+
+# Снимок памяти для прогона без базы (внешний воркер в NL её не имеет). Пока снимок
+# установлен, чтение памяти идёт из него, а не из repository.
+_MEMORY_SNAPSHOT: ContextVar[dict[str, list[dict[str, Any]]] | None] = ContextVar(
+    "signal_feedback_memory_snapshot", default=None
+)
+MEMORY_SNAPSHOT_LIMIT = 200
+
+
+def memory_snapshot_rows(*, limit: int = MEMORY_SNAPSHOT_LIMIT) -> dict[str, list[dict[str, Any]]]:
+    """Активная память ОС по типам — в том же порядке, в каком её отдаёт база.
+
+    Результат сериализуем в JSON: уезжает внешнему воркеру в payload задачи."""
+    snapshot: dict[str, list[dict[str, Any]]] = {}
+    for memory_type in sorted(FEEDBACK_MEMORY_TYPES):
+        rows = repository.list_signal_agent_memory(memory_type=memory_type, status="active", limit=limit)
+        snapshot[memory_type] = [
+            json.loads(json.dumps(
+                {
+                    "memory_type": row.get("memory_type") or memory_type,
+                    "subject": row.get("subject"),
+                    "score": float(row.get("score") or 0),
+                    "facts_json": row.get("facts_json") or {},
+                },
+                default=str,
+            ))
+            for row in rows
+        ]
+    return snapshot
+
+
+@contextmanager
+def use_memory_snapshot(snapshot: dict[str, list[dict[str, Any]]] | None) -> Iterator[None]:
+    token = _MEMORY_SNAPSHOT.set(snapshot)
+    try:
+        yield
+    finally:
+        _MEMORY_SNAPSHOT.reset(token)
+
+
+def _memory_rows(memory_type: str, *, limit: int) -> list[dict[str, Any]]:
+    snapshot = _MEMORY_SNAPSHOT.get()
+    if snapshot is not None:
+        return list(snapshot.get(memory_type) or [])[:limit]
+    return repository.list_signal_agent_memory(memory_type=memory_type, status="active", limit=limit)
 
 
 def import_signal_feedback_csv(path: str | Path, *, user_id: int | None = None, dry_run: bool = False) -> dict[str, Any]:
@@ -185,14 +241,17 @@ def extract_feedback_memories(row: dict[str, str]) -> list[dict[str, Any]]:
             "score": 70,
             "facts": {"signal_title": signal_title},
         })
-    for query in _derive_query_hints(comment, signal_title):
-        memories.append({
-            "memory_type": "signal_query_hint",
-            "subject": query,
-            "score": 65,
-            "facts": {"signal_title": signal_title},
-        })
-    if _positive_source_comment(comment) and source_url:
+    # Искать дальше учимся только на том, что заказчик одобрил (см. QUERY_HINT_VERDICTS).
+    # Отзыв без вердикта (старый CSV-импорт) — только если сам комментарий положительный.
+    if verdict in QUERY_HINT_VERDICTS or (verdict is None and _positive_source_comment(comment)):
+        for query in _derive_query_hints(comment, signal_title):
+            memories.append({
+                "memory_type": "signal_query_hint",
+                "subject": query,
+                "score": 65,
+                "facts": {"signal_title": signal_title},
+            })
+    if verdict not in NEGATIVE_VERDICTS and _positive_source_comment(comment) and source_url:
         memories.append({
             "memory_type": "signal_source_preference",
             "subject": repository.normalize_domain(source_url),
@@ -202,11 +261,37 @@ def extract_feedback_memories(row: dict[str, str]) -> list[dict[str, Any]]:
     return memories
 
 
+def retire_query_hints_from_negative_feedback(*, dry_run: bool = True) -> dict[str, Any]:
+    """Погасить подсказки поиска, выведенные из брака (до правки 18.09 — из любого отзыва).
+
+    Вердикт отзыва, из которого родилась строка памяти, лежит в её facts_json
+    (store_signal_feedback кладёт туда факты отзыва целиком). Строки не удаляются:
+    статус 'superseded' убирает их из выдачи и оставляет след, откуда они взялись."""
+    rows = repository.list_signal_agent_memory(
+        memory_type="signal_query_hint", status="active", limit=100_000
+    )
+    retired: list[dict[str, Any]] = []
+    kept = 0
+    for row in rows:
+        facts = row.get("facts_json") or {}
+        verdict = _normalize_verdict(facts.get("verdict"))
+        if verdict in QUERY_HINT_VERDICTS or (
+            verdict is None and _positive_source_comment(str(facts.get("comment") or ""))
+        ):
+            kept += 1
+            continue
+        retired.append({"id": row.get("id"), "subject": row.get("subject"), "verdict": verdict})
+        if not dry_run:
+            repository.set_signal_agent_memory_status(int(row["id"]), "superseded")
+    return {"dry_run": dry_run, "active_before": len(rows), "kept": kept,
+            "retired": len(retired), "retired_rows": retired[:200]}
+
+
 def signal_feedback_memory_context(topic: str | None = None, *, limit: int = 80) -> dict[str, list[dict[str, Any]]]:
     result = {memory_type: [] for memory_type in FEEDBACK_MEMORY_TYPES}
     topic_l = (topic or "").lower()
     for memory_type in FEEDBACK_MEMORY_TYPES:
-        rows = repository.list_signal_agent_memory(memory_type=memory_type, status="active", limit=limit)
+        rows = _memory_rows(memory_type, limit=limit)
         for row in rows:
             facts = row.get("facts_json") or {}
             haystack = " ".join(
@@ -283,9 +368,22 @@ def _verdict_score(verdict: str) -> float:
     return 0
 
 
-def feedback_query_hints(topic: str | None, *, limit: int = 8) -> list[str]:
+def feedback_query_hints(
+    topic: str | None,
+    *,
+    limit: int = 8,
+    topic_terms: set[str] | None = None,
+) -> list[str]:
+    """Поисковые подсказки из ОС для темы.
+
+    topic_terms — основы слов темы (название + ключи её тематики). Когда они даны,
+    подсказка берётся, только если говорит о ТОЙ ЖЕ теме: иначе одни и те же
+    одобренные запросы уходили бы во все темы подряд, и каждая тема искала бы
+    одно и то же."""
     memory = signal_feedback_memory_context(topic, limit=120)
     hints = [str(row.get("subject") or "").strip() for row in memory["signal_query_hint"]]
+    if topic_terms is not None:
+        hints = [hint for hint in hints if hint_matches_topic(hint, topic_terms)]
     preferred_domains = [str(row.get("subject") or "").strip() for row in memory["signal_source_preference"]]
     queries = []
     for hint in hints:
@@ -297,16 +395,63 @@ def feedback_query_hints(topic: str | None, *, limit: int = 8) -> list[str]:
     return _dedupe(queries)[:limit]
 
 
+# Слова, которые есть почти в любой подсказке и темы не различают.
+_GENERIC_TERM_STEMS = {
+    "techno", "deploy", "indust", "нефтег", "нефтян", "нефти", "газово", "промыш",
+    "технол", "компан", "россии", "россий", "system", "servic", "сервис", "operat",
+    "решени",
+}
+
+
+def topic_term_stems(*texts: str) -> set[str]:
+    """Основы слов (первые 6 букв слов от 5 букв) без общеотраслевых."""
+    stems: set[str] = set()
+    for text in texts:
+        for word in re.findall(r"[a-zа-яё0-9]{5,}", (text or "").lower().replace("ё", "е")):
+            stem = word[:6]
+            if stem not in _GENERIC_TERM_STEMS and not stem.isdigit():
+                stems.add(stem)
+    return stems
+
+
+def hint_matches_topic(hint: str, topic_terms: set[str]) -> bool:
+    return bool(topic_term_stems(hint) & topic_terms)
+
+
+# Сколько примеров ОС показывать судье. Причины у заказчика развёрнутые (до 1–2 тыс.
+# знаков), а промпт уходит в КАЖДЫЙ вызов судьи — поэтому причину режем.
+PROMPT_POSITIVE_EXAMPLES = 6
+PROMPT_NEGATIVE_EXAMPLES = 8
+PROMPT_REASON_CHARS = 320
+
+
 def feedback_prompt_block(topic: str | None = None, *, limit: int = 20) -> str:
     memory = signal_feedback_memory_context(topic, limit=120)
     lines = []
-    if memory["signal_verdict"]:
-        lines.append("feedback_verdict_examples:")
-        for row in memory["signal_verdict"][:limit]:
-            facts = row.get("facts_json") or {}
-            reason = str(facts.get("reason") or "").strip()
-            signal_title = str(facts.get("signal_title") or "").strip()
-            lines.append(f"- verdict={row.get('subject')} signal={signal_title} reason={reason}")
+    # Вердикты берём мимо тематического фильтра контекста: тот пропускает не больше 12
+    # строк «не по теме», а длинное имя темы подстрокой не совпадает почти никогда.
+    # Память отсортирована по весу вердикта, у брака вес −80 — и до судьи доходили
+    # только одобренные и дубли, ни одного отказа: он не видел как раз того, чего
+    # заказчик просит НЕ приносить. Берём обе стороны.
+    verdict_rows = _memory_rows("signal_verdict", limit=120)
+    if verdict_rows:
+        rows = verdict_rows
+        negatives = [row for row in rows if str(row.get("subject") or "") in NEGATIVE_VERDICTS]
+        positives = [row for row in rows if str(row.get("subject") or "") not in NEGATIVE_VERDICTS]
+        for title, subset, cap in (
+            ("feedback_approved_examples (так делать):", positives, PROMPT_POSITIVE_EXAMPLES),
+            ("feedback_rejected_examples (так НЕ делать — такие сигналы заказчик отклонил):", negatives, PROMPT_NEGATIVE_EXAMPLES),
+        ):
+            if not subset:
+                continue
+            lines.append(title)
+            for row in subset[:cap]:
+                facts = row.get("facts_json") or {}
+                reason = re.sub(r"\s+", " ", str(facts.get("reason") or "")).strip()
+                if len(reason) > PROMPT_REASON_CHARS:
+                    reason = reason[:PROMPT_REASON_CHARS].rstrip() + "…"
+                signal_title = str(facts.get("signal_title") or "").strip()
+                lines.append(f"- verdict={row.get('subject')} signal={signal_title} reason={reason}")
     if memory["signal_duplicate"]:
         lines.append("feedback_duplicate_examples:")
         for row in memory["signal_duplicate"][:limit]:

@@ -183,6 +183,17 @@ def _handle_job(client: ExternalWorkerClient, job: dict[str, Any]) -> None:
             result = external_fetch.process_payload(job.get("payload") or {})
             client.progress(job, 90)
             client.complete(job, result)
+        elif job.get("kind") == "signal_discovery":
+            # Радар: снимок базы приходит в payload, сигналы пишет ядро при complete.
+            from oiltech_digest import signal_discovery
+
+            client.progress(job, 20)
+            result = signal_discovery.process_external_payload(
+                job.get("payload") or {},
+                heartbeat=lambda: _safe_heartbeat(client, job),
+            )
+            client.progress(job, 90)
+            client.complete(job, result)
         else:
             raise ValueError(f"Unsupported external job kind: {job.get('kind')}")
         logger.info("external_job_finished job_id=%s kind=%s", job["id"], job.get("kind"))

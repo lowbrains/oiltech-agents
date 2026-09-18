@@ -1,7 +1,10 @@
 services:
   external-worker:
     build: .
-    container_name: oiltech_external_worker
+    # Уникальное имя: на NL-сервере рядом живёт воркер MVP-1 с именем
+    # oiltech_external_worker. С одинаковыми именами второй не поднялся бы, а
+    # пересоздание «не в той папке» погасило бы воркер заказчика.
+    container_name: oiltech_agents_external_worker
     restart: unless-stopped
     env_file:
       - .env.external-worker

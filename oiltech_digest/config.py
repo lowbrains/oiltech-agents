@@ -213,8 +213,14 @@ SIGNAL_DISCOVERY_DAILY_LOOKBACK_HOURS = int(os.environ.get("SIGNAL_DISCOVERY_DAI
 SIGNAL_DISCOVERY_DAYS = int(os.environ.get("SIGNAL_DISCOVERY_DAYS", "14"))
 SIGNAL_DISCOVERY_LIMIT = int(os.environ.get("SIGNAL_DISCOVERY_LIMIT", "120"))
 SIGNAL_DISCOVERY_MIN_SCORE = float(os.environ.get("SIGNAL_DISCOVERY_MIN_SCORE", "40"))
-SIGNAL_DISCOVERY_MAX_SIGNALS = int(os.environ.get("SIGNAL_DISCOVERY_MAX_SIGNALS", "20"))
-SIGNAL_DISCOVERY_WEB_QUERY_LIMIT = int(os.environ.get("SIGNAL_DISCOVERY_WEB_QUERY_LIMIT", "8"))
+# MAX_SIGNALS — сколько кластеров КАЖДОЙ темы уходит судье (а не сколько сигналов вернуть):
+# 13 тем × 6 = до 78 вызовов модели на прогон. Прежние 20 на 21 тему давали до 420.
+SIGNAL_DISCOVERY_MAX_SIGNALS = int(os.environ.get("SIGNAL_DISCOVERY_MAX_SIGNALS", "6"))
+# Запросов к поиску на тему: 13 × 4 = 52 на прогон, ~1600 в месяц при ежедневном запуске.
+SIGNAL_DISCOVERY_WEB_QUERY_LIMIT = int(os.environ.get("SIGNAL_DISCOVERY_WEB_QUERY_LIMIT", "4"))
+# Откуда брать темы радара: tags — корневые тематики заказчика (пункт 12), table —
+# таблица signal_radar_topics (прежние 21 тема из сида).
+SIGNAL_RADAR_TOPIC_SOURCE = os.environ.get("SIGNAL_RADAR_TOPIC_SOURCE", "tags").strip().lower()
 
 
 def price_for_model(model: str | None) -> tuple[float, float]:

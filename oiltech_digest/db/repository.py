@@ -1678,6 +1678,47 @@ def list_signal_agent_memory(
         return cur.fetchall()
 
 
+def set_signal_agent_memory_status(memory_id: int, status: str) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE signal_agent_memory
+            SET status = %s,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (status, memory_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def list_reviewed_signal_urls() -> list[str]:
+    """Адреса материалов, по которым человек уже вынес суждение о сигнале.
+
+    Радар не должен приносить их снова: отклонённое вернулось бы тем же сигналом,
+    а одобренное перезаписалось бы новой оценкой модели поверх разобранного
+    (signal_evidence.source_url уникален — повторная находка забирает материал себе)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT DISTINCT e.source_url
+            FROM signal_evidence e
+            WHERE e.signal_id IN (
+                SELECT f.signal_id FROM signal_feedback_events f
+                WHERE f.signal_id IS NOT NULL
+                  AND (f.verdict IS NOT NULL OR f.event_type = 'comment_added')
+            )
+            UNION
+            SELECT DISTINCT f.source_url
+            FROM signal_feedback_events f
+            WHERE f.signal_id IS NOT NULL
+              AND COALESCE(f.source_url, '') <> ''
+            """
+        )
+        return [str(row[0]) for row in cur.fetchall() if row[0]]
+
+
 def update_agent_memory_status(memory_id: int, status: str) -> bool:
     with get_connection() as conn:
         cur = conn.execute(

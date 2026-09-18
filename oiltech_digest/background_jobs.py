@@ -51,10 +51,15 @@ def enqueue_daily_signal_discovery(*, force: bool = False) -> dict[str, Any]:
 
     marker = {"schedule": DAILY_SIGNAL_DISCOVERY_MARKER}
     lookback_hours = max(1, config.SIGNAL_DISCOVERY_DAILY_LOOKBACK_HOURS)
+    # 'failed' — тоже попытка этого дня. Без него упавшая задача ставилась заново на
+    # каждом цикле планировщика (30 мин): 134 запуска за 5 дней вместо 5. Пока падение
+    # было мгновенным (403 на первом вызове), это ничего не стоило; падение в конце
+    # прогона сжигало бы почти весь его бюджет каждые полчаса.
     if not force and repository.has_recent_background_job(
         kind="signal_discovery",
         payload_subset=marker,
         lookback_hours=lookback_hours,
+        statuses=("queued", "running", "finalizing", "ok", "failed"),
     ):
         return {
             "enqueued": False,
@@ -480,22 +485,10 @@ def _run_source_discovery_loop(payload: dict[str, Any], job_id: int) -> dict[str
 
 
 def _run_signal_discovery(payload: dict[str, Any], job_id: int) -> dict[str, Any]:
-    from oiltech_digest.signal_discovery import SignalDiscoveryConfig, discover_signals
+    from oiltech_digest.signal_discovery import config_from_payload, discover_signals
 
     repository.update_background_job_progress(job_id, 15)
-    result = discover_signals(SignalDiscoveryConfig(
-        topic=str(payload["topic"]) if payload.get("topic") else None,
-        days=int(payload.get("days") or 14),
-        limit=int(payload.get("limit") or 80),
-        min_score=float(payload.get("min_score") or 40),
-        offline=bool(payload.get("offline", True)),
-        dry_run=bool(payload.get("dry_run", False)),
-        max_signals=int(payload.get("max_signals") or 10),
-        web_search=bool(payload.get("web_search", False)),
-        web_only=bool(payload.get("web_only", False)),
-        web_query_limit=int(payload.get("web_query_limit") or 8),
-        background_job_id=job_id,
-    ))
+    result = discover_signals(config_from_payload(payload, background_job_id=job_id))
     repository.update_background_job_progress(job_id, 95)
     return result
 

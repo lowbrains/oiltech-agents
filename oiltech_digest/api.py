@@ -2022,6 +2022,12 @@ def external_worker_complete(
             result = {**documents_external.scrub_result(result), "applied": applied}
         if job.get("kind") == "scrape_source" and result.get("external_fetch"):
             result = {**result, "applied": external_fetch.apply_scrape_result(result)}
+        if job.get("kind") == "signal_discovery" and result.get("signal_discovery"):
+            from oiltech_digest import signal_discovery
+
+            # Конверт ЗАМЕНЯЕТСЯ итогом: кандидаты с подтверждениями и промптами весят
+            # мегабайты и уже лежат в signal_training_examples — в задаче только счётчики.
+            result = {"signal_discovery": True, "applied": signal_discovery.apply_external_result(result, job_id=job_id)}
     except Exception:
         # apply упал — снять 'finalizing', чтобы задача не залипла (вернётся в очередь по лизу/stale)
         repository.release_external_background_job_finalize(job_id, lease_token_hash=lease_token_hash)
@@ -2421,6 +2427,10 @@ def _external_worker_payload(row: dict[str, Any]) -> dict[str, Any]:
         return _clean(documents_external.build_document_payload(payload))
     if row.get("kind") == "scrape_source" and str(row.get("queue_name") or "").startswith("external-"):
         return _clean(external_fetch.build_scrape_source_payload(int(payload["source_id"]), payload))
+    if row.get("kind") == "signal_discovery" and row.get("queue_name") == "external-ai":
+        from oiltech_digest import signal_discovery
+
+        return _clean(signal_discovery.build_external_payload(payload))
     return _clean(payload)
 
 

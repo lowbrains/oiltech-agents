@@ -6,6 +6,10 @@ from oiltech_digest import signal_discovery
 @pytest.fixture(autouse=True)
 def no_signal_feedback_memory(monkeypatch):
     monkeypatch.setattr(signal_discovery, "apply_feedback_glossary", lambda text, topic=None: text)
+    # Темы — из таблицы, которую тесты подменяют; фильтр разобранного — пустой.
+    # Иначе разведка пошла бы в настоящую локальную базу за тегами и адресами.
+    monkeypatch.setattr(signal_discovery.app_config, "SIGNAL_RADAR_TOPIC_SOURCE", "table")
+    monkeypatch.setattr(signal_discovery.repository, "list_reviewed_signal_urls", lambda: [])
 
 
 def test_default_radar_topics_cover_business_directions():
@@ -239,10 +243,12 @@ def test_discover_signals_filters_reject_title_even_when_maturity_watch(monkeypa
             ],
         },
     )
+    # Разведка зовёт judge_signal_snapshot. Подмена judge_signal сюда не доходила, и тест
+    # шёл в настоящий OpenAI: с ключом в окружении «проходил» живым запросом, без ключа падал.
     monkeypatch.setattr(
         signal_discovery,
-        "judge_signal",
-        lambda cluster, topic, offline=True: {
+        "judge_signal_snapshot",
+        lambda cluster, topic, offline=True: ({
             "title": "reject",
             "theme": topic,
             "summary": "Нет конкретного внедрения.",
@@ -255,7 +261,7 @@ def test_discover_signals_filters_reject_title_even_when_maturity_watch(monkeypa
             "why_not_noise": "Нет конкретного промышленного применения.",
             "companies": [],
             "industries": [],
-        },
+        }, {}),
     )
 
     result = signal_discovery.discover_signals(
@@ -478,7 +484,7 @@ def test_web_search_prioritizes_feedback_query_hints(monkeypatch):
     monkeypatch.setattr(
         signal_discovery,
         "feedback_query_hints",
-        lambda topic, limit=8: ["2026 closed-loop rig automation oil gas deployment"],
+        lambda topic, limit=8, **kwargs: ["2026 closed-loop rig automation oil gas deployment"],
     )
     monkeypatch.setattr(
         source_agent,
@@ -517,7 +523,7 @@ def test_web_search_enriches_queries_with_tag_keywords(monkeypatch):
     from oiltech_digest.source_discovery import agent as source_agent
 
     captured = {}
-    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8: [])
+    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8, **kwargs: [])
     monkeypatch.setattr(
         signal_discovery.repository,
         "list_enabled_tags",
@@ -583,7 +589,7 @@ def test_web_search_enriches_queries_with_tag_keywords(monkeypatch):
 def test_web_search_filters_results_by_tag_negative_keywords(monkeypatch):
     from oiltech_digest.source_discovery import agent as source_agent
 
-    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8: [])
+    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8, **kwargs: [])
     monkeypatch.setattr(
         signal_discovery.repository,
         "list_enabled_tags",
