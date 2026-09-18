@@ -49,13 +49,18 @@ def test_approve_source_candidate_creates_disabled_request_source(monkeypatch):
     )
 
     class Cursor:
+        def __init__(self, row):
+            self.row = row
+
         def fetchone(self):
-            return [77]
+            return self.row
 
     class Conn:
         def execute(self, sql, params=None):
+            if sql.lstrip().startswith("SELECT"):
+                return Cursor(None)  # источника с таким именем ещё нет
             executed.append((sql, params))
-            return Cursor()
+            return Cursor([77])
 
         def commit(self):
             executed.append(("commit", None))
@@ -97,13 +102,18 @@ def test_approve_source_candidate_uses_rss_url_for_rss_candidate(monkeypatch):
     )
 
     class Cursor:
+        def __init__(self, row):
+            self.row = row
+
         def fetchone(self):
-            return [78]
+            return self.row
 
     class Conn:
         def execute(self, sql, params=None):
+            if sql.lstrip().startswith("SELECT"):
+                return Cursor(None)  # источника с таким именем ещё нет
             executed.append((sql, params))
-            return Cursor()
+            return Cursor([78])
 
         def commit(self):
             pass
@@ -615,3 +625,26 @@ def test_background_job_status_counts_filters_capability(isolated_db):
     counts = repository.background_job_status_counts(capability="source-discovery")
 
     assert counts == {"queued": 1}
+
+
+def test_approve_does_not_overwrite_another_site_with_the_same_name(isolated_db, monkeypatch):
+    candidates = {
+        1: {"id": 1, "url": "https://a.example/press", "name": "Press Releases", "candidate_type": "newsroom",
+            "topic": None, "approved_source_id": None},
+        2: {"id": 2, "url": "https://b.example/press", "name": "Press Releases", "candidate_type": "newsroom",
+            "topic": None, "approved_source_id": None},
+        3: {"id": 3, "url": "https://a.example/news", "name": "Press Releases", "candidate_type": "newsroom",
+            "topic": None, "approved_source_id": None},
+    }
+    monkeypatch.setattr(repository, "get_source_candidate", lambda candidate_id: candidates[candidate_id])
+
+    first = repository.approve_source_candidate(1)
+    second = repository.approve_source_candidate(2)
+    again = repository.approve_source_candidate(3)  # тот же сайт — обновление, а не новый источник
+
+    with repository.get_connection() as conn:
+        rows = {row[0]: row[1:] for row in conn.execute("SELECT id, name, url FROM sources WHERE id = ANY(%s)",
+                                                         ([first, second],)).fetchall()}
+    assert second != first and again == first
+    assert rows[second] == ("Press Releases (b.example)", "https://b.example/press")
+    assert rows[first] == ("Press Releases", "https://a.example/news")

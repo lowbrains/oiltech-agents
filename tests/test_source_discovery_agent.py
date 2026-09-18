@@ -1244,3 +1244,15 @@ def test_test_source_candidate_dry_run_does_not_update(monkeypatch):
     assert result["recommended_action"] == "reject"
     assert result["next_status"] == "rejected"
     assert updates == []
+
+
+def test_single_4xx_does_not_reject_domain_forever(monkeypatch):
+    memory = []
+    monkeypatch.setattr(agent.repository, "list_agent_memory", lambda **kwargs: [])
+    monkeypatch.setattr(agent.repository, "upsert_agent_memory", lambda **kwargs: memory.append(kwargs) or 1)
+
+    for reason in ("http_403", "http_404", "http_451"):
+        agent._record_unavailable_domain(f"https://site.example/{reason}", reason, {"probe": {"status": int(reason[5:])}})
+
+    # 404 — мёртвая ссылка, 403/451 — блок адреса ядра: домен остаётся в поиске после отсрочки.
+    assert [row["status"] for row in memory] == ["temporary_unavailable"] * 3

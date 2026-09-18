@@ -614,6 +614,15 @@ def approve_source_candidate(
     rss_url = url if strategy == "rss" else None
     listing_url = None if strategy == "rss" else url
     with get_connection() as conn:
+        same_name = conn.execute(
+            "SELECT url, listing_url, rss_url FROM sources WHERE name = %s AND source_type = %s",
+            (source_name, source_type),
+        ).fetchone()
+        domain = normalize_domain(url)
+        if same_name and domain and domain not in {normalize_domain(str(value or "")) for value in same_name}:
+            # Имя берётся из заголовка страницы и бывает общим («Press Releases», «News»):
+            # без этого ON CONFLICT ниже молча переписал бы адрес ЧУЖОГО источника.
+            source_name = f"{source_name} ({domain})"
         cur = conn.execute(
             """
             INSERT INTO sources (

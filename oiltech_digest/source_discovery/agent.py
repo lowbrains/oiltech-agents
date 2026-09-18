@@ -1204,9 +1204,14 @@ def _record_unavailable_domain(url: str, reason: str, inspection: dict[str, Any]
 
 
 def _domain_unavailable_status(reason: str) -> str:
-    if reason.startswith("http_5") or reason.startswith("fetch_failed"):
-        return "temporary_unavailable"
-    return "rejected"
+    """Одна ошибка — не приговор домену, какой бы она ни была.
+
+    404/410 — мёртвая ССЫЛКА из выдачи, а не плохой сайт; 403/451 чаще всего режут
+    адрес российского ядра, откуда идёт проверка, а не любого читателя; 5xx и сбой
+    сети — временные по природе. Раньше любая 4xx с первого раза навсегда выкидывала
+    домен из поиска. Теперь — отсрочка, а в «rejected» домен уходит после
+    TEMPORARY_UNAVAILABLE_REJECT_AFTER сбоев (_record_unavailable_domain)."""
+    return "temporary_unavailable"
 
 
 def _domain_memory_facts(domain: str) -> dict[str, Any]:
