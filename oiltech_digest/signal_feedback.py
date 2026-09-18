@@ -241,9 +241,11 @@ def extract_feedback_memories(row: dict[str, str]) -> list[dict[str, Any]]:
             "score": 70,
             "facts": {"signal_title": signal_title},
         })
-    # Искать дальше учимся только на том, что заказчик одобрил (см. QUERY_HINT_VERDICTS).
-    # Отзыв без вердикта (старый CSV-импорт) — только если сам комментарий положительный.
-    if verdict in QUERY_HINT_VERDICTS or (verdict is None and _positive_source_comment(comment)):
+    # Искать дальше НЕ учимся на браке, дублях и «слишком общем» (см. QUERY_HINT_VERDICTS).
+    # Отзыв без вердикта (первая таблица заказчика, CSV-импорт 13.09) подсказку даёт:
+    # там в основном развёрнутые положительные разборы («сильная находка…»), а от
+    # переноса в чужие темы защищает тематический фильтр feedback_query_hints.
+    if verdict is None or verdict in QUERY_HINT_VERDICTS:
         for query in _derive_query_hints(comment, signal_title):
             memories.append({
                 "memory_type": "signal_query_hint",
@@ -264,6 +266,9 @@ def extract_feedback_memories(row: dict[str, str]) -> list[dict[str, Any]]:
 def retire_query_hints_from_negative_feedback(*, dry_run: bool = True) -> dict[str, Any]:
     """Погасить подсказки поиска, выведенные из брака (до правки 18.09 — из любого отзыва).
 
+    Отзывы без вердикта не трогаем: это первая таблица заказчика, где вердиктов не было,
+    а разборы в основном положительные — маркерами их полярность не определить.
+
     Вердикт отзыва, из которого родилась строка памяти, лежит в её facts_json
     (store_signal_feedback кладёт туда факты отзыва целиком). Строки не удаляются:
     статус 'superseded' убирает их из выдачи и оставляет след, откуда они взялись."""
@@ -275,9 +280,7 @@ def retire_query_hints_from_negative_feedback(*, dry_run: bool = True) -> dict[s
     for row in rows:
         facts = row.get("facts_json") or {}
         verdict = _normalize_verdict(facts.get("verdict"))
-        if verdict in QUERY_HINT_VERDICTS or (
-            verdict is None and _positive_source_comment(str(facts.get("comment") or ""))
-        ):
+        if verdict is None or verdict in QUERY_HINT_VERDICTS:
             kept += 1
             continue
         retired.append({"id": row.get("id"), "subject": row.get("subject"), "verdict": verdict})

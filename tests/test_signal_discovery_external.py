@@ -322,14 +322,15 @@ def test_retire_query_hints_from_negative_feedback(isolated_db):
         )
 
     dry = signal_feedback.retire_query_hints_from_negative_feedback(dry_run=True)
-    assert dry["retired"] == 2
+    assert dry["retired"] == 1
     assert len(repository.list_signal_agent_memory(memory_type="signal_query_hint")) == 4  # сухой прогон не пишет
 
     result = signal_feedback.retire_query_hints_from_negative_feedback(dry_run=False)
 
     active = {row["subject"] for row in repository.list_signal_agent_memory(memory_type="signal_query_hint")}
-    assert result["retired"] == 2
-    assert active == {"2026 h-approved oil gas", "2026 h-legacy oil gas"}
+    assert result["retired"] == 1
+    # Без вердикта — первая таблица заказчика: не гасим, полярность маркерами не определить.
+    assert active == {"2026 h-approved oil gas", "2026 h-legacy oil gas", "2026 h-legacy-neutral oil gas"}
 
 
 def test_failed_daily_radar_is_not_requeued_the_same_day(isolated_db, monkeypatch):
