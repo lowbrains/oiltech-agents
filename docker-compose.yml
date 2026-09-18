@@ -1,32 +1,40 @@
+# Агентная ветвь живёт на том же сервере, что MVP-1, поэтому здесь всё своё: имя
+# проекта (сети и тома получают префикс oiltech-agents_), контейнеры oiltech_agents_*,
+# порты, отдельный экземпляр Postgres с базой oiltech_agents. Общая база — это
+# ровно то, от чего уходили: два bootstrap по одной схеме, и 17.09 bootstrap уже
+# ловил дедлок с живым oiltech_tasks на background_jobs.
+# Своего Caddy нет: поддомен обслуживает Caddy MVP-1 — см. docker-compose.server.yml.
+name: oiltech-agents
+
 services:
   db:
     image: postgres:16
-    container_name: oiltech_pg
+    container_name: oiltech_agents_pg
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-oiltech}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oiltech_local_dev}
-      POSTGRES_DB: ${POSTGRES_DB:-oiltech_digest}
+      POSTGRES_DB: ${POSTGRES_DB:-oiltech_agents}
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oiltech} -d ${POSTGRES_DB:-oiltech_digest}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oiltech} -d ${POSTGRES_DB:-oiltech_agents}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   bootstrap:
     build: .
-    container_name: oiltech_bootstrap
+    container_name: oiltech_agents_bootstrap
     depends_on:
       db:
         condition: service_healthy
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_digest}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
     dns:
       - 1.1.1.1
       - 8.8.8.8
@@ -40,14 +48,14 @@ services:
 
   app:
     build: .
-    container_name: oiltech_app
+    container_name: oiltech_agents_app
     depends_on:
       bootstrap:
         condition: service_completed_successfully
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_digest}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       DIGEST_BRANDING_PATH: /app/branding/digest_branding.json
@@ -55,7 +63,7 @@ services:
       - 1.1.1.1
       - 8.8.8.8
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8100:8000"
     volumes:
       - ./BACKLOG.md:/app/BACKLOG.md
       - exports:/app/exports
@@ -70,14 +78,14 @@ services:
 
   tasks:
     build: .
-    container_name: oiltech_tasks
+    container_name: oiltech_agents_tasks
     depends_on:
       bootstrap:
         condition: service_completed_successfully
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_digest}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       TASKS_APP_MODE: "1"
@@ -86,7 +94,7 @@ services:
       - 1.1.1.1
       - 8.8.8.8
     ports:
-      - "127.0.0.1:8010:8000"
+      - "127.0.0.1:8110:8000"
     volumes:
       - ./BACKLOG.md:/app/BACKLOG.md
       - exports:/app/exports
@@ -101,14 +109,14 @@ services:
 
   worker:
     build: .
-    container_name: oiltech_worker
+    container_name: oiltech_agents_worker
     depends_on:
       bootstrap:
         condition: service_completed_successfully
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_digest}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       BACKGROUND_JOB_POLL_SECONDS: ${BACKGROUND_JOB_POLL_SECONDS:-2}
@@ -128,14 +136,14 @@ services:
 
   playwright-worker:
     build: .
-    container_name: oiltech_playwright_worker
+    container_name: oiltech_agents_playwright_worker
     depends_on:
       bootstrap:
         condition: service_completed_successfully
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_digest}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       BACKGROUND_JOB_POLL_SECONDS: ${PLAYWRIGHT_JOB_POLL_SECONDS:-3}
@@ -155,14 +163,14 @@ services:
 
   scheduler:
     build: .
-    container_name: oiltech_scheduler
+    container_name: oiltech_agents_scheduler
     depends_on:
       bootstrap:
         condition: service_completed_successfully
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_digest}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       CYCLE_INTERVAL_SECONDS: ${CYCLE_INTERVAL_SECONDS:-21600}
       RUN_DISCOVER_ON_START: ${RUN_DISCOVER_ON_START:-1}
@@ -206,10 +214,10 @@ services:
 
   docs:
     image: squidfunk/mkdocs-material:9
-    container_name: oiltech_docs
+    container_name: oiltech_agents_docs
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8081:8000"
+      - "127.0.0.1:8181:8000"
     volumes:
       - ./docs/help:/docs
     healthcheck:
@@ -229,7 +237,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_digest}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
     dns:
       - 1.1.1.1
@@ -240,21 +248,6 @@ services:
       - exports:/app/exports
     profiles:
       - test
-
-  caddy:
-    image: caddy:2-alpine
-    container_name: oiltech_caddy
-    restart: unless-stopped
-    depends_on:
-      - app
-      - docs
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
 
 volumes:
   pgdata:
@@ -268,5 +261,3 @@ volumes:
   # в «свою копию» файла тут уже приводили к дефекту (брендинг, 03.08).
   # ⚠️ В pg_dump этот том НЕ попадает: расширение задачи бэкапа — отдельный тикет #34.
   documents:
-  caddy_data:
-  caddy_config:

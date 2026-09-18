@@ -1,0 +1,15 @@
+# Только для сервера: `docker compose -f docker-compose.yml -f docker-compose.server.yml …`
+#
+# Поддомен агентов обслуживает Caddy MVP-1 (один сервер — одни порты 80/443). Чтобы
+# он достал app агентов по имени контейнера, app подключается ещё и к сети MVP-1.
+# Локально этой сети нет — поэтому подключение здесь, а не в docker-compose.yml.
+services:
+  app:
+    networks:
+      - default
+      - mvp1
+
+networks:
+  mvp1:
+    name: oiltech-digest_default
+    external: true
