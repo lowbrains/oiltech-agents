@@ -264,7 +264,7 @@ def test_discover_source_candidates_job_enqueues_external_evaluation(monkeypatch
         {
             "topic_limit": 1,
             "limit": 5,
-            "offline": True,
+            "offline": False,  # флажок «Без ИИ» снят — оценка в очередь ИИ
             "auto_evaluate": True,
             "article_limit": 4,
         },
@@ -869,3 +869,44 @@ def test_worker_loop_once_processes_queued_jobs(monkeypatch, isolated_db):
     assert repository.get_background_job(int(first["id"]))["result_json"] == {"value": 2}
     assert repository.get_background_job(int(second["id"]))["status"] == "ok"
     assert repository.get_background_job(int(second["id"]))["result_json"] == {"value": 4}
+
+
+def test_discover_source_candidates_offline_does_not_enqueue_paid_ai(monkeypatch):
+    # Флажок «Без ИИ» (offline=True): оценка по правилам на месте, в очередь ИИ — ничего.
+    # Раньше флажок здесь не смотрелся, и с воркером агентов на NL каждое нажатие
+    # «Поставить в очередь» стоило бы до 26 вызовов модели на кандидата.
+    from oiltech_digest.source_discovery import agent
+
+    jobs = []
+    evaluated = []
+    monkeypatch.setattr(background_jobs.config, "EXTERNAL_WORKERS_ENABLED", True)
+    monkeypatch.setattr(background_jobs.config, "AI_EXECUTION_REGION", "external")
+    monkeypatch.setattr(background_jobs.repository, "update_background_job_progress", lambda job_id, value: None)
+    monkeypatch.setattr(agent, "get_topic_gaps", lambda limit: [{"topic": "роботизация бурения"}])
+    monkeypatch.setattr(
+        agent,
+        "discover_sources",
+        lambda config: {"task_id": 7, "search": {"status": "ok"},
+                        "candidates": [{"id": 42, "url": "https://example.com/newsroom", "recommended_action": "add"}]},
+    )
+    monkeypatch.setattr(
+        background_jobs.repository,
+        "create_background_job",
+        lambda kind, payload, **kwargs: jobs.append(kind) or {"id": 99},
+    )
+    from oiltech_digest.source_discovery import sandbox
+
+    def fake_evaluate(candidate_id, **kwargs):
+        evaluated.append((candidate_id, kwargs.get("offline")))
+        return {"metrics": {}, "recommended_action": "review", "next_status": "review"}
+
+    monkeypatch.setattr(sandbox, "evaluate_source_candidate", fake_evaluate)
+
+    result = background_jobs._run_discover_source_candidates(
+        {"topic_limit": 1, "limit": 5, "offline": True, "auto_evaluate": True, "article_limit": 4},
+        job_id=123,
+    )
+
+    assert jobs == []
+    assert result["evaluation_jobs"] == 0
+    assert evaluated == [(42, True)]

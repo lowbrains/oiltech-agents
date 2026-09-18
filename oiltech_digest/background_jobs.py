@@ -373,7 +373,10 @@ def _run_discover_source_candidates(payload: dict[str, Any], job_id: int) -> dic
                 candidate_id = item.get("id")
                 if not candidate_id:
                     continue
-                if config.EXTERNAL_WORKERS_ENABLED and config.AI_EXECUTION_REGION == "external":
+                # В платную очередь ИИ — только если человек снял флажок «Без ИИ» (offline=False).
+                # Раньше флажок здесь не смотрелся: с воркером агентов на NL каждое нажатие
+                # «Поставить в очередь» стоило бы до 26 вызовов модели на кандидата.
+                if not offline and config.EXTERNAL_WORKERS_ENABLED and config.AI_EXECUTION_REGION == "external":
                     evaluation_job = repository.create_background_job(
                         "source_candidate_evaluate",
                         {
