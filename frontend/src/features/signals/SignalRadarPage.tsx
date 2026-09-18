@@ -155,7 +155,7 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
       );
       showToast(`ОС сохранена, memory-записей: ${result.memories}`);
     } catch (error) {
-      handleError(error, "Не удалось сохранить ОС по сигналу");
+      handleError(error, "Не удалось сохранить обратную связь по сигналу");
     } finally {
       setSaving((current) => ({ ...current, [signal.id]: false }));
     }
@@ -199,7 +199,7 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
         <div className="signalRadarHeaderStats" aria-label="Сводка радара">
           <span><strong>{visibleSignals.length}</strong> сигналов</span>
           <span><strong>{digestCount}</strong> в дайджесте</span>
-          <span><strong>{feedbackCount}</strong> ОС</span>
+          <span>обратная связь: <strong>{feedbackCount}</strong></span>
         </div>
       </header>
 
@@ -360,13 +360,16 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                         placeholder="эталонная формулировка сути сигнала"
                       />
                     </label>
-                    <textarea
-                      value={(feedbackDrafts[signal.id] || EMPTY_FEEDBACK_DRAFT).comment}
-                      onChange={(event) => updateFeedbackDraft(signal.id, { comment: event.target.value })}
-                      placeholder="Рекомендации AI-агенту: термины, поисковый угол, сильный источник..."
-                    />
+                    <label className="signalFeedbackField">
+                      <span>Рекомендации AI-агенту</span>
+                      <textarea
+                        value={(feedbackDrafts[signal.id] || EMPTY_FEEDBACK_DRAFT).comment}
+                        onChange={(event) => updateFeedbackDraft(signal.id, { comment: event.target.value })}
+                        placeholder="термины, поисковый угол, сильный источник..."
+                      />
+                    </label>
                     <div className="signalFeedbackActions">
-                      <span>{signal.feedback_count || 0} ОС сохранено</span>
+                      <span>Обратная связь: {signal.feedback_count || 0}</span>
                       <button type="button" className="primaryButton compactButton" disabled={savingThis} onClick={() => void submitFeedback(signal)}>
                         Сохранить
                       </button>
@@ -374,9 +377,9 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                   </div>
                 ) : isAdmin ? (
                   <div className="signalFeedbackCollapsed">
-                    <span>{signal.feedback_count || 0} ОС сохранено</span>
+                    <span>Обратная связь: {signal.feedback_count || 0}</span>
                     <button type="button" className="ghostButton compactButton" onClick={() => toggleFeedback(signal.id)}>
-                      Добавить ОС
+                      Обратная связь
                     </button>
                   </div>
                 ) : null}

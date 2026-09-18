@@ -10,6 +10,8 @@ services:
       - .env.external-worker
     environment:
       PYTHONUNBUFFERED: "1"
-      EXTERNAL_WORKER_QUEUES: ${EXTERNAL_WORKER_QUEUES:-external-ai,external-fetch,external-playwright}
-      EXTERNAL_WORKER_CAPABILITIES: ${EXTERNAL_WORKER_CAPABILITIES:-openai,http_fetch,playwright}
+      # Агентам сейчас нужен только радар (ИИ): сбор источников ведёт MVP-1, и воркер
+      # агентов с очередями fetch/playwright забирал бы хвосты сбора из дампа MVP-1.
+      EXTERNAL_WORKER_QUEUES: ${EXTERNAL_WORKER_QUEUES:-external-ai}
+      EXTERNAL_WORKER_CAPABILITIES: ${EXTERNAL_WORKER_CAPABILITIES:-openai}
     command: ["python", "-m", "oiltech_digest.cli", "-v", "external-worker"]
