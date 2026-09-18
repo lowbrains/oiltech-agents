@@ -34,7 +34,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@oiltech_agents_pg:5432/${POSTGRES_DB:-oiltech_agents}
     dns:
       - 1.1.1.1
       - 8.8.8.8
@@ -46,7 +46,10 @@ services:
       ]
     restart: "no"
 
-  app:
+  # Не «app»: на сервере сервис подключён и к сети MVP-1, где «app» — её собственное
+  # приложение. Два контейнера с одним именем в одной сети — Caddy MVP-1 стал бы
+  # раскидывать запросы заказчика между MVP-1 и агентами.
+  agents-app:
     build: .
     container_name: oiltech_agents_app
     depends_on:
@@ -55,7 +58,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@oiltech_agents_pg:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       DIGEST_BRANDING_PATH: /app/branding/digest_branding.json
@@ -85,7 +88,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@oiltech_agents_pg:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       TASKS_APP_MODE: "1"
@@ -116,7 +119,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@oiltech_agents_pg:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       BACKGROUND_JOB_POLL_SECONDS: ${BACKGROUND_JOB_POLL_SECONDS:-2}
@@ -143,7 +146,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@oiltech_agents_pg:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       BACKGROUND_JOB_POLL_SECONDS: ${PLAYWRIGHT_JOB_POLL_SECONDS:-3}
@@ -170,7 +173,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@oiltech_agents_pg:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
       CYCLE_INTERVAL_SECONDS: ${CYCLE_INTERVAL_SECONDS:-21600}
       RUN_DISCOVER_ON_START: ${RUN_DISCOVER_ON_START:-1}
@@ -237,7 +240,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@db:5432/${POSTGRES_DB:-oiltech_agents}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@oiltech_agents_pg:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
     dns:
       - 1.1.1.1
