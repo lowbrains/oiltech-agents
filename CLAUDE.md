@@ -26,26 +26,38 @@
 - `frontend/src/features/signals/SignalRadarPage.tsx`
 - 15 тестовых файлов из 46: `test_source_discovery_*`, `test_signal_*`, `test_source_health/quality/regularity`
 
-## Развязка, которая ещё не сделана
+## Развязка и выкат (18.09)
 
-На момент форка агент и MVP-1 сидели в **одной базе**, связанные внешними ключами
-в обе стороны:
+**Своя БД — сделано.** Отдельный экземпляр Postgres (`oiltech_agents_pg`, база
+`oiltech_agents`), корпус перенесён дампом MVP-1 18.09: 31 101 статья, 173 источника,
+45 сигналов, 59 оценок Виктора, 18 пользователей — счётчики сверены с MVP-1 один в один.
+Внешние ключи агент↔ядро теперь смотрят в свою копию `articles`/`sources`/`tags`.
 
-```
-агент → ядро:  signal_feedback_events.article_id    → articles
-               source_quality_snapshots.source_id   → sources
-               source_candidates.approved_source_id → sources
-               source_candidate_articles.tag_id     → tags
-               signal_evidence.article_id           → articles
-ядро → агент:  background_jobs.agent_run_id         → agent_runs
-```
+**Развёрнуто на РФ-сервере рядом с MVP-1** (`/root/oiltech-agents`): имя проекта
+`oiltech-agents`, контейнеры `oiltech_agents_*`, приложение на `127.0.0.1:8100`.
+Свой `.env` (база агентов, **свой** хеш токена воркера; сам токен — в
+`/root/oiltech-agents/.worker-token`, права 600, в чат не выводится).
 
-Решение владельца: **своя БД и свой поддомен**, корпус переносится дампом на старте.
-До этого не деплоить — два деплоя по одной схеме удвоят класс бага, который чинили
-13.09 (сид воскрешал выключенные критерии; порядок блоков в `schema.sql` load-bearing).
+⚠️ **Имена в сети MVP-1 обязаны быть уникальными.** Сервис называется `agents-app`, а
+не `app`, база — по имени контейнера `oiltech_agents_pg`, а не `db`: compose даёт
+контейнеру имя сервиса псевдонимом в каждой сети, и два `app` в сети MVP-1 заставили бы
+Caddy раскидывать запросы заказчика между MVP-1 и агентами.
 
-Пока развязки нет, `docker-compose.yml` и `.env.example` унаследованы от MVP-1
-и указывают на ту же базу и те же порты. Это первое, что меняется перед выкатом.
+**Не сделано — поддомен и живая генерация:**
+
+1. DNS: A-запись `agents.oiltech-digest.ru → 109.68.213.12` (панель Timeweb, владелец).
+   18.09 не резолвится, общей записи `*.oiltech-digest.ru` нет.
+2. Подключить `agents-app` к сети MVP-1:
+   `docker compose -f docker-compose.yml -f docker-compose.server.yml up -d --no-deps agents-app`,
+   проверить `docker exec oiltech_caddy getent hosts app` — должен вернуть ОДИН адрес (MVP-1).
+3. В `Caddyfile` MVP-1 блок `agents.oiltech-digest.ru { encode zstd gzip
+   reverse_proxy agents-app:8000 }`, затем `docker compose exec caddy caddy reload
+   --config /etc/caddy/Caddyfile` — только после п.1, иначе Caddy будет безуспешно
+   выпускать сертификат.
+4. NL: второй контейнер внешнего воркера для агентов — `CORE_API_URL=https://agents.oiltech-digest.ru`,
+   токен из `.worker-token`. Без него агент не зовёт модель (с РФ-адреса OpenAI — 403).
+5. Планировщик агентов не запущен намеренно: второй полный конвейер удвоит сбор и расход
+   на ИИ (~$74 → ~$150/мес) на сервере с 1,9 ГБ. Включать после замера памяти.
 
 ## Agent skills
 
