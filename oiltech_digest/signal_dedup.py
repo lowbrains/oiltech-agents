@@ -63,8 +63,11 @@ SIGNAL_DUPLICATE_SCHEMA = {
 # компания дают 68 пар и находят все пять известных групп дублей; при 0,35 теряется
 # половина обзоров по литию. Точность держит судья, порог отвечает только за охват.
 PAIR_MIN_OVERLAP = 0.25
-# Потолок расхода на прогон: пара — один короткий вызов (~$0,002 на gpt-5-mini).
-MAX_JUDGED_PAIRS = 120
+# Потолок расхода на прогон. Замер 19.09: 120 пар — $0,040 (gpt-5-mini), то есть
+# $0,00033 за пару; 400 пар — около $0,13. При потолке 120 из 322 пар непроверенными
+# остались как раз дубли: ZenaTech и FleetRabbit прошли новыми карточками. Ядро может
+# передать свой потолок в снимке (dedup_max_pairs) — без пересборки воркера.
+MAX_JUDGED_PAIRS = 400
 
 # Положительные вердикты Виктора — те же, что питают подсказки поиска (signal_feedback).
 _POSITIVE_VERDICTS = {"strong_signal", "approved", "watch_later", "needs_better_source", "bad_translation"}
@@ -128,8 +131,10 @@ def _eligible(a: dict[str, Any], b: dict[str, Any]) -> bool:
 def find_pairs(nodes: list[dict[str, Any]], *, min_overlap: float = PAIR_MIN_OVERLAP) -> list[tuple[int, int, float]]:
     """Пары-кандидаты: похожий заголовок, общая компания или общая ссылка.
 
-    Сначала пары со свежими карточками (решать надо сейчас), внутри — по убыванию
-    сходства; потолок MAX_JUDGED_PAIRS срезает хвост, а не свежие пары."""
+    Порядок — для потолка: сначала пары со свежими карточками (решать надо сейчас),
+    среди них — с общей компанией или ссылкой, потом по убыванию сходства заголовков.
+    Общая компания — сильный признак даже при низком сходстве: английский заголовок
+    против русского (ZenaTech, 19.09) даёт почти ноль общих основ."""
     features = [
         (title_stems(node["signal"]), company_keys(node["signal"]), url_keys(node.get("urls") or []))
         for node in nodes
@@ -141,13 +146,15 @@ def find_pairs(nodes: list[dict[str, Any]], *, min_overlap: float = PAIR_MIN_OVE
         stems_i, companies_i, urls_i = features[i]
         stems_j, companies_j, urls_j = features[j]
         overlap = _overlap(stems_i, stems_j)
-        if overlap >= min_overlap or companies_i & companies_j or urls_i & urls_j:
-            pairs.append((i, j, overlap))
+        shared = bool(companies_i & companies_j or urls_i & urls_j)
+        if overlap >= min_overlap or shared:
+            pairs.append((i, j, overlap, shared))
     pairs.sort(key=lambda pair: (
         0 if "new" in (nodes[pair[0]]["kind"], nodes[pair[1]]["kind"]) else 1,
+        0 if pair[3] else 1,
         -pair[2],
     ))
-    return pairs
+    return [(i, j, overlap) for i, j, overlap, _shared in pairs]
 
 
 def _hosts(urls: list[str] | set[str]) -> str:

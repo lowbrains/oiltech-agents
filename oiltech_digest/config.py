@@ -220,6 +220,9 @@ SIGNAL_DISCOVERY_WEB_QUERY_LIMIT = int(os.environ.get("SIGNAL_DISCOVERY_WEB_QUER
 # Откуда брать темы радара: tags — корневые тематики заказчика (пункт 12), table —
 # таблица signal_radar_topics (прежние 21 тема из сида).
 SIGNAL_RADAR_TOPIC_SOURCE = os.environ.get("SIGNAL_RADAR_TOPIC_SOURCE", "tags").strip().lower()
+# Сколько пар «одно ли событие» судит дедуп радара за прогон (signal_dedup). Едет
+# воркеру в снимке задачи — менять можно без пересборки NL.
+SIGNAL_DEDUP_MAX_PAIRS = int(os.environ.get("SIGNAL_DEDUP_MAX_PAIRS", "400"))
 
 
 def price_for_model(model: str | None) -> tuple[float, float]:

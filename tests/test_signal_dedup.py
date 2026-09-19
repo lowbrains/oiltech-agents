@@ -348,3 +348,37 @@ def test_card_selected_for_digest_is_never_hidden(isolated_db):
     assert repository.mark_signal_merged(chosen, main) is False
     snapshot = {row["id"]: row for row in repository.list_signals_for_dedup()}
     assert snapshot[chosen]["reviewed"] is True and snapshot[main]["reviewed"] is False
+
+
+def test_shared_company_pair_is_judged_before_title_only_pairs():
+    """19.09: при потолке пар английский заголовок одобренной ZenaTech против русского
+    дал почти ноль общих основ, и пара уходила в хвост под срез."""
+    nodes = [
+        _existing(18, "Acquisition of Velocity Geomatics by ZenaTech accelerates geomatics", ["ZenaTech"],
+                  verdict="approved", fresh=False),
+        _existing(60, "Татнефть строит завод сорбентов для извлечения лития из попутных вод", ["Татнефть"]),
+        _new("Приобретение компании ZenaTech усиливает сервис беспилотников", ["ZenaTech"], key="zena"),
+        _new("Строит завод сорбентов для извлечения лития из попутных вод", [], key="lith"),
+    ]
+
+    order = [(nodes[i].get("id", nodes[i]["signal"]["signal_key"]), nodes[j].get("id", nodes[j]["signal"]["signal_key"]))
+             for i, j, _ in signal_dedup.find_pairs(nodes)]
+
+    assert order[0] == (18, "zena")
+    assert (60, "lith") in order
+
+
+def test_core_sets_dedup_cap_for_worker(monkeypatch):
+    monkeypatch.setattr(signal_discovery.app_config, "SIGNAL_DEDUP_MAX_PAIRS", 7)
+    monkeypatch.setattr(repository, "list_reviewed_signal_urls", lambda: [])
+    monkeypatch.setattr(repository, "list_signals_for_dedup", lambda: [])
+    monkeypatch.setattr(repository, "list_signal_article_evidence", lambda **kwargs: [])
+    monkeypatch.setattr(signal_discovery, "_selected_topics", lambda topic: [{"name": GEO}])
+    snapshot = signal_discovery.build_discovery_snapshot(signal_discovery.SignalDiscoveryConfig())
+    assert snapshot["dedup_max_pairs"] == 7
+
+    seen = {}
+    monkeypatch.setattr(signal_dedup, "dedupe", lambda nodes, **kwargs: seen.update(kwargs) or {"assigned": {}, "stats": {}})
+    config = signal_discovery.SignalDiscoveryConfig(offline=False)
+    signal_discovery._dedupe_run(config, {"existing_signals": [], "dedup_max_pairs": 7}, [], lambda: None)
+    assert seen["max_pairs"] == 7

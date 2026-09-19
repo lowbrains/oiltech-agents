@@ -481,6 +481,7 @@ def build_discovery_snapshot(config: SignalDiscoveryConfig, *, for_external: boo
         "article_evidence": article_evidence,
         "known_urls": sorted({_normalize_url_for_key(url) for url in known_urls if url}),
         "existing_signals": existing_signals,
+        "dedup_max_pairs": app_config.SIGNAL_DEDUP_MAX_PAIRS,
     }
     if for_external:
         try:
@@ -598,7 +599,12 @@ def _dedupe_run(
                 "urls": [item.get("source_url") for item in signal.get("evidence") or [] if item.get("source_url")],
                 "signal": signal,
             })
-    result = signal_dedup.dedupe(nodes, client_factory=lambda: make_client(False), heartbeat=beat)
+    result = signal_dedup.dedupe(
+        nodes,
+        client_factory=lambda: make_client(False),
+        heartbeat=beat,
+        max_pairs=int(snapshot.get("dedup_max_pairs") or signal_dedup.MAX_JUDGED_PAIRS),
+    )
     existing_merges = []
     for index, (primary_index, reason) in result["assigned"].items():
         primary = nodes[primary_index]
