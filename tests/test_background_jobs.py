@@ -123,7 +123,6 @@ def test_enqueue_daily_signal_discovery_skips_existing_daily_job(monkeypatch):
     called = []
 
     monkeypatch.setattr(background_jobs.config, "SIGNAL_DISCOVERY_DAILY_ENABLED", True)
-    monkeypatch.setattr(background_jobs.config, "SIGNAL_DISCOVERY_DAILY_LOOKBACK_HOURS", 24)
     monkeypatch.setattr(
         background_jobs.repository,
         "has_recent_background_job",
@@ -133,7 +132,8 @@ def test_enqueue_daily_signal_discovery_skips_existing_daily_job(monkeypatch):
 
     result = background_jobs.enqueue_daily_signal_discovery()
 
-    assert result == {"enqueued": False, "reason": "already_scheduled", "lookback_hours": 24}
+    assert result["enqueued"] is False and result["reason"] == "already_scheduled"
+    assert 0 < result["lookback_hours"] <= 24  # окно — с полуночи по Москве
     assert called == []
 
 
@@ -141,7 +141,6 @@ def test_enqueue_daily_signal_discovery_creates_web_only_ai_job(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(background_jobs.config, "SIGNAL_DISCOVERY_DAILY_ENABLED", True)
-    monkeypatch.setattr(background_jobs.config, "SIGNAL_DISCOVERY_DAILY_LOOKBACK_HOURS", 24)
     monkeypatch.setattr(background_jobs.config, "SIGNAL_DISCOVERY_DAYS", 14)
     monkeypatch.setattr(background_jobs.config, "SIGNAL_DISCOVERY_LIMIT", 120)
     monkeypatch.setattr(background_jobs.config, "SIGNAL_DISCOVERY_MIN_SCORE", 40)

@@ -8,10 +8,12 @@ executor for Redis/Celery later without changing frontend-facing endpoints.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import logging
 import time
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from oiltech_digest import config
 from oiltech_digest.db import repository
@@ -26,6 +28,8 @@ from oiltech_digest.processing.pipeline import (
 _executor = ThreadPoolExecutor(max_workers=max(1, config.BACKGROUND_JOB_WORKERS))
 logger = logging.getLogger(__name__)
 DAILY_SIGNAL_DISCOVERY_MARKER = "daily_signal_discovery"
+# «Ежедневный» — это календарные сутки заказчика, а не «24 часа назад».
+DAILY_SIGNAL_DISCOVERY_TZ = ZoneInfo("Europe/Moscow")
 
 
 def daily_signal_discovery_payload() -> dict[str, Any]:
@@ -45,12 +49,21 @@ def daily_signal_discovery_payload() -> dict[str, Any]:
     }
 
 
+def _hours_since_local_midnight(now: datetime | None = None) -> float:
+    local = (now or datetime.now(timezone.utc)).astimezone(DAILY_SIGNAL_DISCOVERY_TZ)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return round(max((local - midnight).total_seconds() / 3600, 0.01), 4)
+
+
 def enqueue_daily_signal_discovery(*, force: bool = False) -> dict[str, Any]:
     if not config.SIGNAL_DISCOVERY_DAILY_ENABLED and not force:
         return {"enqueued": False, "reason": "disabled"}
 
     marker = {"schedule": DAILY_SIGNAL_DISCOVERY_MARKER}
-    lookback_hours = max(1, config.SIGNAL_DISCOVERY_DAILY_LOOKBACK_HOURS)
+    # С полуночи по Москве, а не «за 24 часа»: 18.09 запуск в 17:15 МСК заблокировал
+    # утренний крон 19.09 (прошло 14 ч из 24), и радар в тот день не отработал.
+    # При фиксированном часе крона окно ровно в 24 ч — ещё и гонка секунд.
+    lookback_hours = _hours_since_local_midnight()
     # 'failed' — тоже попытка этого дня. Без него упавшая задача ставилась заново на
     # каждом цикле планировщика (30 мин): 134 запуска за 5 дней вместо 5. Пока падение
     # было мгновенным (403 на первом вызове), это ничего не стоило; падение в конце
