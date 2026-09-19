@@ -382,3 +382,16 @@ def test_core_sets_dedup_cap_for_worker(monkeypatch):
     config = signal_discovery.SignalDiscoveryConfig(offline=False)
     signal_discovery._dedupe_run(config, {"existing_signals": [], "dedup_max_pairs": 7}, [], lambda: None)
     assert seen["max_pairs"] == 7
+
+
+def test_earlier_unreviewed_card_stays_main_even_with_fewer_links():
+    """19.09: вчерашняя №55 FleetRabbit ушла в сегодняшнюю №99 — у той было на одну
+    ссылку больше, и номер карточки, на который ссылается Виктор, сменился."""
+    older = _existing(55, "FleetRabbit: диспетчеризация", ["FleetRabbit"], score=55, urls=["u1"])
+    newer = _existing(99, "FleetRabbit: оптимизация диспетчеризации", ["FleetRabbit"], score=55, urls=["u2", "u3"])
+    older["signal"]["first_seen_day"] = "2026-09-18"
+    newer["signal"]["first_seen_day"] = "2026-09-19"
+
+    assigned = signal_dedup.assign_duplicates([older, newer], [(0, 1, "одна платформа")])
+
+    assert assigned == {1: (0, "одна платформа")}

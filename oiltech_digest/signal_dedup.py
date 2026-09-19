@@ -185,16 +185,21 @@ def _rank(node: dict[str, Any]) -> tuple:
     """Кто остаётся главной карточкой группы.
 
     Разобранная Виктором (сначала одобренная) — её он уже видел и оценил; затем уже
-    сохранённая — её карточка стабильна на экране; и только потом свежая из прогона."""
+    сохранённая, и из них — появившаяся раньше: номер карточки Виктор использует как
+    ссылку (19.09 вчерашняя №55 FleetRabbit ушла в сегодняшнюю №99 — у той было на
+    одну ссылку больше); и только потом свежая из прогона."""
     signal = node["signal"]
+    day = ""
     if node["kind"] == "existing" and node["reviewed"]:
         tier = 0 if node.get("verdict") in _POSITIVE_VERDICTS else 1
     elif node["kind"] == "existing":
         tier = 2
+        day = str(signal.get("first_seen_day") or "")
     else:
         tier = 3
     return (
         tier,
+        day,
         -float(signal.get("score") or 0),
         -int(signal.get("evidence_count") or 0),
         int(node.get("id") or 0),

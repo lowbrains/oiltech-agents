@@ -1075,6 +1075,7 @@ def list_signals_for_dedup(*, window_days: int = 30, fresh_days: int = 3, limit:
                    left(s.summary, 400) AS summary,
                    s.companies_json AS companies, s.score, s.evidence_count,
                    (s.first_seen_at >= now() - make_interval(days => %s)) AS fresh,
+                   to_char(s.first_seen_at AT TIME ZONE 'Europe/Moscow', 'YYYY-MM-DD') AS first_seen_day,
                    v.verdict,
                    {reviewed} AS reviewed,
                    COALESCE(ev.urls, ARRAY[]::text[]) AS evidence_urls
