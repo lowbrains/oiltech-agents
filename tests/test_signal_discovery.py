@@ -483,6 +483,17 @@ def test_search_result_evidence_cleans_html_snippets():
     assert evidence["extracted_fact"] == "Robots inspect oil and gas facilities."
 
 
+def test_signal_judge_prompt_requires_russian_user_fields():
+    instructions = signal_discovery.SIGNAL_JUDGE_INSTRUCTIONS
+    schema = signal_discovery.SIGNAL_JUDGE_SCHEMA["schema"]
+
+    assert "Все пользовательские текстовые поля возвращай на русском" in instructions
+    assert "Не копируй англоязычный или китайский" in instructions
+    assert "Названия компаний" in instructions
+    assert "title_ru" in schema["required"]
+    assert schema["properties"]["title_ru"] == {"type": "string"}
+
+
 def test_web_search_prioritizes_feedback_query_hints(monkeypatch):
     from oiltech_digest.source_discovery import agent as source_agent
 
@@ -518,11 +529,156 @@ def test_web_search_prioritizes_feedback_query_hints(monkeypatch):
 
     result = signal_discovery._search_web_evidence(
         {"name": "Бурение", "query_seeds_json": ["drilling automation"]},
-        signal_discovery.SignalDiscoveryConfig(web_query_limit=3, limit=5),
+        signal_discovery.SignalDiscoveryConfig(web_query_limit=3, limit=5, research_rounds=1, web_fulltext_limit=0),
     )
 
     assert captured["queries"][0] == "2026 closed-loop rig automation oil gas deployment"
+    assert "2026 generic drilling automation news" in captured["queries"]
     assert result["evidence"]
+
+
+def test_web_search_keeps_generated_angles_when_seeds_are_many(monkeypatch):
+    from oiltech_digest.source_discovery import agent as source_agent
+
+    captured = {}
+    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8, **kwargs: [])
+    monkeypatch.setattr(
+        source_agent,
+        "generate_search_queries",
+        lambda topic, offline=True, limit=8, strategy="broad": ["2026 rare cementing deployment operator case study"],
+    )
+
+    def fake_search_web(queries, limit=80):
+        captured["queries"] = queries
+        return {"status": "ok", "provider": "test", "results": []}
+
+    monkeypatch.setattr(source_agent, "search_web", fake_search_web)
+
+    signal_discovery._search_web_evidence(
+        {
+            "name": "Цементирование",
+            "query_seeds_json": [
+                "cementing automation",
+                "zonal isolation",
+                "well cementing additive",
+                "cement bond log",
+                "lost circulation material",
+            ],
+        },
+        signal_discovery.SignalDiscoveryConfig(web_query_limit=4, limit=5),
+    )
+
+    assert "2026 rare cementing deployment operator case study" in captured["queries"]
+
+
+def test_web_search_runs_followup_research_round(monkeypatch):
+    from oiltech_digest.source_discovery import agent as source_agent
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8, **kwargs: [])
+    monkeypatch.setattr(
+        source_agent,
+        "generate_search_queries",
+        lambda topic, offline=True, limit=8, strategy="broad": ["2026 autonomous drilling deployment oil gas"],
+    )
+
+    def fake_search_web(queries, limit=80):
+        calls.append(list(queries))
+        if len(calls) == 1:
+            return {
+                "status": "ok",
+                "provider": "test",
+                "results": [
+                    {
+                        "url": "https://example.com/adnoc-ai-rig",
+                        "title": "ADNOC deploys autonomous drilling system on oil and gas wells",
+                        "snippet": "Field deployment improves drilling performance for an oil and gas operator.",
+                        "provider": "test",
+                        "query": queries[0],
+                    }
+                ],
+            }
+        return {
+            "status": "ok",
+            "provider": "test",
+            "results": [
+                {
+                    "url": "https://example.com/adnoc-ai-rig-case",
+                    "title": "ADNOC autonomous drilling case study reports rig performance",
+                    "snippet": "Oilfield case study confirms operator deployment and KPI gains.",
+                    "provider": "test",
+                    "query": queries[0],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(source_agent, "search_web", fake_search_web)
+
+    result = signal_discovery._search_web_evidence(
+        {"name": "Бурение", "query_seeds_json": ["autonomous drilling"]},
+        signal_discovery.SignalDiscoveryConfig(web_query_limit=2, limit=5, research_rounds=2, web_fulltext_limit=0),
+    )
+
+    assert len(calls) == 2
+    assert any("ADNOC" in query and "drilling" in query for query in calls[1])
+    rounds = result["research_rounds"]
+    assert [row["round"] for row in rounds] == [1, 2]
+    assert rounds[0]["mode"] == "initial"
+    assert rounds[0]["quality"]["strong"] is True
+    assert rounds[0]["next_mode"] == "followup"
+    assert rounds[1]["mode"] == "followup"
+    assert rounds[1]["followup"] is True
+    assert len(result["evidence"]) == 2
+
+
+def test_web_search_pivots_after_weak_research_round(monkeypatch):
+    """Раунд без отраслевого контекста и признаков события не должен углубляться follow-up'ом.
+
+    Follow-up вытаскивает компанию/технологию из найденного текста, поэтому на слабой
+    выдаче он просто повторит тот же шум другими словами. Pivot вместо этого берёт
+    свежую пару термин×угол и не зависит от содержимого слабого раунда.
+    """
+    from oiltech_digest.source_discovery import agent as source_agent
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8, **kwargs: [])
+    monkeypatch.setattr(
+        source_agent,
+        "generate_search_queries",
+        lambda topic, offline=True, limit=8, strategy="broad": ["2026 autonomous drilling deployment oil gas"],
+    )
+
+    def fake_search_web(queries, limit=80):
+        calls.append(list(queries))
+        return {
+            "status": "ok",
+            "provider": "test",
+            "results": [
+                {
+                    "url": f"https://example.com/weak-{len(calls)}",
+                    "title": "New robot demonstrated at trade show",
+                    "snippet": "The device impressed attendees with a smooth demo.",
+                    "provider": "test",
+                    "query": queries[0],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(source_agent, "search_web", fake_search_web)
+
+    result = signal_discovery._search_web_evidence(
+        {"name": "Бурение", "query_seeds_json": ["autonomous drilling"]},
+        signal_discovery.SignalDiscoveryConfig(web_query_limit=2, limit=5, research_rounds=2, web_fulltext_limit=0),
+    )
+
+    assert len(calls) == 2
+    rounds = result["research_rounds"]
+    assert rounds[0]["quality"]["has_industry_context"] is False
+    assert rounds[0]["quality"]["strong"] is False
+    assert rounds[0]["next_mode"] == "pivot"
+    assert rounds[1]["mode"] == "pivot"
+    assert calls[1] != calls[0]
+    assert not any('"' in query for query in calls[1])
 
 
 def test_web_search_enriches_queries_with_tag_keywords(monkeypatch):
@@ -582,7 +738,7 @@ def test_web_search_enriches_queries_with_tag_keywords(monkeypatch):
 
     result = signal_discovery._search_web_evidence(
         {"name": "Бурение, направленное бурение, растворы и буровое оборудование", "query_seeds_json": []},
-        signal_discovery.SignalDiscoveryConfig(web_query_limit=5, limit=5),
+        signal_discovery.SignalDiscoveryConfig(web_query_limit=5, limit=5, research_rounds=1, web_fulltext_limit=0),
     )
 
     assert any("closed-loop drilling" in query for query in captured["queries"])
@@ -638,8 +794,463 @@ def test_web_search_filters_results_by_tag_negative_keywords(monkeypatch):
 
     result = signal_discovery._search_web_evidence(
         {"name": "Бурение", "query_seeds_json": []},
-        signal_discovery.SignalDiscoveryConfig(web_query_limit=4, limit=5),
+        signal_discovery.SignalDiscoveryConfig(web_query_limit=4, limit=5, research_rounds=1, web_fulltext_limit=0),
     )
 
     urls = [item["source_url"] for item in result["evidence"]]
     assert urls == ["https://example.com/useful"]
+
+
+def test_web_search_enriches_evidence_with_fetched_full_text(monkeypatch):
+    """Судья должен получать реальный текст страницы, а не обрывок сниппета поиска.
+
+    Сниппет — 1-2 обрубленных предложения; ни контракта, ни KPI, ни даты события в
+    нём обычно нет. Докачка полного текста должна заменить extracted_fact/summary_ru/
+    title/published_at, если страница отдала достаточно текста.
+    """
+    from datetime import datetime, timezone
+
+    from oiltech_digest.source_discovery import agent as source_agent
+
+    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8, **kwargs: [])
+    monkeypatch.setattr(
+        source_agent,
+        "generate_search_queries",
+        lambda topic, offline=True, limit=8, strategy="broad": ["2026 autonomous drilling oil gas"],
+    )
+
+    def fake_search_web(queries, limit=80):
+        return {
+            "status": "ok",
+            "provider": "test",
+            "results": [
+                {
+                    "url": "https://example.com/adnoc-pilot",
+                    "title": "ADNOC pilots autonomous drilling",
+                    "snippet": "Oil and gas field trial begins for autonomous drilling system.",
+                    "provider": "test",
+                    "query": queries[0],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(source_agent, "search_web", fake_search_web)
+
+    full_text = (
+        "ADNOC completed a field trial of an autonomous drilling system with an oilfield "
+        "services contractor. The operator reports a 20% faster rate of penetration and "
+        "signed a follow-on contract for further deployment across offshore wells in 2026."
+    )
+    published_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    fetched_calls = []
+
+    def fake_fetch_full_text(url, fallback_title=""):
+        fetched_calls.append(url)
+        return {
+            "ok": True,
+            "error": None,
+            "raw_text": full_text,
+            "published_at": published_at,
+            "title": "ADNOC completes autonomous drilling pilot with 20% faster ROP",
+        }
+
+    monkeypatch.setattr(signal_discovery, "_fetch_full_text", fake_fetch_full_text)
+
+    result = signal_discovery._search_web_evidence(
+        {"name": "Бурение", "query_seeds_json": ["autonomous drilling"]},
+        signal_discovery.SignalDiscoveryConfig(web_query_limit=2, limit=5, research_rounds=1, web_fulltext_limit=5),
+    )
+
+    assert fetched_calls == ["https://example.com/adnoc-pilot"]
+    assert result["fulltext"] == {"attempted": 1, "fetched": 1, "too_short": 0, "failed": 0}
+    evidence = result["evidence"]
+    assert len(evidence) == 1
+    item = evidence[0]
+    assert item["title"] == "ADNOC completes autonomous drilling pilot with 20% faster ROP"
+    assert item["extracted_fact"] == full_text
+    assert item["published_at"] == published_at
+    assert item["raw_payload"]["full_text_fetched"] is True
+    assert item["raw_payload"]["full_text_chars"] == len(full_text)
+
+
+def test_judge_prompt_includes_published_at_when_known(monkeypatch):
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(signal_discovery, "feedback_prompt_block", lambda topic, **kwargs: "")
+
+    with_date = {
+        "title": "ADNOC completes autonomous drilling pilot",
+        "publisher": "example.com",
+        "source_url": "https://example.com/adnoc-pilot",
+        "evidence_type": "case_study",
+        "published_at": datetime(2026, 3, 1, tzinfo=timezone.utc),
+        "extracted_fact": "20% faster rate of penetration.",
+        "summary_ru": "ADNOC на 20% ускорила проходку.",
+    }
+    without_date = {**with_date, "published_at": None, "source_url": "https://example.com/no-date"}
+
+    prompt_with_date = signal_discovery._judge_prompt([with_date], "Бурение")
+    prompt_without_date = signal_discovery._judge_prompt([without_date], "Бурение")
+
+    assert "published_at: 2026-03-01" in prompt_with_date
+    assert "published_at" not in prompt_without_date
+
+
+def test_web_search_full_text_fetch_falls_back_gracefully(monkeypatch):
+    """Неудачная докачка (404, антибот, короткая страница) не должна терять кандидата.
+
+    Карточка должна остаться такой же, как без докачки, — просто с пометкой в
+    raw_payload, почему полный текст не заменил сниппет.
+    """
+    from oiltech_digest.source_discovery import agent as source_agent
+
+    monkeypatch.setattr(signal_discovery, "feedback_query_hints", lambda topic, limit=8, **kwargs: [])
+    monkeypatch.setattr(
+        source_agent,
+        "generate_search_queries",
+        lambda topic, offline=True, limit=8, strategy="broad": ["2026 autonomous drilling oil gas"],
+    )
+
+    def fake_search_web(queries, limit=80):
+        return {
+            "status": "ok",
+            "provider": "test",
+            "results": [
+                {
+                    "url": "https://example.com/blocked",
+                    "title": "Oil and gas operator deploys autonomous drilling",
+                    "snippet": "Field trial improves drilling performance for an oil and gas operator.",
+                    "provider": "test",
+                    "query": queries[0],
+                },
+                {
+                    "url": "https://example.com/thin",
+                    "title": "Oil and gas contractor launches drilling automation",
+                    "snippet": "Contract signed for drilling automation deployment in oil and gas.",
+                    "provider": "test",
+                    "query": queries[0],
+                },
+            ],
+        }
+
+    monkeypatch.setattr(source_agent, "search_web", fake_search_web)
+
+    def fake_fetch_full_text(url, fallback_title=""):
+        if url == "https://example.com/blocked":
+            return {"ok": False, "error": "http_403", "raw_text": "", "published_at": None, "title": ""}
+        return {"ok": True, "error": None, "raw_text": "Too short.", "published_at": None, "title": "Thin page"}
+
+    monkeypatch.setattr(signal_discovery, "_fetch_full_text", fake_fetch_full_text)
+
+    result = signal_discovery._search_web_evidence(
+        {"name": "Бурение", "query_seeds_json": ["autonomous drilling"]},
+        signal_discovery.SignalDiscoveryConfig(web_query_limit=2, limit=5, research_rounds=1, web_fulltext_limit=5),
+    )
+
+    assert result["fulltext"] == {"attempted": 2, "fetched": 0, "too_short": 1, "failed": 1}
+    by_url = {item["source_url"]: item for item in result["evidence"]}
+    blocked = by_url["https://example.com/blocked"]
+    assert blocked["extracted_fact"] == "Field trial improves drilling performance for an oil and gas operator."
+    assert blocked["raw_payload"]["full_text_fetched"] is False
+    assert blocked["raw_payload"]["full_text_error"] == "http_403"
+    thin = by_url["https://example.com/thin"]
+    assert thin["extracted_fact"] == "Contract signed for drilling automation deployment in oil and gas."
+    assert thin["raw_payload"]["full_text_fetched"] is False
+    assert thin["raw_payload"]["full_text_error"] == "too_short"
+
+
+def test_batch_review_skips_when_fewer_than_two_candidates():
+    candidates = [{"signal": {"signal_key": "a", "score": 70}, "rejected": False}]
+
+    result = signal_discovery._batch_review_candidates(candidates, "Бурение", offline=True)
+
+    assert result == {"status": "skipped", "reason": "fewer_than_2_candidates", "reviewed": 1, "dropped": 0}
+    assert candidates[0]["rejected"] is False
+
+
+def test_batch_review_offline_drops_near_duplicate_candidates():
+    """Судья видел кластеры по отдельности и одобрил оба — офлайн-правило ловит
+
+    то, что по заголовку и компании это один и тот же контракт ADNOC, и оставляет
+    только более сильный по score кандидат.
+    """
+    strong = {
+        "signal": {
+            "signal_key": "strong",
+            "title": "ADNOC deploys autonomous drilling rig",
+            "score": 80,
+            "companies": ["ADNOC"],
+        },
+        "rejected": False,
+    }
+    weak = {
+        "signal": {
+            "signal_key": "weak",
+            "title": "ADNOC deploys autonomous drilling system",
+            "score": 55,
+            "companies": ["ADNOC"],
+        },
+        "rejected": False,
+    }
+
+    result = signal_discovery._batch_review_candidates([weak, strong], "Бурение", offline=True)
+
+    assert result["status"] == "ok"
+    assert result["source"] == "rules"
+    assert result["dropped"] == 1
+    assert strong["rejected"] is False
+    assert weak["rejected"] is True
+    assert weak["signal"]["maturity"] == "reject"
+    assert weak["signal"]["batch_review_reason"]
+
+
+def test_batch_review_offline_keeps_distinct_candidates():
+    a = {
+        "signal": {"signal_key": "a", "title": "ADNOC deploys autonomous drilling rig", "score": 80, "companies": ["ADNOC"]},
+        "rejected": False,
+    }
+    b = {
+        "signal": {"signal_key": "b", "title": "Sinopec pilots robotic pipeline inspection", "score": 70, "companies": ["Sinopec"]},
+        "rejected": False,
+    }
+
+    result = signal_discovery._batch_review_candidates([a, b], "HSE robotics", offline=True)
+
+    assert result == {
+        "status": "ok",
+        "source": "rules",
+        "reviewed": 2,
+        "dropped": 0,
+        "decisions": [],
+        "interest_scores": {"a": 80.0, "b": 70.0},
+    }
+    assert a["rejected"] is False
+    assert b["rejected"] is False
+    # Офлайн-режим не умеет сравнивать пачку — interest_score откатывается на score судьи.
+    assert a["signal"]["interest_score"] == 80.0
+    assert b["signal"]["interest_score"] == 70.0
+
+
+def test_batch_review_ai_drops_flagged_candidate(monkeypatch):
+    from oiltech_digest.processing.openai_client import AIResponse
+
+    class Client:
+        def complete_json(self, instructions, user_input, schema, max_output_tokens=900, model=None, reasoning_effort=None):
+            return AIResponse(
+                data={
+                    "decisions": [
+                        {
+                            "signal_key": "keep-me",
+                            "keep": True,
+                            "reason": "Отдельное событие.",
+                            "interest_score": 88,
+                            "why_interesting": "Первое промышленное внедрение у нового игрока на фоне пачки.",
+                        },
+                        {
+                            "signal_key": "drop-me",
+                            "keep": False,
+                            "reason": "Пересказывает тот же контракт, что keep-me.",
+                            "interest_score": 0,
+                            "why_interesting": "",
+                        },
+                    ]
+                },
+                model="fake-ai",
+            )
+
+    monkeypatch.setattr(signal_discovery, "make_client", lambda offline: Client())
+
+    keep = {"signal": {"signal_key": "keep-me", "title": "A", "score": 80, "companies": [], "evidence": []}, "rejected": False}
+    drop = {"signal": {"signal_key": "drop-me", "title": "B", "score": 60, "companies": [], "evidence": []}, "rejected": False}
+
+    result = signal_discovery._batch_review_candidates([keep, drop], "Бурение", offline=False)
+
+    assert result == {
+        "status": "ok",
+        "source": "ai",
+        "model": "fake-ai",
+        "reviewed": 2,
+        "dropped": 1,
+        "decisions": [{"signal_key": "drop-me", "reason": "Пересказывает тот же контракт, что keep-me."}],
+        "interest_scores": {"keep-me": 88.0},
+    }
+    assert keep["rejected"] is False
+    assert keep["signal"]["interest_score"] == 88.0
+    assert keep["signal"]["why_interesting"] == "Первое промышленное внедрение у нового игрока на фоне пачки."
+    assert drop["rejected"] is True
+    assert drop["signal"]["maturity"] == "reject"
+    assert drop["signal"]["batch_review_reason"] == "Пересказывает тот же контракт, что keep-me."
+    assert "interest_score" not in drop["signal"]
+
+
+def test_batch_review_ai_missing_decision_falls_back_to_score(monkeypatch):
+    """Модель обязана вернуть решение по каждому signal_key, но если пропустила один —
+
+    ранжирование не должно остаться без числа: используем score судьи как черновую замену.
+    """
+    from oiltech_digest.processing.openai_client import AIResponse
+
+    class Client:
+        def complete_json(self, *args, **kwargs):
+            return AIResponse(
+                data={
+                    "decisions": [
+                        {
+                            "signal_key": "a",
+                            "keep": True,
+                            "reason": "ok",
+                            "interest_score": 70,
+                            "why_interesting": "x",
+                        },
+                    ]
+                },
+                model="fake-ai",
+            )
+
+    monkeypatch.setattr(signal_discovery, "make_client", lambda offline: Client())
+
+    a = {"signal": {"signal_key": "a", "title": "A", "score": 50, "companies": [], "evidence": []}, "rejected": False}
+    b = {"signal": {"signal_key": "b", "title": "B", "score": 65, "companies": [], "evidence": []}, "rejected": False}
+
+    result = signal_discovery._batch_review_candidates([a, b], "Бурение", offline=False)
+
+    assert result["interest_scores"] == {"a": 70.0, "b": 65.0}
+    assert a["signal"]["interest_score"] == 70.0
+    assert b["signal"]["interest_score"] == 65.0
+    assert b["rejected"] is False
+
+
+def test_apply_discovery_ranks_final_signals_by_interest_score():
+    """Финальная сортировка должна слушать interest_score (сравнение внутри пачки),
+
+    а не сырой score судьи, который сравнивал кластер сам с собой.
+    """
+    run = {
+        "topics": [
+            {
+                "topic": "Бурение",
+                "article_evidence": 0,
+                "total_evidence": 0,
+                "skipped_reviewed": 0,
+                "web_search": None,
+                "clusters": 2,
+                "candidates": [
+                    {
+                        "signal": {
+                            "signal_key": "high-score-boring",
+                            "score": 90,
+                            "interest_score": 40,
+                            "evidence_count": 1,
+                            "evidence": [],
+                        },
+                        "raw_output": {},
+                        "rejected": False,
+                        "training_input": {},
+                    },
+                    {
+                        "signal": {
+                            "signal_key": "low-score-interesting",
+                            "score": 60,
+                            "interest_score": 92,
+                            "evidence_count": 1,
+                            "evidence": [],
+                        },
+                        "raw_output": {},
+                        "rejected": False,
+                        "training_input": {},
+                    },
+                ],
+            }
+        ],
+        "dedup": {},
+    }
+
+    result = signal_discovery.apply_discovery(
+        signal_discovery.SignalDiscoveryConfig(offline=True, dry_run=True, max_signals=10),
+        run,
+    )
+
+    assert [item["signal_key"] for item in result["signals"]] == ["low-score-interesting", "high-score-boring"]
+
+
+def test_batch_review_ai_failure_is_graceful(monkeypatch):
+    """Сбой ревью-вызова не должен ронять весь прогон темы или трогать кандидатов."""
+
+    class Client:
+        def complete_json(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(signal_discovery, "make_client", lambda offline: Client())
+
+    a = {"signal": {"signal_key": "a", "title": "A", "score": 80, "companies": [], "evidence": []}, "rejected": False}
+    b = {"signal": {"signal_key": "b", "title": "B", "score": 70, "companies": [], "evidence": []}, "rejected": False}
+
+    result = signal_discovery._batch_review_candidates([a, b], "Бурение", offline=False)
+
+    assert result["status"] == "error"
+    assert "boom" in result["error"]
+    assert a["rejected"] is False
+    assert b["rejected"] is False
+
+
+def test_cluster_key_keeps_same_direction_events_separate():
+    first = signal_discovery._cluster_key(
+        {
+            "title": "Operator deploys autonomous robot on offshore platform",
+            "extracted_fact": "Robot inspects oil and gas equipment for ADNOC.",
+        },
+        "HSE robotics / Physical AI",
+    )
+    second = signal_discovery._cluster_key(
+        {
+            "title": "Refinery pilots robotic inspection dog for hazardous zones",
+            "extracted_fact": "Robotic dog checks petrochemical units for Sinopec.",
+        },
+        "HSE robotics / Physical AI",
+    )
+
+    assert first.startswith("physical-ai-robotics-")
+    assert second.startswith("physical-ai-robotics-")
+    assert first != second
+
+
+def test_clusters_for_judging_round_robins_signal_families():
+    clusters = [
+        [
+            {
+                "title": "Oilfield deploys drilling automation",
+                "extracted_fact": "The operator deployed the system.",
+                "strength": 0.9,
+            }
+        ],
+        [
+            {
+                "title": "Refinery deploys robotic inspection",
+                "extracted_fact": "The operator deployed the robot.",
+                "strength": 0.85,
+            }
+        ],
+        [
+            {
+                "title": "Supplier wins oilfield automation contract",
+                "extracted_fact": "Contract signed with an oil and gas operator.",
+                "strength": 0.8,
+            }
+        ],
+        [
+            {
+                "title": "Vendor launches upstream AI product",
+                "extracted_fact": "Commercialized launch for oil and gas customers.",
+                "strength": 0.75,
+            }
+        ],
+    ]
+
+    selected = signal_discovery._clusters_for_judging(clusters, 3)
+    selected_titles = [cluster[0]["title"] for cluster in selected]
+
+    assert selected_titles == [
+        "Oilfield deploys drilling automation",
+        "Supplier wins oilfield automation contract",
+        "Vendor launches upstream AI product",
+    ]

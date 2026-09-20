@@ -44,6 +44,8 @@ def daily_signal_discovery_payload() -> dict[str, Any]:
         "web_search": True,
         "web_only": True,
         "web_query_limit": config.SIGNAL_DISCOVERY_WEB_QUERY_LIMIT,
+        "research_rounds": config.SIGNAL_DISCOVERY_RESEARCH_ROUNDS,
+        "web_fulltext_limit": config.SIGNAL_DISCOVERY_WEB_FULLTEXT_LIMIT,
         "trigger": "scheduler_daily",
         "schedule": DAILY_SIGNAL_DISCOVERY_MARKER,
     }

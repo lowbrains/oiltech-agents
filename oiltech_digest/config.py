@@ -217,6 +217,11 @@ SIGNAL_DISCOVERY_MIN_SCORE = float(os.environ.get("SIGNAL_DISCOVERY_MIN_SCORE", 
 SIGNAL_DISCOVERY_MAX_SIGNALS = int(os.environ.get("SIGNAL_DISCOVERY_MAX_SIGNALS", "6"))
 # Запросов к поиску на тему: 13 × 4 = 52 на прогон, ~1600 в месяц при ежедневном запуске.
 SIGNAL_DISCOVERY_WEB_QUERY_LIMIT = int(os.environ.get("SIGNAL_DISCOVERY_WEB_QUERY_LIMIT", "4"))
+# Раунды research-loop: 1 = только широкий поиск, 2 = широкий поиск + уточнение по найденным зацепкам.
+SIGNAL_DISCOVERY_RESEARCH_ROUNDS = int(os.environ.get("SIGNAL_DISCOVERY_RESEARCH_ROUNDS", "2"))
+# Сколько web-результатов на тему докачивать целиком (страница, а не сниппет поисковика)
+# перед кластеризацией и судьёй. 0 отключает докачку и оставляет только сниппеты.
+SIGNAL_DISCOVERY_WEB_FULLTEXT_LIMIT = int(os.environ.get("SIGNAL_DISCOVERY_WEB_FULLTEXT_LIMIT", "20"))
 # Откуда брать темы радара: tags — корневые тематики заказчика (пункт 12), table —
 # таблица signal_radar_topics (прежние 21 тема из сида).
 SIGNAL_RADAR_TOPIC_SOURCE = os.environ.get("SIGNAL_RADAR_TOPIC_SOURCE", "tags").strip().lower()

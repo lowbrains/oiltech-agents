@@ -51,6 +51,20 @@ INDUSTRY_CONTEXT_RE = re.compile(
 )
 
 
+EVENT_SIGNAL_RE = re.compile(
+    r"\b("
+    r"deploy|deployed|deployment|implement|implemented|field trial|pilot|rollout|"
+    r"launch|launched|release|released|commercializ|awarded|award|selected|selects|"
+    r"chose|chosen|adopt|adopted|partnership|contract|acquisition|acquire[sd]?|supplier|"
+    r"kpi|performance|throughput|uptime|reduc|increas|cut downtime|saved|savings"
+    r")\b|"
+    r"(внедр|пилот|запуст|заключ[ил]|выбрал|подписал|поставщик|контракт|партнерств|"
+    r"снизил|повысил|ускорил|сократил|результат|показател)|"
+    r"(现场应用|中标|合作|签署|采购|推出|发布|试点|降低|提高|节省)",
+    re.IGNORECASE,
+)
+
+
 DEFAULT_RADAR_TOPICS = [
     {
         "name": "HSE robotics / Physical AI",
@@ -364,7 +378,13 @@ SIGNAL_JUDGE_INSTRUCTIONS = """Ты аналитик технологическ�
 
 Верни один сигнал или reject. Не добавляй фактов, которых нет во входе.
 score возвращай по шкале 0-100, где 40 = слабый watch, 70 = хороший shortlist,
-85+ = proven. theme возвращай на русском, кроме устоявшихся аббревиатур HSE/PTW/AI."""
+85+ = proven.
+
+Все пользовательские текстовые поля возвращай на русском: title, theme, summary,
+thesis, transferability, why_now, why_not_noise. Не копируй англоязычный или китайский
+заголовок как title; переведи его нормальным нефтегазовым русским языком.
+Названия компаний, продуктов, месторождений, стандартов и устоявшиеся аббревиатуры
+HSE/PTW/AI оставляй в оригинальном написании."""
 
 SIGNAL_JUDGE_SCHEMA = {
     "name": "technology_signal_judgement",
@@ -373,6 +393,7 @@ SIGNAL_JUDGE_SCHEMA = {
         "additionalProperties": False,
         "required": [
             "title",
+            "title_ru",
             "theme",
             "summary",
             "thesis",
@@ -387,6 +408,7 @@ SIGNAL_JUDGE_SCHEMA = {
         ],
         "properties": {
             "title": {"type": "string"},
+            "title_ru": {"type": "string"},
             "theme": {"type": "string"},
             "summary": {"type": "string"},
             "thesis": {"type": "string"},
@@ -398,6 +420,68 @@ SIGNAL_JUDGE_SCHEMA = {
             "why_not_noise": {"type": "string"},
             "companies": {"type": "array", "items": {"type": "string"}},
             "industries": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+}
+
+
+BATCH_REVIEW_INSTRUCTIONS = """Ты — финальный контроль качества radar'а технологических сигналов.
+
+Тебе дают пачку кандидатов в сигналы по одной теме. Каждый кандидат уже прошёл
+отдельную оценку судьи, но судья видел только свой кластер evidence и не видел
+остальных кандидатов пачки. Твоя задача — посмотреть на всю пачку разом и решить,
+какие кандидаты действительно разные и полезные сигналы, а какие надо убрать.
+
+Убирай кандидата (keep=false), если:
+- он описывает то же самое событие, что другой кандидат в этой же пачке (тот же
+  продукт/контракт/внедрение у той же компании, просто другими словами) — оставь
+  только более сильный из пары (выше score или увереннее факты), в reason укажи
+  signal_key дубликата, который остаётся;
+- на фоне всей пачки видно, что это не отдельное событие, а общий обзор рынка,
+  трюизм или пересказ уже известного тренда без нового факта;
+- в пачке несколько кандидатов от одного вендора с одинаковой рекламной подачей —
+  оставь только самый содержательный, остальные убери.
+
+Не выдумывай факты, которых нет во входе. Не убирай кандидата только из-за похожей
+темы — разные компании или разные технологии внутри одной темы это нормально и
+должны остаться. Если пачка уже вся про разные события — верни keep=true для всех.
+
+Для каждого кандидата с keep=true дополнительно оцени interest_score от 0 до 100 —
+насколько он интересен и значим ИМЕННО НА ФОНЕ ОСТАЛЬНЫХ кандидатов этой пачки, а не
+сам по себе. Это не то же самое, что score судьи: судья оценивал кластер в изоляции,
+а тут нужно сравнение внутри пачки. Выше балл — если сигнал: про нового игрока или
+неожиданное сочетание технологии и отрасли, даёт измеримый эффект (KPI, % ускорения,
+снижение простоя), показывает первое промышленное применение, а не повтор известного
+подхода. Ниже балл — если это ожидаемый, рутинный шаг крупного игрока, о котором
+рынок и так знает, или очередной анонс без нового факта на фоне уже более сильных
+кандидатов пачки. why_interesting — коротко по-русски, почему такой балл именно на
+фоне остальных. Для keep=false interest_score и why_interesting можно оставить пустыми.
+
+Верни решение по КАЖДОМУ переданному signal_key. reason — коротко по-русски."""
+
+
+BATCH_REVIEW_SCHEMA = {
+    "name": "signal_batch_review",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["decisions"],
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["signal_key", "keep", "reason", "interest_score", "why_interesting"],
+                    "properties": {
+                        "signal_key": {"type": "string"},
+                        "keep": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "interest_score": {"type": "number", "minimum": 0, "maximum": 100},
+                        "why_interesting": {"type": "string"},
+                    },
+                },
+            },
         },
     },
 }
@@ -415,6 +499,8 @@ class SignalDiscoveryConfig:
     web_search: bool = False
     web_only: bool = False
     web_query_limit: int = 8
+    research_rounds: int = 2
+    web_fulltext_limit: int = 20
     background_job_id: int | None = None
     persist_training_examples: bool = True
 
@@ -534,7 +620,7 @@ def run_discovery(
             skipped_reviewed = len(evidence) - len(fresh)
             clusters = _cluster_evidence(fresh, topic_name)
             candidates = []
-            for cluster in clusters[: config.max_signals]:
+            for cluster in _clusters_for_judging(clusters, config.max_signals):
                 beat()
                 signal, raw_output = judge_signal_snapshot(cluster, topic_name, offline=config.offline)
                 if topic.get("tag_id") is not None:
@@ -550,6 +636,8 @@ def run_discovery(
                     "rejected": _is_rejected_signal(signal),
                     "training_input": _training_input_payload(topic_name, cluster, web_search, offline=config.offline),
                 })
+            beat()
+            batch_review = _batch_review_candidates(candidates, topic_name, offline=config.offline)
             topics_out.append({
                 "topic": topic_name,
                 "article_evidence": len(db_evidence),
@@ -558,6 +646,7 @@ def run_discovery(
                 "web_search": web_search,
                 "clusters": len(clusters),
                 "candidates": candidates,
+                "batch_review": batch_review,
             })
     return {"topics": topics_out, "dedup": _dedupe_run(config, snapshot, topics_out, beat)}
 
@@ -666,6 +755,7 @@ def apply_discovery(
             "clusters": topic.get("clusters", 0),
             "signals": judged,
             "duplicates": topic_duplicates,
+            "batch_review": topic.get("batch_review"),
         })
     dedup = dict(run.get("dedup") or {})
     merged = 0
@@ -686,7 +776,18 @@ def apply_discovery(
         dedup.pop("existing_merges", None)
     if dedup or merged or merged_existing:
         dedup.update({"merged_new": merged, "merged_existing": merged_existing})
-    all_signals.sort(key=lambda item: (float(item.get("score") or 0), int(item.get("evidence_count") or 0)), reverse=True)
+    # interest_score сравнивает сигнал с остальными кандидатами его пачки (batch review);
+    # сырой score судьи оценивал кластер в изоляции и не видел, что сосед интереснее.
+    # Если interest_score не проставлен (например тема пропустила batch review из-за
+    # единственного кандидата), откатываемся на score — так топ N не проседает.
+    all_signals.sort(
+        key=lambda item: (
+            float(item["interest_score"] if item.get("interest_score") is not None else item.get("score") or 0),
+            float(item.get("score") or 0),
+            int(item.get("evidence_count") or 0),
+        ),
+        reverse=True,
+    )
     return {
         "dry_run": config.dry_run,
         "offline": config.offline,
@@ -846,6 +947,8 @@ def config_from_payload(payload: dict[str, Any], *, background_job_id: int | Non
         web_search=bool(payload.get("web_search", False)),
         web_only=bool(payload.get("web_only", False)),
         web_query_limit=int(payload.get("web_query_limit") or 8),
+        research_rounds=int(payload.get("research_rounds") or 2),
+        web_fulltext_limit=int(payload.get("web_fulltext_limit") or 20),
         background_job_id=background_job_id,
     )
 
@@ -937,6 +1040,160 @@ def judge_signal_snapshot(evidence: list[dict[str, Any]], topic: str, *, offline
         max_output_tokens=1800,
     )
     return _normalize_signal_payload(response.data, topic, context=_glossary_context(evidence, topic)), response.data
+
+
+def _batch_review_candidates(
+    candidates: list[dict[str, Any]],
+    topic: str,
+    *,
+    offline: bool,
+) -> dict[str, Any]:
+    """Финальный взгляд на пачку сигналов темы целиком, а не по одному кластеру.
+
+    judge_signal_snapshot оценивает каждый кластер в изоляции и не видит остальные
+    кандидаты этой темы — поэтому не может заметить, что кандидат №3 пересказывает
+    то же событие, что и №1, другими словами, или что кандидат сам по себе похож на
+    факт, но на фоне всей пачки явно не тянет на отдельный сигнал. Мутирует переданные
+    candidate-словари на месте (rejected/maturity/batch_review_reason), потому что
+    именно эти объекты потом уходят в _dedupe_run и apply_discovery.
+    """
+    reviewable = [item for item in candidates if not item.get("rejected") and item.get("signal")]
+    if len(reviewable) < 2:
+        return {"status": "skipped", "reason": "fewer_than_2_candidates", "reviewed": len(reviewable), "dropped": 0}
+
+    if offline:
+        dropped = _offline_batch_duplicate_drop(reviewable)
+        interest_scores = _apply_fallback_interest_scores(reviewable)
+        return {
+            "status": "ok",
+            "source": "rules",
+            "reviewed": len(reviewable),
+            "dropped": len(dropped),
+            "decisions": dropped,
+            "interest_scores": interest_scores,
+        }
+
+    client = make_client(False)
+    payload = {
+        "topic": topic,
+        "candidates": [_batch_review_candidate_payload(item) for item in reviewable],
+    }
+    try:
+        response = client.complete_json(
+            BATCH_REVIEW_INSTRUCTIONS,
+            json.dumps(payload, ensure_ascii=False),
+            BATCH_REVIEW_SCHEMA,
+            max_output_tokens=900,
+        )
+    except Exception as exc:  # noqa: BLE001 - батч-ревью не должно ронять прогон темы
+        return {"status": "error", "error": str(exc)[:500], "reviewed": len(reviewable), "dropped": 0}
+
+    by_key = {str(item["signal"].get("signal_key") or ""): item for item in reviewable}
+    dropped = []
+    seen_keys = set()
+    for decision in response.data.get("decisions") or []:
+        key = str(decision.get("signal_key") or "")
+        candidate = by_key.get(key)
+        if candidate is None:
+            continue
+        seen_keys.add(key)
+        if not decision.get("keep", True):
+            reason = str(decision.get("reason") or "").strip() or "Отклонён на финальной проверке пачки сигналов."
+            candidate["rejected"] = True
+            candidate["signal"]["maturity"] = "reject"
+            candidate["signal"]["batch_review_reason"] = reason
+            dropped.append({"signal_key": key, "reason": reason})
+            continue
+        # Судья оценивал score в изоляции; interest_score — сравнение внутри пачки,
+        # поэтому именно он должен решать финальную сортировку, а не сырой score.
+        candidate["signal"]["interest_score"] = _normalize_score(decision.get("interest_score"))
+        candidate["signal"]["why_interesting"] = str(decision.get("why_interesting") or "").strip()
+
+    # Модель могла пропустить кандидата вопреки инструкции — не терять ранжирование
+    # из-за одного недостающего решения, откатываемся на score судьи для него.
+    missing = [item for key, item in by_key.items() if key not in seen_keys]
+    interest_scores = _apply_fallback_interest_scores(missing)
+    interest_scores.update({
+        str(item["signal"].get("signal_key") or ""): item["signal"].get("interest_score")
+        for item in reviewable
+        if not item.get("rejected") and item["signal"].get("interest_score") is not None
+    })
+
+    return {
+        "status": "ok",
+        "source": "ai",
+        "model": response.model,
+        "reviewed": len(reviewable),
+        "dropped": len(dropped),
+        "decisions": dropped,
+        "interest_scores": interest_scores,
+    }
+
+
+def _batch_review_candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    signal = candidate["signal"]
+    evidence = signal.get("evidence") or []
+    return {
+        "signal_key": signal.get("signal_key"),
+        "title": signal.get("title_ru") or signal.get("title"),
+        "theme": signal.get("theme"),
+        "maturity": signal.get("maturity"),
+        "score": signal.get("score"),
+        "summary": signal.get("summary"),
+        "companies": signal.get("companies") or [],
+        "evidence_urls": [str(item.get("source_url") or "") for item in evidence if item.get("source_url")][:5],
+    }
+
+
+def _apply_fallback_interest_scores(items: list[dict[str, Any]]) -> dict[str, float]:
+    """Когда сравнение пачки недоступно (offline) или модель пропустила кандидата,
+
+    используем score судьи как черновую замену interest_score — без неё сортировка
+    apply_discovery осталась бы без числа для сравнения этого сигнала с остальными.
+    """
+    scores: dict[str, float] = {}
+    for item in items:
+        signal = item["signal"]
+        signal.setdefault("interest_score", _normalize_score(signal.get("score")))
+        scores[str(signal.get("signal_key") or "")] = signal["interest_score"]
+    return scores
+
+
+def _offline_batch_duplicate_drop(reviewable: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Без LLM ловим только близкие дубли по заголовку и компаниям (best-effort).
+
+    Настоящее «это тот же трюизм другими словами» без модели не распознать —
+    офлайн-режим здесь такой же грубый фоллбэк, как и остальная rules-эвристика
+    в этом модуле (например recommend_source_action).
+    """
+    dropped = []
+    kept: list[set[str]] = []
+    for candidate in sorted(reviewable, key=lambda item: float(item["signal"].get("score") or 0), reverse=True):
+        signal = candidate["signal"]
+        tokens = _batch_dedupe_tokens(signal)
+        if any(_jaccard(tokens, kept_tokens) >= 0.6 for kept_tokens in kept):
+            reason = "Похож на другой сигнал этой пачки (офлайн-правило, без модели)."
+            candidate["rejected"] = True
+            signal["maturity"] = "reject"
+            signal["batch_review_reason"] = reason
+            dropped.append({"signal_key": signal.get("signal_key"), "reason": reason})
+        else:
+            kept.append(tokens)
+    return dropped
+
+
+def _batch_dedupe_tokens(signal: dict[str, Any]) -> set[str]:
+    text = " ".join([
+        str(signal.get("title") or ""),
+        " ".join(str(company) for company in signal.get("companies") or []),
+    ]).lower()
+    return {word for word in re.findall(r"[a-zа-яё0-9]{4,}", text) if word not in _STOP_WORDS}
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
 
 
 def list_signals(*, maturity: str | None = None, theme: str | None = None, limit: int = 50) -> list[dict]:
@@ -1039,24 +1296,269 @@ def _search_web_evidence(topic: dict[str, Any], config: SignalDiscoveryConfig) -
         limit=config.web_query_limit,
         strategy="broad",
     )
-    queries = _dedupe(feedback_queries + seed_queries + generated_queries)[: config.web_query_limit]
-    search = search_web(queries, limit=config.limit)
+    queries = _planned_search_queries(
+        topic,
+        config,
+        tag_context,
+        feedback_queries=feedback_queries,
+        seed_queries=seed_queries,
+        generated_queries=generated_queries,
+    )
+    search = _run_research_loop(
+        search_web,
+        initial_queries=queries,
+        topic=topic,
+        topic_name=topic_name,
+        tag_context=tag_context,
+        config=config,
+    )
     results = search.get("results") or []
     evidence = [
         item
         for item in (_search_result_to_evidence(row, topic_name) for row in results)
         if item and _has_industry_context(item) and not _blocked_by_tag_negative_keywords(item, tag_context)
     ]
+    evidence, fulltext_stats = _enrich_web_evidence_with_full_text(
+        evidence,
+        topic_name,
+        limit=config.web_fulltext_limit,
+    )
     return {
         "status": search.get("status"),
         "provider": search.get("provider"),
         "reason": search.get("reason"),
-        "queries": queries,
+        "queries": search.get("queries") or queries,
+        "initial_queries": queries,
+        "research_rounds": search.get("research_rounds") or [],
         "results": len(results),
         "evidence": evidence,
+        "fulltext": fulltext_stats,
         "tag_context": _tag_context_snapshot(tag_context),
         "errors": search.get("errors") or [],
     }
+
+
+def _run_research_loop(
+    search_web: Callable[[list[str]], dict[str, Any]],
+    *,
+    initial_queries: list[str],
+    topic: dict[str, Any],
+    topic_name: str,
+    tag_context: dict[str, Any],
+    config: SignalDiscoveryConfig,
+) -> dict[str, Any]:
+    max_rounds = max(1, int(config.research_rounds or 1))
+    query_limit = max(1, int(config.web_query_limit or 1))
+    active_queries = _dedupe(initial_queries)[:query_limit]
+    all_queries: list[str] = []
+    all_results: list[dict[str, Any]] = []
+    all_errors: list[str] = []
+    rounds: list[dict[str, Any]] = []
+    provider = None
+    status = "empty"
+    reason = None
+    mode = "initial"
+
+    for round_index in range(1, max_rounds + 1):
+        if not active_queries:
+            break
+        search = search_web(active_queries, limit=config.limit)
+        provider = search.get("provider") or provider
+        status = str(search.get("status") or status)
+        reason = search.get("reason") or reason
+        results = search.get("results") or []
+        errors = [str(item) for item in search.get("errors") or [] if str(item)]
+        all_queries.extend(active_queries)
+        all_results.extend(results)
+        all_errors.extend(errors)
+        quality = _round_signal_quality(results)
+        rounds.append({
+            "round": round_index,
+            "queries": active_queries,
+            "status": search.get("status"),
+            "results": len(results),
+            "mode": mode,
+            "followup": mode == "followup",
+            "quality": quality,
+        })
+        if round_index >= max_rounds or not results:
+            break
+        if quality["strong"]:
+            mode = "followup"
+            active_queries = _research_followup_queries(
+                results,
+                topic_name,
+                tag_context,
+                year=2026,
+                limit=query_limit,
+                seen_queries=all_queries,
+            )
+        else:
+            mode = "pivot"
+            active_queries = _research_pivot_queries(
+                topic,
+                tag_context,
+                year=2026,
+                limit=query_limit,
+                seen_queries=all_queries,
+            )
+        rounds[-1]["next_mode"] = mode if active_queries else "stop"
+
+    deduped_results = _dedupe_search_results(all_results, config.limit)
+    return {
+        "status": "ok" if deduped_results else status,
+        "provider": provider,
+        "reason": reason,
+        "queries": _dedupe(all_queries),
+        "limit": config.limit,
+        "results": deduped_results,
+        "errors": all_errors[:10],
+        "research_rounds": rounds,
+    }
+
+
+def _round_signal_quality(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Оценить раунд поиска: есть ли отраслевой контекст и признак события.
+
+    Отраслевой контекст без события (просто общее упоминание нефтегаза) — это
+    ещё не зацепка для follow-up: углубляться в такую выдачу бессмысленно, надо
+    менять угол поиска (pivot), а не пытаться уточнить компанию/технологию из шума.
+    """
+    industry_hits = 0
+    event_hits = 0
+    for row in results:
+        text = _clean_search_text(f"{row.get('title') or ''} {row.get('snippet') or ''}")
+        if not text:
+            continue
+        if INDUSTRY_CONTEXT_RE.search(text):
+            industry_hits += 1
+            if EVENT_SIGNAL_RE.search(text):
+                event_hits += 1
+    return {
+        "industry_hits": industry_hits,
+        "event_hits": event_hits,
+        "has_industry_context": industry_hits > 0,
+        "has_event_signal": event_hits > 0,
+        "strong": industry_hits > 0 and event_hits > 0,
+    }
+
+
+def _research_pivot_queries(
+    topic: dict[str, Any],
+    tag_context: dict[str, Any],
+    *,
+    year: int,
+    limit: int,
+    seen_queries: list[str],
+) -> list[str]:
+    """Собрать новый поисковый угол, когда прошлый раунд не дал зацепки.
+
+    Follow-up углубляется в найденную компанию/технологию, поэтому бесполезен на
+    слабой выдаче: он просто повторит тот же шум другими словами. Pivot вместо
+    этого перебирает свежие пары термин×угол (`_angle_suffixes_for_terms`) —
+    term-major порядок внутри каждого угла даёт заметно больше вариантов, чем
+    в исходном раунде, так что `_round_robin_queries` почти всегда находит
+    непройденные формулировки.
+    """
+    terms = _topic_search_terms(topic, tag_context)
+    if not terms:
+        return []
+    suffixes = _angle_suffixes_for_terms(terms)
+    groups = [[f"{year} {term} {suffix}" for term in terms] for suffix in suffixes]
+    return _round_robin_queries(groups, limit=limit, seen=seen_queries)
+
+
+def _research_followup_queries(
+    results: list[dict[str, Any]],
+    topic_name: str,
+    tag_context: dict[str, Any],
+    *,
+    year: int,
+    limit: int,
+    seen_queries: list[str],
+) -> list[str]:
+    groups: list[list[str]] = []
+    topic_terms = _topic_search_terms({"name": topic_name, "query_seeds_json": []}, tag_context)[:6]
+    for row in results[:12]:
+        title = _clean_search_text(str(row.get("title") or ""))
+        snippet = _clean_search_text(str(row.get("snippet") or ""))
+        text = f"{title} {snippet}".strip()
+        if not text or not INDUSTRY_CONTEXT_RE.search(text):
+            continue
+        companies = _followup_companies(text)
+        tech_terms = _followup_technology_terms(text, topic_terms)
+        row_queries: list[str] = []
+        for company in companies[:2]:
+            for term in tech_terms[:2] or topic_terms[:1]:
+                row_queries.extend([
+                    f'{year} "{company}" {term} deployment oil gas',
+                    f'{year} "{company}" {term} contract operator oilfield',
+                ])
+        if not companies and tech_terms:
+            row_queries.append(f"{year} {tech_terms[0]} customer deployment KPI oil gas")
+        if _contains_cjk(text):
+            cjk_terms = [term for term in [*tech_terms, *topic_terms] if _contains_cjk(term)]
+            row_queries.append(f"{year} {' '.join(cjk_terms[:2]) or topic_name} 现场应用 油气 技术")
+            row_queries.append(f"{year} {' '.join(cjk_terms[:2]) or topic_name} 中标 合作 油田")
+        if row_queries:
+            groups.append(_dedupe(row_queries))
+    return _round_robin_queries(groups, limit=limit, seen=seen_queries)
+
+
+def _followup_companies(text: str) -> list[str]:
+    generic = {
+        "AI", "HSE", "PTW", "LOTO", "SIMOPS", "LNG", "OIL", "GAS", "THE",
+        "NEWS", "PRESS", "RELEASE", "OPERATOR", "FIELD", "TECHNOLOGY",
+    }
+    return [
+        company
+        for company in _extract_companies(text)
+        if company.upper() not in generic and not re.fullmatch(r"20\d{2}", company)
+    ][:4]
+
+
+def _followup_technology_terms(text: str, topic_terms: list[str]) -> list[str]:
+    text_l = text.lower()
+    patterns = [
+        "closed-loop drilling",
+        "automated drilling",
+        "autonomous drilling",
+        "robotic inspection",
+        "predictive maintenance",
+        "digital permit to work",
+        "hydraulic fracturing",
+        "real-time monitoring",
+        "pipeline pigging",
+        "artificial lift",
+        "carbon capture",
+    ]
+    terms = [term for term in patterns if term in text_l]
+    for term in topic_terms:
+        term_l = str(term or "").lower()
+        if term_l and (term_l in text_l or _contains_cjk(term)):
+            terms.append(term)
+    if not terms:
+        words = [
+            word
+            for word in re.findall(r"[a-zа-яё0-9\u3400-\u9fff]{4,}", text_l)
+            if word not in _STOP_WORDS and not word.isdigit()
+        ]
+        terms.append(" ".join(words[:4]))
+    return _dedupe([term for term in terms if term])[:4]
+
+
+def _dedupe_search_results(results: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped = []
+    for item in results:
+        url = _normalize_url_for_key(str(item.get("url") or ""))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 def _topic_seed_queries(topic: dict[str, Any], *, year: int, tag_context: dict[str, Any] | None = None) -> list[str]:
@@ -1076,6 +1578,133 @@ def _topic_seed_queries(topic: dict[str, Any], *, year: int, tag_context: dict[s
         if _contains_cjk(seed):
             queries.append(f"{year} {seed} 新闻 石油 天然气 石化 矿山")
     return _dedupe(queries)
+
+
+def _planned_search_queries(
+    topic: dict[str, Any],
+    config: SignalDiscoveryConfig,
+    tag_context: dict[str, Any],
+    *,
+    feedback_queries: list[str],
+    seed_queries: list[str],
+    generated_queries: list[str],
+) -> list[str]:
+    """Собрать лимит запросов так, чтобы один источник не съел весь прогон.
+
+    Раньше список строился линейно: ОС -> сиды -> LLM, а затем обрезался. На малом лимите
+    это убивало исследовательские углы и прогон снова сваливался в однотипные новости.
+    """
+    limit = max(1, int(config.web_query_limit or 1))
+    head = _dedupe(feedback_queries[:1])
+    remaining = max(0, limit - len(head))
+    if remaining == 0:
+        return head[:limit]
+    angle_queries = _topic_angle_queries(topic, tag_context, year=2026)
+    tail = _round_robin_queries(
+        [
+            angle_queries,
+            generated_queries,
+            seed_queries,
+            feedback_queries[1:2],
+        ],
+        limit=remaining,
+        seen=head,
+    )
+    return _dedupe(head + tail)[:limit]
+
+
+def _round_robin_queries(groups: list[list[str]], *, limit: int, seen: list[str] | None = None) -> list[str]:
+    result: list[str] = []
+    seen_keys = {_query_dedupe_key(value) for value in seen or [] if value}
+    indexes = [0 for _ in groups]
+    while len(result) < limit:
+        progressed = False
+        for group_index, group in enumerate(groups):
+            while indexes[group_index] < len(group):
+                value = re.sub(r"\s+", " ", str(group[indexes[group_index]] or "")).strip()
+                indexes[group_index] += 1
+                key = _query_dedupe_key(value)
+                if not value or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                result.append(value)
+                progressed = True
+                break
+            if len(result) >= limit:
+                break
+        if not progressed:
+            break
+    return result
+
+
+def _topic_angle_queries(topic: dict[str, Any], tag_context: dict[str, Any], *, year: int) -> list[str]:
+    terms = _topic_search_terms(topic, tag_context)
+    if not terms:
+        return []
+    queries = []
+    for index, suffix in enumerate(_angle_suffixes_for_terms(terms)):
+        term = terms[index % len(terms)]
+        queries.append(f"{year} {term} {suffix}")
+    return _dedupe(queries)
+
+
+def _topic_search_terms(topic: dict[str, Any], tag_context: dict[str, Any]) -> list[str]:
+    raw_seeds = topic.get("query_seeds_json")
+    if raw_seeds is None:
+        raw_seeds = topic.get("query_seeds") or []
+    values = [
+        *(tag_context.get("keywords_en") or [])[:8],
+        *(str(item or "").strip() for item in (raw_seeds or [])[:8]),
+        *(tag_context.get("keywords_ru") or [])[:6],
+    ]
+    for tag in (tag_context.get("tags") or [])[:6]:
+        values.extend(str(tag.get(field) or "").strip() for field in ("name_en", "name"))
+    values.extend([str(topic.get("name") or ""), str(topic.get("description") or "")])
+    return _dedupe([_trim_query_term(value) for value in values if _trim_query_term(value)])[:12]
+
+
+def _angle_suffixes_for_terms(terms: list[str]) -> list[str]:
+    has_cjk = any(_contains_cjk(term) for term in terms)
+    has_cyrillic = any(_contains_cyrillic(term) for term in terms)
+    suffixes = [
+        "field trial deployment customer oil gas",
+        "contract partnership operator oilfield service",
+        "commercial launch technology deployment upstream",
+        "case study performance KPI industrial operation",
+        "mining chemicals industrial transfer oil gas",
+        "newsroom press release customer deployment",
+    ]
+    if has_cyrillic:
+        suffixes.extend([
+            "пилот внедрение заказчик нефтегаз",
+            "контракт партнерство оператор нефтесервис",
+        ])
+    if has_cjk:
+        suffixes.extend([
+            "现场应用 油气 技术",
+            "中标 合作 油田 技术",
+            "客户 案例 石化 矿山",
+        ])
+    return suffixes
+
+
+def _trim_query_term(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
+    if not text:
+        return ""
+    if len(text) <= 90:
+        return text
+    return " ".join(text.split()[:8]).strip(" ,.;:")
+
+
+def _query_dedupe_key(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").lower()).strip()
+    text = re.sub(r"\b(20[2-9][0-9]|news|новости|新闻)\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _contains_cyrillic(text: str) -> bool:
+    return bool(re.search(r"[а-яё]", text or "", re.IGNORECASE))
 
 
 def _topic_tag_context(topic_name: str) -> dict[str, Any]:
@@ -1273,6 +1902,100 @@ def _search_result_to_evidence(row: dict[str, Any], topic: str) -> dict[str, Any
     }
 
 
+WEB_EVIDENCE_FULLTEXT_CHARS = 1500
+
+
+def _fetch_full_text(url: str, fallback_title: str = "") -> dict[str, Any]:
+    """Открыть страницу и достать настоящий текст статьи вместо сниппета поиска.
+
+    Сниппет — это 1-2 обрубленных предложения от поисковика; по нему ни кластеризация,
+    ни судья не видят ни контракта, ни цифр, ни даты события. Переиспользуем ту же пару
+    probe_url + parse_article_page, что и source_discovery (включая RU/external-роутинг
+    через прокси внутри probe_url), поэтому вынесено в отдельную функцию — тесты
+    подменяют её целиком, не трогая сеть.
+    """
+    from oiltech_digest.ingestion import request_parser
+    from oiltech_digest.ingestion.source_diagnostics import probe_url
+
+    probe, content = probe_url(url)
+    if content is None:
+        return {
+            "ok": False,
+            "error": probe.error or f"http_{probe.status}",
+            "raw_text": "",
+            "published_at": None,
+            "title": "",
+        }
+    title, published_at, raw_text = request_parser.parse_article_page(content, fallback_title)
+    return {
+        "ok": True,
+        "error": None,
+        "raw_text": raw_text or "",
+        "published_at": published_at,
+        "title": title or "",
+    }
+
+
+def _enrich_web_evidence_with_full_text(
+    evidence: list[dict[str, Any]],
+    topic: str,
+    *,
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Заменить сниппет реальным текстом статьи там, где это удаётся и оправдано.
+
+    Раньше evidence из web-поиска несло только заголовок и обрывок сниппета — судья и
+    кластеризация не видели ни контракта, ни KPI, ни настоящей даты события, только то,
+    что уместилось в две строки выдачи. Лимит и мягкий фоллбэк на неудаче нужны, чтобы
+    не превращать один прогон в сотню HTTP-запросов и не терять кандидата, если страница
+    недоступна или защищена антиботом — тогда карточка остаётся такой же, как раньше.
+    """
+    stats = {"attempted": 0, "fetched": 0, "too_short": 0, "failed": 0}
+    if limit <= 0:
+        return evidence, stats
+
+    enriched: list[dict[str, Any]] = []
+    for item in evidence:
+        url = str(item.get("source_url") or "")
+        if not url or stats["attempted"] >= limit:
+            enriched.append(item)
+            continue
+        stats["attempted"] += 1
+        fetched = _fetch_full_text(url, str(item.get("title") or ""))
+        raw_text = _clean_search_text(fetched.get("raw_text") or "")
+        if not fetched.get("ok") or len(raw_text) < app_config.MIN_ARTICLE_TEXT_CHARS:
+            stats["failed" if not fetched.get("ok") else "too_short"] += 1
+            enriched.append({
+                **item,
+                "raw_payload": {
+                    **(item.get("raw_payload") or {}),
+                    "full_text_fetched": False,
+                    "full_text_error": fetched.get("error") or "too_short",
+                },
+            })
+            continue
+
+        stats["fetched"] += 1
+        title = fetched.get("title") or item.get("title") or ""
+        fact = raw_text[:WEB_EVIDENCE_FULLTEXT_CHARS]
+        context = {"title": title, "raw_text": f"{title}\n{fact}", "language": "mixed"}
+        enriched.append({
+            **item,
+            "title": title,
+            "title_ru": _enforce_glossary(title, context, topic),
+            "published_at": fetched.get("published_at") or item.get("published_at"),
+            "evidence_type": _evidence_type(f"{title} {fact}"),
+            "extracted_fact": fact,
+            "summary_ru": _enforce_glossary(fact, context, topic),
+            "raw_payload": {
+                **(item.get("raw_payload") or {}),
+                "full_text_fetched": True,
+                "full_text_chars": len(raw_text),
+            },
+        })
+    return enriched, stats
+
+
 def _has_industry_context(row: dict[str, Any]) -> bool:
     text = " ".join(
         str(row.get(key) or "")
@@ -1341,6 +2064,49 @@ def _cluster_evidence(evidence: list[dict[str, Any]], topic: str) -> list[list[d
     return clusters
 
 
+def _clusters_for_judging(clusters: list[list[dict[str, Any]]], limit: int) -> list[list[dict[str, Any]]]:
+    if limit <= 0:
+        return []
+    buckets: dict[str, list[list[dict[str, Any]]]] = {}
+    for cluster in clusters:
+        buckets.setdefault(_cluster_family(cluster), []).append(cluster)
+    families = sorted(
+        buckets.values(),
+        key=lambda rows: _cluster_rank(rows[0]) if rows else (0, 0),
+        reverse=True,
+    )
+    selected: list[list[dict[str, Any]]] = []
+    while len(selected) < limit:
+        progressed = False
+        for family in families:
+            if not family:
+                continue
+            selected.append(family.pop(0))
+            progressed = True
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+    return selected
+
+
+def _cluster_rank(cluster: list[dict[str, Any]]) -> tuple[int, float]:
+    return (len(cluster), sum(float(item.get("strength") or 0) for item in cluster))
+
+
+def _cluster_family(cluster: list[dict[str, Any]]) -> str:
+    text = " ".join(f"{item.get('title') or ''} {item.get('extracted_fact') or ''}" for item in cluster).lower()
+    if re.search(r"contract|partnership|supplier|контракт|поставщик|中标|合作", text):
+        return "commercial"
+    if re.search(r"deploy|implemented|field trial|pilot|внедр|пилот|现场应用", text):
+        return "deployment"
+    if re.search(r"\b\d+[%x]?\b|kpi|performance|faster|reduce|сниз|ускор|提高", text):
+        return "performance"
+    if re.search(r"launch|release|commercialized|запуст|推出|发布", text):
+        return "product"
+    return "other"
+
+
 def _cluster_key(evidence: dict[str, Any], topic: str) -> str:
     text = f"{evidence.get('title') or ''} {evidence.get('extracted_fact') or ''}".lower()
     patterns = [
@@ -1352,7 +2118,7 @@ def _cluster_key(evidence: dict[str, Any], topic: str) -> str:
     ]
     for key, pattern in patterns:
         if re.search(pattern, text):
-            return key
+            return f"{key}-{_fact_fingerprint(text)}"
     words = [w for w in re.findall(r"[a-zа-яё0-9]{4,}", text) if w not in _STOP_WORDS]
     return "-".join(words[:3]) or _slug(topic)
 
@@ -1441,15 +2207,21 @@ def _judge_prompt(evidence: list[dict[str, Any]], topic: str) -> str:
     for index, item in enumerate(evidence[:8], start=1):
         rows.append(
             "\n".join(
-                [
+                part
+                for part in [
                     f"evidence #{index}",
                     f"title: {item.get('title')}",
                     f"publisher: {item.get('publisher')}",
                     f"url: {item.get('source_url')}",
                     f"type: {item.get('evidence_type')}",
+                    # Раньше судья не видел дату события вообще и мог опираться только на
+                    # упоминания года в тексте. С полным текстом страницы published_at
+                    # часто реальный — даём его в явном виде для правила «событие старое».
+                    f"published_at: {item.get('published_at')}" if item.get("published_at") else None,
                     f"fact: {item.get('extracted_fact')}",
                     f"summary_ru: {item.get('summary_ru')}",
                 ]
+                if part is not None
             )
         )
     glossary = glossary_prompt_block(_glossary_context(evidence, topic))
@@ -1474,6 +2246,9 @@ def _training_input_payload(
             "status": (web_search or {}).get("status"),
             "provider": (web_search or {}).get("provider"),
             "queries": (web_search or {}).get("queries") or [],
+            "initial_queries": (web_search or {}).get("initial_queries") or [],
+            "research_rounds": (web_search or {}).get("research_rounds") or [],
+            "fulltext": (web_search or {}).get("fulltext"),
             "reason": (web_search or {}).get("reason"),
         } if web_search is not None else None,
         "evidence": [
