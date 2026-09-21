@@ -12,7 +12,7 @@ import json
 import logging
 import re
 
-from lxml import html
+from lxml import etree, html
 
 from oiltech_digest import config
 from oiltech_digest.db import repository
@@ -62,7 +62,7 @@ def extract_og_image(content: bytes | str) -> str:
         return ""
     try:
         doc = html.fromstring(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, etree.ParserError):
         return ""
     for xpath in _OG_IMAGE_XPATHS:
         for value in doc.xpath(xpath):
@@ -225,7 +225,7 @@ def extract_main_text(content: bytes | str) -> str:
         return ""
     try:
         doc = html.fromstring(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, etree.ParserError):
         return ""
 
     structured_text = _json_ld_article_text(doc)

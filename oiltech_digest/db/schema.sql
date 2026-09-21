@@ -704,6 +704,9 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS summary TEXT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS merged_into_signal_id BIGINT REFERENCES signals(id) ON DELETE SET NULL;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS merge_reason TEXT;
 CREATE INDEX IF NOT EXISTS idx_signals_merged_into ON signals(merged_into_signal_id) WHERE merged_into_signal_id IS NOT NULL;
+-- Ревью пачки (21.09): насколько сигнал интересен НА ФОНЕ своей пачки и почему.
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS interest_score NUMERIC;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS why_interesting TEXT;
 ALTER TABLE signal_evidence ADD COLUMN IF NOT EXISTS title_ru TEXT;
 ALTER TABLE signal_evidence ADD COLUMN IF NOT EXISTS summary_ru TEXT;
 ALTER TABLE signal_feedback_events ALTER COLUMN article_id DROP NOT NULL;

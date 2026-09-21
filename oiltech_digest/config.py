@@ -222,6 +222,10 @@ SIGNAL_DISCOVERY_RESEARCH_ROUNDS = int(os.environ.get("SIGNAL_DISCOVERY_RESEARCH
 # Сколько web-результатов на тему докачивать целиком (страница, а не сниппет поисковика)
 # перед кластеризацией и судьёй. 0 отключает докачку и оставляет только сниппеты.
 SIGNAL_DISCOVERY_WEB_FULLTEXT_LIMIT = int(os.environ.get("SIGNAL_DISCOVERY_WEB_FULLTEXT_LIMIT", "20"))
+# Докачка идёт на воркере: таймаут одной страницы и бюджет времени на тему. Без них
+# 20 медленных страниц × 20 с (+ повторы SSL-пути) съедали аренду задачи в 600 с.
+SIGNAL_DISCOVERY_FULLTEXT_TIMEOUT_SECONDS = int(os.environ.get("SIGNAL_DISCOVERY_FULLTEXT_TIMEOUT_SECONDS", "8"))
+SIGNAL_DISCOVERY_FULLTEXT_BUDGET_SECONDS = float(os.environ.get("SIGNAL_DISCOVERY_FULLTEXT_BUDGET_SECONDS", "120"))
 # Откуда брать темы радара: tags — корневые тематики заказчика (пункт 12), table —
 # таблица signal_radar_topics (прежние 21 тема из сида).
 SIGNAL_RADAR_TOPIC_SOURCE = os.environ.get("SIGNAL_RADAR_TOPIC_SOURCE", "tags").strip().lower()

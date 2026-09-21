@@ -123,9 +123,20 @@ def enqueue(
         capability=capability,
         max_attempts=max_attempts,
     )
-    if config.BACKGROUND_JOB_INLINE:
+    if config.BACKGROUND_JOB_INLINE and runs_inline(queue_name):
         _executor.submit(run, int(job["id"]))
     return job
+
+
+def runs_inline(queue_name: str) -> bool:
+    """Можно ли исполнить задачу в этом же процессе.
+
+    Внешняя очередь — это решение маршрута: задачу должен взять воркер за рубежом.
+    20.09 планировщик агентов (без BACKGROUND_JOB_INLINE=0) выполнил ежедневный радар
+    из очереди external-ai прямо на РФ-ядре → OpenAI 403 → задача дня failed, а крон
+    утром ответил «already_scheduled». Флаг окружения — одна забытая строка в compose;
+    здесь маршрут не может обойти ни один процесс."""
+    return not str(queue_name or "").startswith("external")
 
 
 def run(job_id: int) -> None:

@@ -10,7 +10,7 @@ import re
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 
 from dateutil import parser as dateparser
-from lxml import html
+from lxml import etree, html
 
 from oiltech_digest.config import MIN_ARTICLE_TEXT_CHARS, REQUEST_ARTICLE_LIMIT
 from oiltech_digest.db import repository
@@ -157,7 +157,7 @@ def extract_candidate_links(source: dict | str, listing_url: str | bytes, conten
 
     try:
         doc = html.fromstring(body)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, etree.ParserError):
         return []
 
     explicit = _extract_candidates_with_selector(doc, home_url, source_dict)
@@ -200,9 +200,12 @@ def fetch_article_candidate(candidate: CandidateLink, source: dict) -> dict | No
 
 
 def parse_article_page(content: bytes | str, fallback_title: str = "") -> tuple[str, datetime | None, str]:
+    # Пустое тело при 200 (или одни пробелы/комментарий) lxml встречает ParserError
+    # «Document is empty» — это НЕ ValueError. Без него одна пустая страница роняла
+    # весь прогон радара (докачка полного текста, 21.09), а сбор — весь источник.
     try:
         doc = html.fromstring(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, etree.ParserError):
         return fallback_title, None, ""
 
     title = _first_non_empty(

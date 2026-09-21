@@ -10,10 +10,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, fields, replace
+from datetime import datetime
 import hashlib
 import json
 import re
+import time
 from typing import Any, Callable, Iterator
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from oiltech_digest import config as app_config
 from oiltech_digest import signal_dedup
@@ -435,8 +439,8 @@ BATCH_REVIEW_INSTRUCTIONS = """Ты — финальный контроль ка
 Убирай кандидата (keep=false), если:
 - он описывает то же самое событие, что другой кандидат в этой же пачке (тот же
   продукт/контракт/внедрение у той же компании, просто другими словами) — оставь
-  только более сильный из пары (выше score или увереннее факты), в reason укажи
-  signal_key дубликата, который остаётся;
+  только более сильный из пары (выше score или увереннее факты), а у убранного в
+  duplicate_of_signal_key укажи signal_key того, который остаётся;
 - на фоне всей пачки видно, что это не отдельное событие, а общий обзор рынка,
   трюизм или пересказ уже известного тренда без нового факта;
 - в пачке несколько кандидатов от одного вендора с одинаковой рекламной подачей —
@@ -457,7 +461,8 @@ BATCH_REVIEW_INSTRUCTIONS = """Ты — финальный контроль ка
 кандидатов пачки. why_interesting — коротко по-русски, почему такой балл именно на
 фоне остальных. Для keep=false interest_score и why_interesting можно оставить пустыми.
 
-Верни решение по КАЖДОМУ переданному signal_key. reason — коротко по-русски."""
+duplicate_of_signal_key заполняй ТОЛЬКО для дубля; для обзора, шума и для keep=true —
+пустая строка. Верни решение по КАЖДОМУ переданному signal_key. reason — коротко по-русски."""
 
 
 BATCH_REVIEW_SCHEMA = {
@@ -472,10 +477,13 @@ BATCH_REVIEW_SCHEMA = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["signal_key", "keep", "reason", "interest_score", "why_interesting"],
+                    "required": [
+                        "signal_key", "keep", "duplicate_of_signal_key", "reason", "interest_score", "why_interesting",
+                    ],
                     "properties": {
                         "signal_key": {"type": "string"},
                         "keep": {"type": "boolean"},
+                        "duplicate_of_signal_key": {"type": "string"},
                         "reason": {"type": "string"},
                         "interest_score": {"type": "number", "minimum": 0, "maximum": 100},
                         "why_interesting": {"type": "string"},
@@ -529,6 +537,15 @@ _TAG_SNAPSHOT_FIELDS = (
 
 def _jsonable(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
+
+
+# Год в поисковых запросах — текущий по Москве (сутки радара считаются так же), а не
+# зашитый 2026: с 1 января запросы искали бы прошлогодние события.
+RADAR_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _current_year() -> int:
+    return datetime.now(RADAR_TZ).year
 
 
 def _topic_name(topic: dict[str, Any], config: SignalDiscoveryConfig) -> str:
@@ -613,8 +630,14 @@ def run_discovery(
             evidence = list(db_evidence)
             web_search = None
             if config.web_search or config.web_only:
-                web_search = _search_web_evidence(topic, config)
+                web_search = _search_web_evidence(topic, config, heartbeat=beat)
                 evidence.extend(web_search["evidence"])
+                # Дальше блок нужен только счётчиками: сами тексты уже в кандидатах. Без
+                # этого результат воркера вёз каждую докачанную страницу лишний раз.
+                web_search = {
+                    **{key: value for key, value in web_search.items() if key != "evidence"},
+                    "evidence_count": len(web_search.get("evidence") or []),
+                }
             evidence = _dedupe_evidence(evidence)
             fresh = [item for item in evidence if _normalize_url_for_key(str(item.get("source_url") or "")) not in known_urls]
             skipped_reviewed = len(evidence) - len(fresh)
@@ -674,9 +697,15 @@ def _dedupe_run(
             "signal": row,
         })
     refs: dict[int, dict[str, Any]] = {}
+    batch_duplicates: list[dict[str, Any]] = []
     for topic in topics_out:
         for candidate in topic["candidates"]:
             if candidate["rejected"]:
+                continue
+            if candidate.get("duplicate_of"):
+                # Дубль уже найден ревью пачки — в пары не идёт; ниже пойдёт за своей
+                # главной, если ту дедуп склеит с кем-то ещё (звезда, а не цепочка).
+                batch_duplicates.append(candidate)
                 continue
             signal = candidate["signal"]
             refs[len(nodes)] = candidate
@@ -705,9 +734,15 @@ def _dedupe_run(
             refs[index]["duplicate_reason"] = reason
         elif primary["kind"] == "existing":
             existing_merges.append({"signal_id": nodes[index]["id"], "into": primary["id"], "reason": reason})
+    by_key = {str(ref["signal"].get("signal_key") or ""): ref for ref in refs.values()}
+    for candidate in batch_duplicates:
+        primary = by_key.get(str(candidate["duplicate_of"].get("signal_key") or ""))
+        if primary is not None and primary.get("duplicate_of"):
+            candidate["duplicate_of"] = dict(primary["duplicate_of"])
     return {
         **result["stats"],
         "duplicates_new": sum(1 for index in result["assigned"] if index in refs),
+        "batch_duplicates": len(batch_duplicates),
         "existing_merges": existing_merges,
     }
 
@@ -934,21 +969,36 @@ def discover_signals(config: SignalDiscoveryConfig) -> dict[str, Any]:
     return result
 
 
+def _payload_number(payload: dict[str, Any], key: str, default: Any, cast: Callable[[Any], Any]) -> Any:
+    """Нет значения — умолчание; явный 0 — это 0.
+
+    `int(payload.get(key) or 20)` превращал 0 в 20, и выключатель докачки
+    SIGNAL_DISCOVERY_WEB_FULLTEXT_LIMIT=0 на ежедневном пути не выключал ничего (21.09)."""
+    value = payload.get(key)
+    if value is None or value == "":
+        return default
+    return cast(value)
+
+
 def config_from_payload(payload: dict[str, Any], *, background_job_id: int | None = None) -> SignalDiscoveryConfig:
     """Параметры задачи из payload — те же умолчания, что у локального обработчика."""
     return SignalDiscoveryConfig(
         topic=str(payload["topic"]) if payload.get("topic") else None,
-        days=int(payload.get("days") or 14),
-        limit=int(payload.get("limit") or 80),
-        min_score=float(payload.get("min_score") or 40),
+        days=_payload_number(payload, "days", 14, int),
+        limit=_payload_number(payload, "limit", 80, int),
+        min_score=_payload_number(payload, "min_score", 40.0, float),
         offline=bool(payload.get("offline", True)),
         dry_run=bool(payload.get("dry_run", False)),
-        max_signals=int(payload.get("max_signals") or 10),
+        max_signals=_payload_number(payload, "max_signals", 10, int),
         web_search=bool(payload.get("web_search", False)),
         web_only=bool(payload.get("web_only", False)),
-        web_query_limit=int(payload.get("web_query_limit") or 8),
-        research_rounds=int(payload.get("research_rounds") or 2),
-        web_fulltext_limit=int(payload.get("web_fulltext_limit") or 20),
+        web_query_limit=_payload_number(payload, "web_query_limit", 8, int),
+        # Задача с экрана эти поля не шлёт — умолчание из настроек ядра, чтобы
+        # выключатель в .env действовал на любой запуск, а не только на ежедневный.
+        research_rounds=_payload_number(payload, "research_rounds", app_config.SIGNAL_DISCOVERY_RESEARCH_ROUNDS, int),
+        web_fulltext_limit=_payload_number(
+            payload, "web_fulltext_limit", app_config.SIGNAL_DISCOVERY_WEB_FULLTEXT_LIMIT, int
+        ),
         background_job_id=background_job_id,
     )
 
@@ -997,11 +1047,21 @@ def apply_external_result(result: dict[str, Any], *, job_id: int) -> dict[str, A
     topics = []
     for row in applied["topic_results"]:
         web = row.get("web_search") or {}
+        review = row.get("batch_review") or {}
         topics.append({
             "topic": row["topic"],
             "web_status": web.get("status"),
             "queries": len(web.get("queries") or []),
             "results": web.get("results"),
+            # Без этих трёх полей в задаче не видно, работают ли раунды поиска,
+            # докачка страниц и ревью пачки — проверка выката смотрит сюда.
+            "research_modes": [item.get("mode") for item in web.get("research_rounds") or []],
+            "fulltext": web.get("fulltext"),
+            "batch_review": {
+                key: review.get(key)
+                for key in ("status", "source", "reviewed", "dropped", "duplicates", "reason", "error")
+                if review.get(key) is not None
+            } or None,
             "total_evidence": row.get("total_evidence"),
             "skipped_reviewed": row.get("skipped_reviewed"),
             "clusters": row.get("clusters"),
@@ -1054,22 +1114,31 @@ def _batch_review_candidates(
     кандидаты этой темы — поэтому не может заметить, что кандидат №3 пересказывает
     то же событие, что и №1, другими словами, или что кандидат сам по себе похож на
     факт, но на фоне всей пачки явно не тянет на отдельный сигнал. Мутирует переданные
-    candidate-словари на месте (rejected/maturity/batch_review_reason), потому что
-    именно эти объекты потом уходят в _dedupe_run и apply_discovery.
+    candidate-словари на месте, потому что именно эти объекты потом уходят в
+    _dedupe_run и apply_discovery.
+
+    Два разных исхода «убрать»: обзор/шум — rejected (брак), дубль соседа — duplicate_of
+    оставшегося. Дубль не брак: его ссылки уходят в главную карточку путём дедупа
+    (_merge_duplicate), а в обучение он идёт как «duplicate». Пометка дубля браком
+    теряла ссылки и учила радар, что пересказ сильного события — мусор (21.09).
     """
     reviewable = [item for item in candidates if not item.get("rejected") and item.get("signal")]
     if len(reviewable) < 2:
-        return {"status": "skipped", "reason": "fewer_than_2_candidates", "reviewed": len(reviewable), "dropped": 0}
+        return {"status": "skipped", "reason": "fewer_than_2_candidates", "reviewed": len(reviewable),
+                "dropped": 0, "duplicates": 0}
 
     if offline:
-        dropped = _offline_batch_duplicate_drop(reviewable)
-        interest_scores = _apply_fallback_interest_scores(reviewable)
+        duplicates = _offline_batch_duplicates(reviewable)
+        interest_scores = _apply_fallback_interest_scores(
+            [item for item in reviewable if not item.get("duplicate_of")]
+        )
         return {
             "status": "ok",
             "source": "rules",
             "reviewed": len(reviewable),
-            "dropped": len(dropped),
-            "decisions": dropped,
+            "dropped": 0,
+            "duplicates": len(duplicates),
+            "decisions": duplicates,
             "interest_scores": interest_scores,
         }
 
@@ -1086,37 +1155,60 @@ def _batch_review_candidates(
             max_output_tokens=900,
         )
     except Exception as exc:  # noqa: BLE001 - батч-ревью не должно ронять прогон темы
-        return {"status": "error", "error": str(exc)[:500], "reviewed": len(reviewable), "dropped": 0}
+        return {"status": "error", "error": str(exc)[:500], "reviewed": len(reviewable), "dropped": 0,
+                "duplicates": 0}
 
     by_key = {str(item["signal"].get("signal_key") or ""): item for item in reviewable}
-    dropped = []
-    seen_keys = set()
+    decisions: dict[str, dict[str, Any]] = {}
     for decision in response.data.get("decisions") or []:
         key = str(decision.get("signal_key") or "")
-        candidate = by_key.get(key)
-        if candidate is None:
+        if key in by_key and key not in decisions:
+            decisions[key] = decision
+    # Кого модель не упомянула — остаётся (ниже получит балл судьи вместо interest).
+    kept = {key for key in by_key if decisions.get(key, {}).get("keep", True)}
+    targets = {
+        key: str(decision.get("duplicate_of_signal_key") or "").strip()
+        for key, decision in decisions.items()
+        if not decision.get("keep", True)
+    }
+    targets = {key: target for key, target in targets.items() if target and target != key and target in by_key}
+
+    dropped: list[dict[str, Any]] = []
+    duplicates: list[dict[str, Any]] = []
+    unscored: list[dict[str, Any]] = [item for key, item in by_key.items() if key not in decisions]
+    for key, decision in decisions.items():
+        candidate = by_key[key]
+        if key in kept:
+            # Судья оценивал score в изоляции; interest_score — сравнение внутри пачки,
+            # поэтому именно он должен решать финальную сортировку, а не сырой score.
+            candidate["signal"]["interest_score"] = _normalize_score(decision.get("interest_score"))
+            candidate["signal"]["why_interesting"] = str(decision.get("why_interesting") or "").strip()
             continue
-        seen_keys.add(key)
-        if not decision.get("keep", True):
-            reason = str(decision.get("reason") or "").strip() or "Отклонён на финальной проверке пачки сигналов."
-            candidate["rejected"] = True
-            candidate["signal"]["maturity"] = "reject"
+        reason = str(decision.get("reason") or "").strip() or "Отклонён на финальной проверке пачки сигналов."
+        root = _batch_duplicate_root(key, targets, kept)
+        if root == "cycle":
+            # Противоречивый ответ (A — дубль B, B — дубль A): сигнал не теряем.
+            kept.add(key)
+            unscored.append(candidate)
+            continue
+        if root:
+            candidate["duplicate_of"] = {"signal_key": root}
+            candidate["duplicate_reason"] = reason
             candidate["signal"]["batch_review_reason"] = reason
-            dropped.append({"signal_key": key, "reason": reason})
+            duplicates.append({"signal_key": key, "action": "duplicate", "duplicate_of": root, "reason": reason})
             continue
-        # Судья оценивал score в изоляции; interest_score — сравнение внутри пачки,
-        # поэтому именно он должен решать финальную сортировку, а не сырой score.
-        candidate["signal"]["interest_score"] = _normalize_score(decision.get("interest_score"))
-        candidate["signal"]["why_interesting"] = str(decision.get("why_interesting") or "").strip()
+        candidate["rejected"] = True
+        candidate["signal"]["maturity"] = "reject"
+        candidate["signal"]["batch_review_reason"] = reason
+        dropped.append({"signal_key": key, "action": "reject", "reason": reason})
 
     # Модель могла пропустить кандидата вопреки инструкции — не терять ранжирование
     # из-за одного недостающего решения, откатываемся на score судьи для него.
-    missing = [item for key, item in by_key.items() if key not in seen_keys]
-    interest_scores = _apply_fallback_interest_scores(missing)
+    interest_scores = _apply_fallback_interest_scores(unscored)
     interest_scores.update({
-        str(item["signal"].get("signal_key") or ""): item["signal"].get("interest_score")
-        for item in reviewable
-        if not item.get("rejected") and item["signal"].get("interest_score") is not None
+        key: by_key[key]["signal"].get("interest_score")
+        for key in kept
+        if by_key[key]["signal"].get("interest_score") is not None
     })
 
     return {
@@ -1125,9 +1217,29 @@ def _batch_review_candidates(
         "model": response.model,
         "reviewed": len(reviewable),
         "dropped": len(dropped),
-        "decisions": dropped,
+        "duplicates": len(duplicates),
+        "decisions": dropped + duplicates,
         "interest_scores": interest_scores,
     }
+
+
+def _batch_duplicate_root(key: str, targets: dict[str, str], kept: set[str]) -> str | None:
+    """Оставшийся кандидат, в которого сливается дубль; None — цепочка кончилась браком.
+
+    Модель может сослаться на дубль (A → B, B → C): идём до оставшегося — звезда, а не
+    цепочка, как у дедупа. «cycle» — модель противоречит себе."""
+    if key not in targets:
+        return None
+    visited = {key}
+    current = targets[key]
+    while current not in kept:
+        if current in visited:
+            return "cycle"
+        if current not in targets:
+            return None
+        visited.add(current)
+        current = targets[current]
+    return current
 
 
 def _batch_review_candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -1159,27 +1271,30 @@ def _apply_fallback_interest_scores(items: list[dict[str, Any]]) -> dict[str, fl
     return scores
 
 
-def _offline_batch_duplicate_drop(reviewable: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _offline_batch_duplicates(reviewable: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Без LLM ловим только близкие дубли по заголовку и компаниям (best-effort).
 
     Настоящее «это тот же трюизм другими словами» без модели не распознать —
     офлайн-режим здесь такой же грубый фоллбэк, как и остальная rules-эвристика
-    в этом модуле (например recommend_source_action).
+    в этом модуле (например recommend_source_action). Похожий — дубль сильнейшего
+    из оставшихся (duplicate_of), а не брак: его ссылки уходят в ту карточку.
     """
-    dropped = []
-    kept: list[set[str]] = []
+    duplicates = []
+    kept: list[tuple[set[str], str]] = []
     for candidate in sorted(reviewable, key=lambda item: float(item["signal"].get("score") or 0), reverse=True):
         signal = candidate["signal"]
         tokens = _batch_dedupe_tokens(signal)
-        if any(_jaccard(tokens, kept_tokens) >= 0.6 for kept_tokens in kept):
-            reason = "Похож на другой сигнал этой пачки (офлайн-правило, без модели)."
-            candidate["rejected"] = True
-            signal["maturity"] = "reject"
-            signal["batch_review_reason"] = reason
-            dropped.append({"signal_key": signal.get("signal_key"), "reason": reason})
-        else:
-            kept.append(tokens)
-    return dropped
+        primary = next((key for kept_tokens, key in kept if _jaccard(tokens, kept_tokens) >= 0.6), None)
+        if primary is None:
+            kept.append((tokens, str(signal.get("signal_key") or "")))
+            continue
+        reason = "Похож на другой сигнал этой пачки (офлайн-правило, без модели)."
+        candidate["duplicate_of"] = {"signal_key": primary}
+        candidate["duplicate_reason"] = reason
+        signal["batch_review_reason"] = reason
+        duplicates.append({"signal_key": signal.get("signal_key"), "action": "duplicate",
+                           "duplicate_of": primary, "reason": reason})
+    return duplicates
 
 
 def _batch_dedupe_tokens(signal: dict[str, Any]) -> set[str]:
@@ -1276,12 +1391,21 @@ def _article_to_evidence(row: dict[str, Any], topic: str) -> dict[str, Any]:
     }
 
 
-def _search_web_evidence(topic: dict[str, Any], config: SignalDiscoveryConfig) -> dict[str, Any]:
+def _search_web_evidence(
+    topic: dict[str, Any],
+    config: SignalDiscoveryConfig,
+    *,
+    heartbeat: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     from oiltech_digest.source_discovery.agent import generate_search_queries, search_web
 
+    # Поиск, генерация запросов и докачка страниц — самые долгие шаги темы: без
+    # продления аренды на медленных сайтах задача теряла lease и оплачивалась дважды.
+    beat = heartbeat or (lambda: None)
+    year = _current_year()
     topic_name = str(topic.get("name") or config.topic or "").strip()
     tag_context = _topic_tag_context(topic_name)
-    seed_queries = _topic_seed_queries(topic, year=2026, tag_context=tag_context)
+    seed_queries = _topic_seed_queries(topic, year=year, tag_context=tag_context)
     topic_terms = topic_term_stems(
         topic_name,
         str(topic.get("description") or ""),
@@ -1303,6 +1427,7 @@ def _search_web_evidence(topic: dict[str, Any], config: SignalDiscoveryConfig) -
         feedback_queries=feedback_queries,
         seed_queries=seed_queries,
         generated_queries=generated_queries,
+        year=year,
     )
     search = _run_research_loop(
         search_web,
@@ -1311,6 +1436,8 @@ def _search_web_evidence(topic: dict[str, Any], config: SignalDiscoveryConfig) -
         topic_name=topic_name,
         tag_context=tag_context,
         config=config,
+        year=year,
+        heartbeat=beat,
     )
     results = search.get("results") or []
     evidence = [
@@ -1322,6 +1449,7 @@ def _search_web_evidence(topic: dict[str, Any], config: SignalDiscoveryConfig) -
         evidence,
         topic_name,
         limit=config.web_fulltext_limit,
+        heartbeat=beat,
     )
     return {
         "status": search.get("status"),
@@ -1346,7 +1474,11 @@ def _run_research_loop(
     topic_name: str,
     tag_context: dict[str, Any],
     config: SignalDiscoveryConfig,
+    year: int | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    beat = heartbeat or (lambda: None)
+    year = _current_year() if year is None else year
     max_rounds = max(1, int(config.research_rounds or 1))
     query_limit = max(1, int(config.web_query_limit or 1))
     active_queries = _dedupe(initial_queries)[:query_limit]
@@ -1362,6 +1494,7 @@ def _run_research_loop(
     for round_index in range(1, max_rounds + 1):
         if not active_queries:
             break
+        beat()
         search = search_web(active_queries, limit=config.limit)
         provider = search.get("provider") or provider
         status = str(search.get("status") or status)
@@ -1389,7 +1522,7 @@ def _run_research_loop(
                 results,
                 topic_name,
                 tag_context,
-                year=2026,
+                year=year,
                 limit=query_limit,
                 seen_queries=all_queries,
             )
@@ -1398,7 +1531,7 @@ def _run_research_loop(
             active_queries = _research_pivot_queries(
                 topic,
                 tag_context,
-                year=2026,
+                year=year,
                 limit=query_limit,
                 seen_queries=all_queries,
             )
@@ -1588,6 +1721,7 @@ def _planned_search_queries(
     feedback_queries: list[str],
     seed_queries: list[str],
     generated_queries: list[str],
+    year: int | None = None,
 ) -> list[str]:
     """Собрать лимит запросов так, чтобы один источник не съел весь прогон.
 
@@ -1599,7 +1733,7 @@ def _planned_search_queries(
     remaining = max(0, limit - len(head))
     if remaining == 0:
         return head[:limit]
-    angle_queries = _topic_angle_queries(topic, tag_context, year=2026)
+    angle_queries = _topic_angle_queries(topic, tag_context, year=_current_year() if year is None else year)
     tail = _round_robin_queries(
         [
             angle_queries,
@@ -1903,9 +2037,17 @@ def _search_result_to_evidence(row: dict[str, Any], topic: str) -> dict[str, Any
 
 
 WEB_EVIDENCE_FULLTEXT_CHARS = 1500
+# Документы, а не страницы: лишний трафик, а текст из байтов PDF ушёл бы судье мусором.
+_FULLTEXT_SKIP_SUFFIXES = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip")
+_BINARY_PREFIXES = (b"%PDF", b"PK\x03\x04", b"\xd0\xcf\x11\xe0", b"\x89PNG", b"\xff\xd8\xff", b"GIF8")
 
 
-def _fetch_full_text(url: str, fallback_title: str = "") -> dict[str, Any]:
+def _looks_binary(content: bytes | str) -> bool:
+    head = content[:1024] if isinstance(content, bytes) else content[:1024].encode("utf-8", "ignore")
+    return head.lstrip().startswith(_BINARY_PREFIXES) or b"\x00" in head
+
+
+def _fetch_full_text(url: str, fallback_title: str = "", *, timeout: int | None = None) -> dict[str, Any]:
     """Открыть страницу и достать настоящий текст статьи вместо сниппета поиска.
 
     Сниппет — это 1-2 обрубленных предложения от поисковика; по нему ни кластеризация,
@@ -1913,19 +2055,21 @@ def _fetch_full_text(url: str, fallback_title: str = "") -> dict[str, Any]:
     probe_url + parse_article_page, что и source_discovery (включая RU/external-роутинг
     через прокси внутри probe_url), поэтому вынесено в отдельную функцию — тесты
     подменяют её целиком, не трогая сеть.
+
+    Таймаут короче обычного (SIGNAL_DISCOVERY_FULLTEXT_TIMEOUT_SECONDS): страница —
+    улучшение, а не условие прогона, и 20 с × до 20 страниц × 13 тем не должны жечь аренду.
     """
     from oiltech_digest.ingestion import request_parser
     from oiltech_digest.ingestion.source_diagnostics import probe_url
 
-    probe, content = probe_url(url)
+    empty = {"ok": False, "raw_text": "", "published_at": None, "title": ""}
+    if urlsplit(url).path.lower().endswith(_FULLTEXT_SKIP_SUFFIXES):
+        return {**empty, "error": "not_html"}
+    probe, content = probe_url(url, timeout=timeout or app_config.SIGNAL_DISCOVERY_FULLTEXT_TIMEOUT_SECONDS)
     if content is None:
-        return {
-            "ok": False,
-            "error": probe.error or f"http_{probe.status}",
-            "raw_text": "",
-            "published_at": None,
-            "title": "",
-        }
+        return {**empty, "error": probe.error or f"http_{probe.status}"}
+    if _looks_binary(content):
+        return {**empty, "error": "not_html"}
     title, published_at, raw_text = request_parser.parse_article_page(content, fallback_title)
     return {
         "ok": True,
@@ -1941,6 +2085,9 @@ def _enrich_web_evidence_with_full_text(
     topic: str,
     *,
     limit: int,
+    heartbeat: Callable[[], None] | None = None,
+    budget_seconds: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Заменить сниппет реальным текстом статьи там, где это удаётся и оправдано.
 
@@ -1949,19 +2096,34 @@ def _enrich_web_evidence_with_full_text(
     что уместилось в две строки выдачи. Лимит и мягкий фоллбэк на неудаче нужны, чтобы
     не превращать один прогон в сотню HTTP-запросов и не терять кандидата, если страница
     недоступна или защищена антиботом — тогда карточка остаётся такой же, как раньше.
+
+    Любая ошибка страницы — откат на сниппет, а не падение темы: 21.09 пустое тело (200)
+    роняло lxml ParserError сквозь весь прогон. Перед каждой страницей — heartbeat, а по
+    исчерпании бюджета времени на тему остальные кандидаты остаются со сниппетом.
     """
-    stats = {"attempted": 0, "fetched": 0, "too_short": 0, "failed": 0}
+    beat = heartbeat or (lambda: None)
+    budget = app_config.SIGNAL_DISCOVERY_FULLTEXT_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    stats = {"attempted": 0, "fetched": 0, "too_short": 0, "failed": 0, "skipped_budget": 0}
     if limit <= 0:
         return evidence, stats
 
+    started = clock()
     enriched: list[dict[str, Any]] = []
     for item in evidence:
         url = str(item.get("source_url") or "")
-        if not url or stats["attempted"] >= limit:
+        if not url or stats["attempted"] + stats["skipped_budget"] >= limit:
             enriched.append(item)
             continue
+        if budget > 0 and clock() - started >= budget:
+            stats["skipped_budget"] += 1
+            enriched.append(item)
+            continue
+        beat()
         stats["attempted"] += 1
-        fetched = _fetch_full_text(url, str(item.get("title") or ""))
+        try:
+            fetched = _fetch_full_text(url, str(item.get("title") or ""))
+        except Exception as exc:  # noqa: BLE001 - одна страница не роняет тему
+            fetched = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}", "raw_text": ""}
         raw_text = _clean_search_text(fetched.get("raw_text") or "")
         if not fetched.get("ok") or len(raw_text) < app_config.MIN_ARTICLE_TEXT_CHARS:
             stats["failed" if not fetched.get("ok") else "too_short"] += 1

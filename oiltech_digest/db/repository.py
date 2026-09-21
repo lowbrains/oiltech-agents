@@ -938,9 +938,10 @@ def upsert_signal(signal: dict) -> int:
             """
             INSERT INTO signals (
               signal_key, title, title_ru, theme, summary, thesis, transferability, maturity, confidence, score,
-              why_now, why_not_noise, companies_json, industries_json, evidence_count
+              why_now, why_not_noise, companies_json, industries_json, evidence_count,
+              interest_score, why_interesting
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (signal_key) DO UPDATE SET
               title = EXCLUDED.title,
               title_ru = EXCLUDED.title_ru,
@@ -956,6 +957,10 @@ def upsert_signal(signal: dict) -> int:
               companies_json = EXCLUDED.companies_json,
               industries_json = EXCLUDED.industries_json,
               evidence_count = EXCLUDED.evidence_count,
+              -- Балл интереса — сравнение внутри пачки; тема из одного кандидата его
+              -- не получает, и прошлый балл не должен стираться NULL'ом.
+              interest_score = COALESCE(EXCLUDED.interest_score, signals.interest_score),
+              why_interesting = COALESCE(NULLIF(EXCLUDED.why_interesting, ''), signals.why_interesting),
               last_seen_at = now(),
               updated_at = now()
             RETURNING id
@@ -976,6 +981,8 @@ def upsert_signal(signal: dict) -> int:
                 Json(_jsonable(signal.get("companies") or [])),
                 Json(_jsonable(signal.get("industries") or [])),
                 int(signal.get("evidence_count") or 0),
+                float(signal["interest_score"]) if signal.get("interest_score") is not None else None,
+                (signal.get("why_interesting") or None),
             ),
         )
         signal_id = int(cur.fetchone()[0])

@@ -140,7 +140,7 @@ def test_worker_marks_repeats_of_existing_and_in_run_duplicates(monkeypatch):
     }
     monkeypatch.setattr(signal_discovery, "_cluster_evidence", lambda evidence, topic: [[{"t": topic, "i": i}] for i in range(len(by_topic[topic]))])
     monkeypatch.setattr(signal_discovery, "_dedupe_evidence", lambda evidence: evidence)
-    monkeypatch.setattr(signal_discovery, "_search_web_evidence", lambda topic, config: {"evidence": [{}], "status": "ok"})
+    monkeypatch.setattr(signal_discovery, "_search_web_evidence", lambda topic, config, **kwargs: {"evidence": [{}], "status": "ok"})
     monkeypatch.setattr(signal_discovery, "judge_signal_snapshot",
                         lambda cluster, topic, offline=True: (dict(by_topic[topic][cluster[0]["i"]]), {}))
     monkeypatch.setattr(signal_discovery, "_signal_key", lambda signal, cluster: signal["signal_key"])
@@ -395,3 +395,15 @@ def test_earlier_unreviewed_card_stays_main_even_with_fewer_links():
     assigned = signal_dedup.assign_duplicates([older, newer], [(0, 1, "одна платформа")])
 
     assert assigned == {1: (0, "одна платформа")}
+
+
+def test_company_written_as_list_pairs_with_single_company():
+    """№107 «EDF / MethaneSAT» и №3 «MethaneSAT» — одно событие, но пара не находилась:
+    строка «edf / methanesat» не равна «methanesat» (20.09)."""
+    nodes = [
+        _existing(3, "Спутник MethaneSAT потерян на орбите", ["MethaneSAT"]),
+        _new("Потеря связи со спутником мониторинга метана", ["EDF / MethaneSAT"], key="k107"),
+    ]
+
+    assert signal_dedup.company_keys(nodes[1]["signal"]) == {"edf", "methanesat"}
+    assert [(i, j) for i, j, _ in signal_dedup.find_pairs(nodes)] == [(0, 1)]

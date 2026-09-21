@@ -79,8 +79,14 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Конвейер статей (tasks, worker, playwright-worker, scheduler) агентам не нужен:
+  # сбор и ИИ-обработку ведёт MVP-1, радар ходит в веб, агент источников — в поиск.
+  # 20.09 голый `up -d --build` поднял их все, и за 8,5 ч планировщик задублировал
+  # сбор MVP-1 ($4,48 ИИ) и уронил радар дня. Под профилем их поднимает только
+  # явное `--profile pipeline`, а выкат ядра — `up -d --no-deps agents-app`.
   tasks:
     build: .
+    profiles: ["pipeline"]
     container_name: oiltech_agents_tasks
     depends_on:
       bootstrap:
@@ -112,6 +118,7 @@ services:
 
   worker:
     build: .
+    profiles: ["pipeline"]
     container_name: oiltech_agents_worker
     depends_on:
       bootstrap:
@@ -139,6 +146,7 @@ services:
 
   playwright-worker:
     build: .
+    profiles: ["pipeline"]
     container_name: oiltech_agents_playwright_worker
     depends_on:
       bootstrap:
@@ -166,6 +174,7 @@ services:
 
   scheduler:
     build: .
+    profiles: ["pipeline"]
     container_name: oiltech_agents_scheduler
     depends_on:
       bootstrap:
@@ -175,6 +184,10 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-oiltech}:${POSTGRES_PASSWORD:-oiltech_local_dev}@oiltech_agents_pg:5432/${POSTGRES_DB:-oiltech_agents}
       PYTHONUNBUFFERED: "1"
+      # Без этой строки enqueue() исполнял задачи прямо в планировщике — так радар
+      # из очереди external-ai ушёл в OpenAI с РФ-адреса (20.09). Код теперь и сам
+      # не исполняет внешние очереди на месте (background_jobs.runs_inline).
+      BACKGROUND_JOB_INLINE: "0"
       CYCLE_INTERVAL_SECONDS: ${CYCLE_INTERVAL_SECONDS:-21600}
       RUN_DISCOVER_ON_START: ${RUN_DISCOVER_ON_START:-1}
       DISCOVER_EVERY_CYCLES: ${DISCOVER_EVERY_CYCLES:-24}
@@ -218,6 +231,7 @@ services:
 
   docs:
     image: squidfunk/mkdocs-material:9
+    profiles: ["docs"]
     container_name: oiltech_agents_docs
     restart: unless-stopped
     ports:

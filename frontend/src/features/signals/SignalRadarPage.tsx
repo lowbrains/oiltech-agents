@@ -299,6 +299,17 @@ export function SignalRadarPage({ onUnauthorized, showToast, isAdmin = false }: 
                       <span>Переносимость</span>
                       <p>{signal.transferability || "Нет оценки"}</p>
                     </div>
+                    {/* Сравнение внутри пачки прогона, а не абсолютная оценка судьи:
+                        поэтому рядом с баллами, но порядок списка — по баллам. */}
+                    {signal.why_interesting ? (
+                      <div>
+                        <span>
+                          Почему интересно
+                          {signal.interest_score != null ? ` · ${Math.round(Number(signal.interest_score))}` : ""}
+                        </span>
+                        <p>{signal.why_interesting}</p>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
 

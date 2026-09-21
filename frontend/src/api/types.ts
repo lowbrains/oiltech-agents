@@ -242,6 +242,9 @@ export type Signal = {
   user_status_updated_at?: string | null;
   feedback_count?: number;
   merged_count?: number;
+  // Ревью пачки: насколько сигнал интересен на фоне соседей по прогону и почему.
+  interest_score?: number | null;
+  why_interesting?: string | null;
   evidence?: SignalEvidence[];
 };
 

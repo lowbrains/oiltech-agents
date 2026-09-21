@@ -111,9 +111,13 @@ def test_discover_signals_builds_radar_signal_from_article_evidence(monkeypatch)
         signal_discovery.SignalDiscoveryConfig(offline=True, dry_run=True)
     )
 
-    assert result["signals"]
-    assert result["signals"][0]["maturity"] in {"watch", "shortlist", "proven"}
-    assert result["signals"][0]["evidence_count"] == 2
+    # Две статьи — два разных события (ADNOC выбрала роботов / обзор Physical AI):
+    # ключ кластера «шаблон + отпечаток текста» (655cdbe) их больше не склеивает, как
+    # склеивал голый шаблон «physical-ai-robotics». Одно событие в одну карточку сводят
+    # дедуп и ревью пачки — см. test_batch_review_duplicate_merges_into_primary_card.
+    assert len(result["signals"]) == 2
+    assert {item["maturity"] for item in result["signals"]} <= {"watch", "shortlist", "proven"}
+    assert [item["evidence_count"] for item in result["signals"]] == [1, 1]
     assert saved == {"signals": 0, "evidence": 0}
 
 
@@ -232,7 +236,7 @@ def test_discover_signals_filters_reject_title_even_when_maturity_watch(monkeypa
     monkeypatch.setattr(
         signal_discovery,
         "_search_web_evidence",
-        lambda topic, config: {
+        lambda topic, config, **kwargs: {
             "status": "ok",
             "provider": "test",
             "queries": [],
@@ -395,7 +399,7 @@ def test_discover_signals_can_use_web_evidence_without_registered_sources(monkey
     monkeypatch.setattr(
         signal_discovery,
         "_search_web_evidence",
-        lambda topic, config: {
+        lambda topic, config, **kwargs: {
             "status": "ok",
             "provider": "test",
             "queries": ["2026 electronic permit to work oil gas"],
@@ -456,7 +460,7 @@ def test_web_only_skips_local_article_evidence(monkeypatch):
     monkeypatch.setattr(
         signal_discovery,
         "_search_web_evidence",
-        lambda topic, config: {"status": "empty", "provider": "test", "queries": [], "results": 0, "evidence": []},
+        lambda topic, config, **kwargs: {"status": "empty", "provider": "test", "queries": [], "results": 0, "evidence": []},
     )
 
     result = signal_discovery.discover_signals(
@@ -862,7 +866,7 @@ def test_web_search_enriches_evidence_with_fetched_full_text(monkeypatch):
     )
 
     assert fetched_calls == ["https://example.com/adnoc-pilot"]
-    assert result["fulltext"] == {"attempted": 1, "fetched": 1, "too_short": 0, "failed": 0}
+    assert result["fulltext"] == {"attempted": 1, "fetched": 1, "too_short": 0, "failed": 0, "skipped_budget": 0}
     evidence = result["evidence"]
     assert len(evidence) == 1
     item = evidence[0]
@@ -947,7 +951,7 @@ def test_web_search_full_text_fetch_falls_back_gracefully(monkeypatch):
         signal_discovery.SignalDiscoveryConfig(web_query_limit=2, limit=5, research_rounds=1, web_fulltext_limit=5),
     )
 
-    assert result["fulltext"] == {"attempted": 2, "fetched": 0, "too_short": 1, "failed": 1}
+    assert result["fulltext"] == {"attempted": 2, "fetched": 0, "too_short": 1, "failed": 1, "skipped_budget": 0}
     by_url = {item["source_url"]: item for item in result["evidence"]}
     blocked = by_url["https://example.com/blocked"]
     assert blocked["extracted_fact"] == "Field trial improves drilling performance for an oil and gas operator."
@@ -964,15 +968,17 @@ def test_batch_review_skips_when_fewer_than_two_candidates():
 
     result = signal_discovery._batch_review_candidates(candidates, "Бурение", offline=True)
 
-    assert result == {"status": "skipped", "reason": "fewer_than_2_candidates", "reviewed": 1, "dropped": 0}
+    assert result == {"status": "skipped", "reason": "fewer_than_2_candidates", "reviewed": 1, "dropped": 0,
+                      "duplicates": 0}
     assert candidates[0]["rejected"] is False
 
 
-def test_batch_review_offline_drops_near_duplicate_candidates():
+def test_batch_review_offline_merges_near_duplicate_into_stronger():
     """Судья видел кластеры по отдельности и одобрил оба — офлайн-правило ловит
 
-    то, что по заголовку и компании это один и тот же контракт ADNOC, и оставляет
-    только более сильный по score кандидат.
+    то, что по заголовку и компании это один и тот же контракт ADNOC. Слабый — дубль
+    сильного (его ссылки уйдут в ту карточку), а не брак: брак учит радар, что
+    пересказ сильного события — мусор, и теряет ссылки (21.09).
     """
     strong = {
         "signal": {
@@ -997,10 +1003,13 @@ def test_batch_review_offline_drops_near_duplicate_candidates():
 
     assert result["status"] == "ok"
     assert result["source"] == "rules"
-    assert result["dropped"] == 1
+    assert result["dropped"] == 0
+    assert result["duplicates"] == 1
     assert strong["rejected"] is False
-    assert weak["rejected"] is True
-    assert weak["signal"]["maturity"] == "reject"
+    assert "duplicate_of" not in strong
+    assert weak["rejected"] is False
+    assert weak["duplicate_of"] == {"signal_key": "strong"}
+    assert weak["signal"].get("maturity") != "reject"
     assert weak["signal"]["batch_review_reason"]
 
 
@@ -1021,6 +1030,7 @@ def test_batch_review_offline_keeps_distinct_candidates():
         "source": "rules",
         "reviewed": 2,
         "dropped": 0,
+        "duplicates": 0,
         "decisions": [],
         "interest_scores": {"a": 80.0, "b": 70.0},
     }
@@ -1031,7 +1041,7 @@ def test_batch_review_offline_keeps_distinct_candidates():
     assert b["signal"]["interest_score"] == 70.0
 
 
-def test_batch_review_ai_drops_flagged_candidate(monkeypatch):
+def test_batch_review_ai_rejects_noise_candidate(monkeypatch):
     from oiltech_digest.processing.openai_client import AIResponse
 
     class Client:
@@ -1049,7 +1059,8 @@ def test_batch_review_ai_drops_flagged_candidate(monkeypatch):
                         {
                             "signal_key": "drop-me",
                             "keep": False,
-                            "reason": "Пересказывает тот же контракт, что keep-me.",
+                            "duplicate_of_signal_key": "",
+                            "reason": "Общий обзор рынка без нового факта.",
                             "interest_score": 0,
                             "why_interesting": "",
                         },
@@ -1071,7 +1082,8 @@ def test_batch_review_ai_drops_flagged_candidate(monkeypatch):
         "model": "fake-ai",
         "reviewed": 2,
         "dropped": 1,
-        "decisions": [{"signal_key": "drop-me", "reason": "Пересказывает тот же контракт, что keep-me."}],
+        "duplicates": 0,
+        "decisions": [{"signal_key": "drop-me", "action": "reject", "reason": "Общий обзор рынка без нового факта."}],
         "interest_scores": {"keep-me": 88.0},
     }
     assert keep["rejected"] is False
@@ -1079,7 +1091,8 @@ def test_batch_review_ai_drops_flagged_candidate(monkeypatch):
     assert keep["signal"]["why_interesting"] == "Первое промышленное внедрение у нового игрока на фоне пачки."
     assert drop["rejected"] is True
     assert drop["signal"]["maturity"] == "reject"
-    assert drop["signal"]["batch_review_reason"] == "Пересказывает тот же контракт, что keep-me."
+    assert drop["signal"]["batch_review_reason"] == "Общий обзор рынка без нового факта."
+    assert "duplicate_of" not in drop
     assert "interest_score" not in drop["signal"]
 
 

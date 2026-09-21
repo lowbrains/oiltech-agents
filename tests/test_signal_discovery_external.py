@@ -199,6 +199,8 @@ def test_core_applies_external_result_and_records_generation_run(monkeypatch):
     assert summary["topics"][0] == {
         "topic": DRILLING, "web_status": "ok", "queries": 2, "results": 3, "total_evidence": 2,
         "skipped_reviewed": 0, "clusters": 2, "signals": 1, "duplicates": 0,
+        # Старая сборка NL не шлёт раунды, докачку и ревью пачки — поля пустые, не ошибка.
+        "research_modes": [], "fulltext": None, "batch_review": None,
     }
     assert summary["dedup"] is None  # результат воркера без дедупа (старая сборка NL) пишется как раньше
 

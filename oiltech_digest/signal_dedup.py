@@ -97,9 +97,13 @@ def company_keys(signal: dict[str, Any]) -> set[str]:
             continue
         key = re.sub(r"\(.*?\)", "", raw)
         key = re.sub(r"[«»\"'?]", "", key)
-        key = re.sub(r"\s+", " ", key).strip()
-        if len(re.findall(r"[a-zа-яё]", key)) >= 2:
-            keys.add(key)
+        # Модель пишет участников одной строкой: «EDF / MethaneSAT» против «MethaneSAT»
+        # в соседней карточке — без разбора по «/» общей компании не видно, и пара
+        # №107–№3 одного события не попала к судье (20.09).
+        for part in re.split(r"\s*[/;]\s*", key):
+            part = re.sub(r"\s+", " ", part).strip()
+            if len(re.findall(r"[a-zа-яё]", part)) >= 2:
+                keys.add(part)
     return keys
 
 
