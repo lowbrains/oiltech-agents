@@ -37,12 +37,13 @@ TAGS = [
     },
 ]
 
+CHEMISTRY = "Химия, материалы, вода и извлечение ценных компонентов"
 MEMORY = {
     "signal_query_hint": [
         {"subject": "2026 closed-loop drilling automation oil gas", "score": 65,
-         "facts_json": {"verdict": "approved"}},
+         "facts_json": {"verdict": "approved", "topic": DRILLING}},
         {"subject": "2026 lithium brine extraction oil gas", "score": 65,
-         "facts_json": {"verdict": "approved"}},
+         "facts_json": {"verdict": "approved", "topic": CHEMISTRY}},
     ],
 }
 
@@ -306,11 +307,11 @@ def test_prompt_block_shows_rejected_examples_even_when_outscored():
 
 def test_feedback_query_hints_keep_only_hints_of_the_topic():
     with signal_feedback.use_memory_snapshot(MEMORY):
-        hints = signal_feedback.feedback_query_hints(
-            DRILLING, topic_terms=signal_feedback.topic_term_stems(DRILLING, "closed-loop drilling")
-        )
+        drilling = signal_feedback.feedback_query_hints(DRILLING)
+        chemistry = signal_feedback.feedback_query_hints(CHEMISTRY)
 
-    assert hints == ["2026 closed-loop drilling automation oil gas"]
+    assert drilling == ["2026 closed-loop drilling automation oil gas"]
+    assert chemistry == ["2026 lithium brine extraction oil gas"]
 
 
 def test_retire_query_hints_from_negative_feedback(isolated_db):

@@ -1627,6 +1627,23 @@ def cmd_retire_signal_query_hints(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_assign_signal_hint_topics(args: argparse.Namespace) -> None:
+    from oiltech_digest.signal_discovery import assign_query_hint_topics
+
+    result = assign_query_hint_topics(dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return
+    print(
+        f"assign-signal-hint-topics: active={result['active']} already_scoped={result['already_scoped']} "
+        f"assigned={len(result['assigned'])} unassigned={len(result['unassigned'])} dry_run={result['dry_run']}"
+    )
+    for item in result["assigned"]:
+        print(f"  → {item['topic'][:45]} ({item['overlap']}/{item['runner_up']}): {item['subject'][:80]}")
+    for item in result["unassigned"]:
+        print(f"  × без темы ({item['overlap']}/{item['runner_up']}): {item['subject'][:80]}")
+
+
 def cmd_export_signal_training_jsonl(args: argparse.Namespace) -> None:
     from oiltech_digest.signal_training import export_signal_training_jsonl
 
@@ -2385,6 +2402,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_retire_hints.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     p_retire_hints.add_argument("--json", action="store_true")
     p_retire_hints.set_defaults(func=cmd_retire_signal_query_hints)
+
+    p_assign_hints = sub.add_parser(
+        "assign-signal-hint-topics",
+        help="привязать старые поисковые подсказки радара без темы к одной теме (сухой прогон по умолчанию)",
+    )
+    p_assign_hints.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
+    p_assign_hints.add_argument("--json", action="store_true")
+    p_assign_hints.set_defaults(func=cmd_assign_signal_hint_topics)
 
     p_export_signal_training = sub.add_parser(
         "export-signal-training-jsonl",

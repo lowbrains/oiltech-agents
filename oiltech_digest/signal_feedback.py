@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime
 from contextvars import ContextVar
 import csv
 import hashlib
 import json
 import re
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -143,7 +145,12 @@ def store_signal_feedback(
         corrected_thesis=corrected_thesis or None,
         duplicate_of_signal_id=duplicate_of_signal_id,
     )
+    # Тема карточки, к которой отзыв: подсказка поиска из него работает только в этой теме.
+    # Без темы одобренные 13–15.09 литиевые карточки превратились в «ищи литий» во всех
+    # темах подряд — 21.09 это 13 из 52 запросов радара в шести темах.
+    topic = str(row.get("topic") or "").strip() or (repository.get_signal_theme(signal_id) if signal_id else None)
     facts = {
+        "topic": topic,
         "row_number": row.get("#") or row.get("row_number"),
         "signal_title": signal_title,
         "source_url": source_url,
@@ -371,22 +378,20 @@ def _verdict_score(verdict: str) -> float:
     return 0
 
 
-def feedback_query_hints(
-    topic: str | None,
-    *,
-    limit: int = 8,
-    topic_terms: set[str] | None = None,
-) -> list[str]:
-    """Поисковые подсказки из ОС для темы.
+def feedback_query_hints(topic: str | None, *, limit: int = 8) -> list[str]:
+    """Поисковые подсказки из ОС для темы — только те, что привязаны к ЭТОЙ теме.
 
-    topic_terms — основы слов темы (название + ключи её тематики). Когда они даны,
-    подсказка берётся, только если говорит о ТОЙ ЖЕ теме: иначе одни и те же
-    одобренные запросы уходили бы во все темы подряд, и каждая тема искала бы
-    одно и то же."""
+    До 21.09 подсказка шла в тему, если делила с ней хоть одно слово: «…способ добычи
+    лития…» попадала в «Добычу», «…попутной воды…» — в «Химию», и радар искал литий в
+    шести темах (13 из 52 запросов). Тема подсказки — тема карточки, к которой был
+    отзыв (store_signal_feedback); старые подсказки без темы привязывает
+    signal_discovery.assign_query_hint_topics, а до привязки они в поиск не идут."""
     memory = signal_feedback_memory_context(topic, limit=120)
-    hints = [str(row.get("subject") or "").strip() for row in memory["signal_query_hint"]]
-    if topic_terms is not None:
-        hints = [hint for hint in hints if hint_matches_topic(hint, topic_terms)]
+    hints = [
+        str(row.get("subject") or "").strip()
+        for row in _memory_rows("signal_query_hint", limit=200)
+        if topic and str((row.get("facts_json") or {}).get("topic") or "").strip() == topic
+    ]
     preferred_domains = [str(row.get("subject") or "").strip() for row in memory["signal_source_preference"]]
     queries = []
     for hint in hints:
@@ -415,10 +420,6 @@ def topic_term_stems(*texts: str) -> set[str]:
             if stem not in _GENERIC_TERM_STEMS and not stem.isdigit():
                 stems.add(stem)
     return stems
-
-
-def hint_matches_topic(hint: str, topic_terms: set[str]) -> bool:
-    return bool(topic_term_stems(hint) & topic_terms)
 
 
 # Сколько примеров ОС показывать судье. Причины у заказчика развёрнутые (до 1–2 тыс.
@@ -538,6 +539,8 @@ def _extract_quality_rules(comment: str) -> list[str]:
 
 
 def _derive_query_hints(comment: str, signal_title: str) -> list[str]:
+    # Год отзыва, а не зашитый 2026 (тот же класс, что год радара, 21.09).
+    year = datetime.now(ZoneInfo("Europe/Moscow")).year
     hints = []
     glossary_terms = [
         str(memory["subject"])
@@ -547,10 +550,10 @@ def _derive_query_hints(comment: str, signal_title: str) -> list[str]:
     for term in glossary_terms[:8]:
         term = term.strip(" .:\"'“”")
         if term and not re.search(r"[а-яё]", term, flags=re.I):
-            hints.append(f"2026 {term} oil gas technology deployment")
+            hints.append(f"{year} {term} oil gas technology deployment")
     title_words = " ".join(re.findall(r"[A-Za-zА-Яа-яЁё0-9]{4,}", signal_title)[:6])
     if title_words:
-        hints.append(f"2026 {title_words} oil gas")
+        hints.append(f"{year} {title_words} oil gas")
     return _dedupe(hints)[:8]
 
 

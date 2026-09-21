@@ -1315,6 +1315,50 @@ def list_signals(*, maturity: str | None = None, theme: str | None = None, limit
     return repository.list_signals(maturity=maturity, theme=theme, limit=limit)
 
 
+def assign_query_hint_topics(*, dry_run: bool = True) -> dict[str, Any]:
+    """Привязать старые подсказки поиска без темы к ОДНОЙ теме радара.
+
+    Подсказки 13–15.09 родились до тем-тегов и темы не знают; с 21.09 такие в поиск не
+    идут. Здесь каждой подбирается тема с наибольшим числом общих основ слов (название
+    темы + ключи её тематики); берём, только если совпадений не меньше двух и лидер
+    один — иначе подсказка остаётся без темы, чем уедет в чужую. Сухой прогон по
+    умолчанию: список показывают владельцу до записи."""
+    profiles = []
+    for topic in _radar_topics():
+        name = str(topic.get("name") or "").strip()
+        if not name:
+            continue
+        context = _topic_tag_context(name)
+        profiles.append((name, topic_term_stems(
+            name,
+            str(topic.get("description") or ""),
+            *(context.get("keywords_ru") or []),
+            *(context.get("keywords_en") or []),
+        )))
+    rows = repository.list_signal_agent_memory(memory_type="signal_query_hint", status="active", limit=100_000)
+    assigned: list[dict[str, Any]] = []
+    unassigned: list[dict[str, Any]] = []
+    already = 0
+    for row in rows:
+        if str((row.get("facts_json") or {}).get("topic") or "").strip():
+            already += 1
+            continue
+        subject = str(row.get("subject") or "")
+        stems = topic_term_stems(subject)
+        scored = sorted(((len(stems & terms), name) for name, terms in profiles), key=lambda item: -item[0])
+        best = scored[0] if scored else (0, "")
+        runner_up = scored[1][0] if len(scored) > 1 else 0
+        item = {"id": row.get("id"), "subject": subject, "topic": best[1], "overlap": best[0], "runner_up": runner_up}
+        if best[0] >= 2 and best[0] > runner_up:
+            assigned.append(item)
+            if not dry_run:
+                repository.merge_signal_agent_memory_facts(int(row["id"]), {"topic": best[1], "topic_assigned": "stems_21.09"})
+        else:
+            unassigned.append(item)
+    return {"dry_run": dry_run, "active": len(rows), "already_scoped": already,
+            "assigned": assigned, "unassigned": unassigned}
+
+
 def topics_from_tags(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Темы радара = корневые тематики заказчика (13), без служебного приёмника.
 
@@ -1406,13 +1450,7 @@ def _search_web_evidence(
     topic_name = str(topic.get("name") or config.topic or "").strip()
     tag_context = _topic_tag_context(topic_name)
     seed_queries = _topic_seed_queries(topic, year=year, tag_context=tag_context)
-    topic_terms = topic_term_stems(
-        topic_name,
-        str(topic.get("description") or ""),
-        *(tag_context.get("keywords_ru") or []),
-        *(tag_context.get("keywords_en") or []),
-    )
-    feedback_queries = feedback_query_hints(topic_name, limit=config.web_query_limit, topic_terms=topic_terms)
+    feedback_queries = feedback_query_hints(topic_name, limit=config.web_query_limit)
     generation_topic = _query_generation_topic(topic, tag_context)
     generated_queries = generate_search_queries(
         generation_topic,

@@ -1828,6 +1828,22 @@ def list_signal_agent_memory(
         return cur.fetchall()
 
 
+def merge_signal_agent_memory_facts(memory_id: int, patch: dict) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE signal_agent_memory SET facts_json = facts_json || %s::jsonb, updated_at = now() WHERE id = %s",
+            (Json(_jsonable(patch)), memory_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_signal_theme(signal_id: int) -> str | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT theme FROM signals WHERE id = %s", (signal_id,)).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+
 def set_signal_agent_memory_status(memory_id: int, status: str) -> bool:
     with get_connection() as conn:
         cur = conn.execute(
