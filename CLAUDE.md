@@ -26,6 +26,27 @@
 - `frontend/src/features/signals/SignalRadarPage.tsx`
 - 15 тестовых файлов из 46: `test_source_discovery_*`, `test_signal_*`, `test_source_health/quality/regularity`
 
+## ⚠️ Выкат ядра агентов на РФ — только так (инцидент 20–21.09)
+
+```bash
+cd /root/oiltech-agents && git fetch origin && git reset --hard origin/main
+docker compose -f docker-compose.yml -f docker-compose.server.yml build agents-app
+docker compose -f docker-compose.yml -f docker-compose.server.yml up -d --no-deps agents-app
+```
+
+- **Никогда** `up -d --build` без имени сервиса: 20.09 так поднялся планировщик агентов,
+  за 8,5 ч задублировал сбор MVP-1 ($4,48 ИИ, 208 задач без потребителя) и выполнил радар
+  дня на РФ-ядре (OpenAI 403 → радар 21.09 потерян). Теперь конвейер (`tasks`, `worker`,
+  `playwright-worker`, `scheduler`) — под профилем `pipeline`, `docs` — под `docs`: голый
+  `up` поднимает только `db`, `bootstrap`, `agents-app` (сторож — `tests/test_signal_radar_robustness.py`).
+- Внешние очереди (`external-*`) не исполняются в процессе, который ставит задачу, даже при
+  `BACKGROUND_JOB_INLINE=1` (`background_jobs.runs_inline`).
+- `--no-deps` не запускает `bootstrap`: новые колонки — точечным `ALTER … IF NOT EXISTS`
+  через `psql` ДО выката кода, который в них пишет.
+- Проверка радара — только через очередь (`enqueue-signal-discovery … --dry-run`), не
+  `discover-signals`: тот исполняется на РФ и всегда получает 403 от OpenAI.
+- NL-воркер пересобирает владелец (команда — в разделе «Радар сигналов через NL»).
+
 ## Развязка и выкат (18.09)
 
 **Своя БД — сделано.** Отдельный экземпляр Postgres (`oiltech_agents_pg`, база

@@ -45,16 +45,27 @@ SIGNAL_DISCOVERY_WEB_FULLTEXT_LIMIT=20   # 0 отключает докачку �
 
 ### 1. РФ-ядро (`/root/oiltech-agents`, проект `oiltech-agents`)
 
+> ⚠️ **Исправлено 21.09 после инцидента.** Прежняя команда `up -d --build` без имени
+> сервиса подняла ВСЕ сервисы агентов, включая планировщик, который намеренно не
+> запускался: за 8,5 ч он задублировал сбор MVP-1 ($4,48 ИИ, 208 задач без потребителя)
+> и выполнил радар дня прямо на РФ-ядре → OpenAI 403 → радар 21.09 потерян.
+> Катить ядро агентов — ТОЛЬКО `agents-app`; конвейер (`scheduler`, `tasks`, `worker`,
+> `playwright-worker`) агентам не нужен и теперь стоит под профилем `pipeline`.
+
 ```bash
 cd /root/oiltech-agents
 git fetch origin && git reset --hard origin/main
-docker compose -p oiltech-agents -f docker-compose.yml -f docker-compose.server.yml up -d --build
-docker compose -p oiltech-agents ps   # agents-app / scheduler / worker — running
+docker compose -f docker-compose.yml -f docker-compose.server.yml build agents-app
+docker compose -f docker-compose.yml -f docker-compose.server.yml up -d --no-deps agents-app
+docker ps --format '{{.Names}}' | grep oiltech_agents_   # только app, pg, docs — scheduler/tasks/worker НЕТ
 ```
 
+`--no-deps` не запускает `bootstrap`, поэтому новые колонки схемы накатываются отдельно и
+ДО выката кода, который в них пишет — точечным `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
+из конца `schema.sql` через `psql` в `oiltech_agents_pg` (так же 18.09 ставили
+`merged_into_signal_id`). Полный `init-db` на живой базе 17.09 уже ловил дедлок с воркером.
 Ядро только ставит задачу радара (`signal_discovery.build_external_payload`) и применяет
-результат (`apply_external_result`) — само не ищет и не зовёт OpenAI, поэтому это
-обновление можно катить в любое время, простоя пайплайна не будет.
+результат (`apply_external_result`) — само не ищет и не зовёт OpenAI.
 
 ### 2. NL external worker — обязателен, без него новый код не выполнится
 
@@ -71,17 +82,22 @@ docker compose -p oiltech-agents-worker -f docker-compose.external-worker.yml up
 
 ### 3. Проверка после обоих обновлений
 
-Ждать до 07:15 МСК не обязательно — можно прогнать одну тему вручную и посмотреть на
-диагностику новых полей в JSON-ответе:
+> ⚠️ **Исправлено 21.09.** `discover-signals` гоняет радар ВНУТРИ процесса на РФ-ядре →
+> OpenAI отвечает 403 `unsupported_country_region_territory` всегда. Проверять только
+> через очередь — задачу возьмёт NL-воркер:
 
 ```bash
-docker exec oiltech_agents_app python -m oiltech_digest.cli discover-signals \
-  --topic "Бурение" --web --no-offline --dry-run --json \
-  | python -m json.tool
+docker exec oiltech_agents_app python -m oiltech_digest.cli enqueue-signal-discovery \
+  --topic "Бурение, направленное бурение, буровые растворы и буровое оборудование" \
+  --web --web-only --limit 10 --max-signals 2 --no-offline --dry-run
+# затем в базе агентов:
+# SELECT status, result_json->'applied'->'topics' FROM background_jobs WHERE id = <id>;
 ```
 
-В выводе смотреть (пути — внутри `topic_results[0]`, не `topics[0]`: `topics` в ответе CLI —
-просто список названий тем строками):
+В `applied.topics[0]` итога задачи: `research_modes` (например `["initial","pivot"]`),
+`fulltext` (`attempted/fetched/too_short/failed/skipped_budget`), `batch_review`
+(`status/source/reviewed/dropped/duplicates`). Ниже — те же поля в полном ответе CLI
+(локальный прогон на машине с доступом к OpenAI; пути — внутри `topic_results[0]`):
 
 - `topic_results[0].web_search.research_rounds` — у каждого раунда есть
   `mode`/`quality`/`next_mode`; на слабой выдаче `next_mode` должен быть `pivot`, а не
