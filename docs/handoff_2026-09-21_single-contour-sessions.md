@@ -87,7 +87,9 @@
 
 1. `git fetch mvp1`, затем ветка от `origin/main` и `git merge --no-ff --no-commit mvp1/main`.
 2. **Ловушка — вынос агентного слоя `d0c9ec1`.** Для агентных файлов, которые Герман не трогал с
-   13.09, удаление сольётся без конфликта, то есть молча. После слияния:
+   13.09, удаление сольётся без конфликта, то есть молча. Замер пробным слиянием 21.09: удаляются
+   26 файлов, из них 22 — Германа (весь `source_discovery/` кроме `agent.py`, `signal_training.py`,
+   `SourceAgentPage`, `SourceCandidatesPage`, `api/signals.ts`, их тесты). После слияния:
    - `git diff --cached --name-status origin/main | grep '^D'` — вернуть каждый файл Германа через
      `git checkout origin/main -- <путь>`;
    - всю границу Германа вернуть так же;
