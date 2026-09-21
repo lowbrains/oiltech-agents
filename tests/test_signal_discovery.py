@@ -872,7 +872,8 @@ def test_web_search_enriches_evidence_with_fetched_full_text(monkeypatch):
     item = evidence[0]
     assert item["title"] == "ADNOC completes autonomous drilling pilot with 20% faster ROP"
     assert item["extracted_fact"] == full_text
-    assert item["published_at"] == published_at
+    # Строкой ISO: объект datetime ронял отправку итога воркера ядру (4712, 21.09).
+    assert item["published_at"] == published_at.isoformat()
     assert item["raw_payload"]["full_text_fetched"] is True
     assert item["raw_payload"]["full_text_chars"] == len(full_text)
 

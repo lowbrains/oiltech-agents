@@ -474,3 +474,69 @@ def test_worker_result_does_not_carry_web_evidence_twice(monkeypatch):
     assert "evidence" not in web
     assert web["evidence_count"] == 1
     assert run["topics"][0]["candidates"][0]["signal"]["evidence"][0]["source_url"] == "https://example.com/a"
+
+
+# --- Итог воркера — JSON (поймано проверкой 4712 после пересборки NL 21.09) -----------
+
+
+def test_fetched_page_date_travels_as_iso_string(monkeypatch):
+    """Докачка клала published_at объектом datetime — итог воркера не уходил ядру."""
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(
+        signal_discovery,
+        "_fetch_full_text",
+        lambda url, fallback_title="", **kwargs: {
+            "ok": True, "error": None, "title": "Drilling automation contract",
+            "raw_text": "Oil and gas operator signed a drilling automation contract. " * 10,
+            "published_at": datetime(2026, 9, 1, tzinfo=timezone.utc),
+        },
+    )
+
+    evidence, _ = signal_discovery._enrich_web_evidence_with_full_text(
+        [_web_item("https://example.com/a")], "Бурение", limit=5
+    )
+
+    assert evidence[0]["published_at"] == "2026-09-01T00:00:00+00:00"
+
+
+def test_worker_sends_result_with_dates_to_core(monkeypatch):
+    """Граница с ядром: любой вид задачи отдаёт дату строкой ISO, а не падает на отправке
+    (18.09 — сбор, 21.09 — радар: один и тот же класс дважды)."""
+    import json as jsonlib
+    from datetime import datetime, timezone
+
+    from oiltech_digest import external_worker
+
+    client = external_worker.ExternalWorkerClient(
+        core_api_url="https://core.example", token="t", worker_id="w", queues=["external-ai"], capabilities=["openai"]
+    )
+    sent = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def post(url, json=None, timeout=None):
+        sent["body"] = jsonlib.dumps(json)  # как requests: без default
+        return Response()
+
+    monkeypatch.setattr(client.session, "post", post)
+
+    client.complete(
+        {"id": 1, "lease_token": "x"},
+        {"run": {"evidence": [{"published_at": datetime(2026, 9, 1, tzinfo=timezone.utc)}]}},
+    )
+
+    assert '"published_at": "2026-09-01T00:00:00+00:00"' in sent["body"]
+
+
+def test_core_stores_iso_published_at_from_worker(isolated_db):
+    signal_id = repository.upsert_signal({"signal_key": "k-date", "title": "T", "theme": "Бурение", "score": 60})
+
+    repository.upsert_signal_evidence(
+        signal_id, {"source_url": "https://example.com/a", "title": "T", "published_at": "2026-09-01T00:00:00+00:00"}
+    )
+
+    stored = repository.list_signal_evidence(signal_id)[0]["published_at"]
+    assert stored.isoformat().startswith("2026-09-01")

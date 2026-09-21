@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
+from decimal import Decimal
+import json
 import logging
 import time
 from typing import Any
@@ -99,7 +102,7 @@ class ExternalWorkerClient:
     def complete(self, job: dict[str, Any], result: dict[str, Any]) -> None:
         response = self.session.post(
             f"{self.core_api_url}/api/external-worker/jobs/{job['id']}/complete",
-            json={"lease_token": job["lease_token"], "result": result},
+            json={"lease_token": job["lease_token"], "result": json_ready(result)},
             timeout=60,
         )
         response.raise_for_status()
@@ -116,6 +119,23 @@ class ExternalWorkerClient:
             timeout=30,
         )
         response.raise_for_status()
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def json_ready(result: Any) -> Any:
+    """Итог уходит ядру JSON-ом: дата — строкой ISO, число из базы — float.
+
+    Без этого дата в любом поле итога роняла отправку уже сделанной (и оплаченной)
+    работы: 18.09 — сбор, 21.09 — радар; задача уходила в повтор и падала снова.
+    Прочее непривычное по-прежнему — громкая ошибка, а не молчаливая строка."""
+    return json.loads(json.dumps(result, default=_json_default))
 
 
 def _safe_heartbeat(client: "ExternalWorkerClient", job: dict[str, Any]) -> None:

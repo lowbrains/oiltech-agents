@@ -2042,6 +2042,10 @@ _FULLTEXT_SKIP_SUFFIXES = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".p
 _BINARY_PREFIXES = (b"%PDF", b"PK\x03\x04", b"\xd0\xcf\x11\xe0", b"\x89PNG", b"\xff\xd8\xff", b"GIF8")
 
 
+def _iso(value: Any) -> Any:
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
 def _looks_binary(content: bytes | str) -> bool:
     head = content[:1024] if isinstance(content, bytes) else content[:1024].encode("utf-8", "ignore")
     return head.lstrip().startswith(_BINARY_PREFIXES) or b"\x00" in head
@@ -2145,7 +2149,9 @@ def _enrich_web_evidence_with_full_text(
             **item,
             "title": title,
             "title_ru": _enforce_glossary(title, context, topic),
-            "published_at": fetched.get("published_at") or item.get("published_at"),
+            # Строкой ISO, как все даты снимка: объект datetime ронял отправку итога
+            # воркера ядру (проверка 4712, 21.09) — тот же класс, что сбор 18.09.
+            "published_at": _iso(fetched.get("published_at")) or item.get("published_at"),
             "evidence_type": _evidence_type(f"{title} {fact}"),
             "extracted_fact": fact,
             "summary_ru": _enforce_glossary(fact, context, topic),
