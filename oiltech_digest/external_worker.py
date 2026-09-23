@@ -370,7 +370,7 @@ def _run_job(client: ExternalWorkerClient, job: dict[str, Any], beat: Callable[[
             client.progress(job, 20)
             result = external_ai.process_source_candidate_payload(
                 job.get("payload") or {},
-                heartbeat=lambda: _safe_heartbeat(client, job),
+                heartbeat=beat,
             )
             client.progress(job, 90)
             client.complete(job, result)
@@ -408,12 +408,14 @@ def _run_job(client: ExternalWorkerClient, job: dict[str, Any], beat: Callable[[
             client.complete(job, result)
         elif job.get("kind") == "signal_discovery":
             # Радар: снимок базы приходит в payload, сигналы пишет ядро при complete.
+            # beat, а не голый heartbeat: сторож зависания считает продвижением только его,
+            # и прогон дольше EXTERNAL_JOB_MAX_SECONDS иначе снимался бы как зависший.
             from oiltech_digest import signal_discovery
 
             client.progress(job, 20)
             result = signal_discovery.process_external_payload(
                 job.get("payload") or {},
-                heartbeat=lambda: _safe_heartbeat(client, job),
+                heartbeat=beat,
             )
             client.progress(job, 90)
             client.complete(job, result)

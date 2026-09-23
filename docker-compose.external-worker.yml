@@ -73,3 +73,21 @@ services:
       EXTERNAL_WORKER_QUEUES: external-playwright
       EXTERNAL_WORKER_CAPABILITIES: playwright
     command: ["python", "-m", "oiltech_digest.cli", "-v", "external-worker"]
+
+  # Агенты — радар сигналов и оценка кандидатов агента источников (ADR 0001). Прогон
+  # радара — до 17 мин (медиана 4): в общей полосе с потоком дня пакет статей ждал бы
+  # его, а радар — пакеты. Поиск радара — Brave: ключ BRAVE_SEARCH_API_KEY обязан быть
+  # в .env.external-worker, иначе поиск вернёт ноль и радар молча ничего не найдёт.
+  external-worker-agents:
+    build: .
+    container_name: oiltech_external_worker_agents
+    restart: unless-stopped
+    env_file:
+      - .env.external-worker
+    environment:
+      PYTHONUNBUFFERED: "1"
+      EXTERNAL_WORKER_ID: nl-agents-1
+      EXTERNAL_WORKER_QUEUES: external-agents
+      EXTERNAL_WORKER_CAPABILITIES: openai
+      SOURCE_DISCOVERY_SEARCH_PROVIDER: brave
+    command: ["python", "-m", "oiltech_digest.cli", "-v", "external-worker"]

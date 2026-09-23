@@ -21,8 +21,10 @@ def _ago(minutes: float) -> datetime:
 
 def test_external_queue_refuses_kind_its_worker_cannot_run(isolated_db):
     # 13–17.09 радар ставили в external-ai, где его никто не умел исполнять: 134 падения.
+    # В едином контуре у радара своя полоса — туда его и переносит постановка
+    # (test_agents_lane.py); отказ остаётся для вида, которого NL не исполняет вовсе.
     with pytest.raises(ValueError, match="не обслуживает"):
-        repository.create_background_job("signal_discovery", {}, queue_name="external-ai", execution_region="external")
+        repository.create_background_job("diagnose_source", {"source_id": 1}, queue_name="external-ai", execution_region="external")
     with pytest.raises(ValueError, match="не обслуживает"):
         repository.create_background_job("scrape_source", {"source_id": 1}, queue_name="external-ai")
     with pytest.raises(ValueError, match="такой полосы нет"):

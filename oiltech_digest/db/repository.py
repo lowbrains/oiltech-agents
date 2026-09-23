@@ -2431,6 +2431,8 @@ def create_background_job(
     max_attempts: int = 3,
     agent_run_id: int | None = None,
 ) -> dict:
+    # Агентные задачи — в свою полосу, как бы их ни назвал вызывающий код (lanes.route).
+    queue_name = lanes.route(queue_name, kind)
     # Внешняя очередь принимает только то, что её воркер умеет исполнять (lanes.py).
     lanes.check_enqueue(queue_name, kind)
     with get_connection() as conn:

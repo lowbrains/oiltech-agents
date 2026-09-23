@@ -2154,7 +2154,7 @@ def test_external_worker_claim_hydrates_source_candidate_evaluation_payload(monk
         lambda **kwargs: {
             "id": 12,
             "kind": "source_candidate_evaluate",
-            "queue_name": "external-ai",
+            "queue_name": "external-agents",
             "execution_region": "external",
             "capability": "openai",
             "status": "running",
@@ -2175,7 +2175,7 @@ def test_external_worker_claim_hydrates_source_candidate_evaluation_payload(monk
     response = client.post(
         "/api/external-worker/claim",
         headers={"Authorization": "Bearer secret"},
-        json={"worker_id": "eu-1", "queues": ["external-ai"], "capabilities": ["openai"]},
+        json={"worker_id": "nl-agents-1", "queues": ["external-agents"], "capabilities": ["openai"]},
     )
 
     assert response.status_code == 200
@@ -2794,7 +2794,7 @@ def test_external_worker_claim_hydrates_signal_discovery_payload(monkeypatch):
         api.repository,
         "claim_external_background_job",
         lambda **kwargs: {
-            "id": 13, "kind": "signal_discovery", "queue_name": "external-ai", "execution_region": "external",
+            "id": 13, "kind": "signal_discovery", "queue_name": "external-agents", "execution_region": "external",
             "capability": "openai", "status": "running", "progress": 10, "attempts": 1, "max_attempts": 1,
             "run_after": None, "payload_json": {"web_only": True}, "result_json": None, "error_message": None,
             "created_at": None, "started_at": None, "finished_at": None,
@@ -2805,7 +2805,7 @@ def test_external_worker_claim_hydrates_signal_discovery_payload(monkeypatch):
     response = client.post(
         "/api/external-worker/claim",
         headers={"Authorization": "Bearer secret"},
-        json={"worker_id": "eu-1", "queues": ["external-ai"], "capabilities": ["openai"]},
+        json={"worker_id": "nl-agents-1", "queues": ["external-agents"], "capabilities": ["openai"]},
     )
 
     assert response.status_code == 200
