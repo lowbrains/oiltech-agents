@@ -28,6 +28,14 @@
 
 ## ⚠️ Выкат ядра агентов на РФ — только так (инцидент 20–21.09)
 
+**Код единого контура (сессия A, PR #1) до переключения D не выкатывать — ни командами ниже, ни
+пересборкой NL.** В нём радар и оценка кандидата встают в полосу `external-agents`, а воркер агентов
+на NL слушает только `external-ai`: радар молча встанет в очереди (сторожа `check-lanes` на агентном
+стеке нет). Compose NL в нём — пять полос с именами контейнеров MVP-1: пересборка остановит
+`oiltech_agents_external_worker` и упрётся в имя работающего воркера заказчика `oiltech_external_worker`.
+Выкат — только окном D
+(`docs/handoff_2026-09-21_single-contour-sessions.md`, «Сессия D»).
+
 ```bash
 cd /root/oiltech-agents && git fetch origin && git reset --hard origin/main
 docker compose -f docker-compose.yml -f docker-compose.server.yml build agents-app
@@ -101,6 +109,7 @@ Encrypt, отдаётся фронтенд агентов с новым рада
 `SOURCE_DISCOVERY_SEARCH_PROVIDER=brave` и ключ Brave — без них поиск вернёт 0 и радар молча
 не найдёт ничего. Пересборка после правок воркерной части (например, дедупа):
 `cd /root/oiltech-agents && git fetch origin && git reset --hard origin/main && docker compose -p oiltech-agents-worker -f docker-compose.external-worker.yml up -d --build`.
+⚠️ Не для кода единого контура до D — см. предупреждение в разделе «Выкат ядра агентов на РФ».
 
 ## Дедуп радара (18.09, `b1a73df`)
 
