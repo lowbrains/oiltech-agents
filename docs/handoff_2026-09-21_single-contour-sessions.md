@@ -278,8 +278,9 @@
 - `check-lanes` показывает версии всех четырёх потребителей;
 - в простое не больше ~60 `claim` за 5 минут.
 
-**Итог сессии C (23.09):** [electromop/oiltech-digest#64](https://github.com/electromop/oiltech-digest/pull/64),
-**не выкачено** — ждёт «да» владельца; хендофф — `oiltech-digest/docs/handoff_2026-09-23_contour-reliability.md`.
+**Итог сессии C (23.09):** [electromop/oiltech-digest#64](https://github.com/electromop/oiltech-digest/pull/64)
+влит в `main` (`7e067c4`), **не выкачено** — выкат ядра ждёт «да» владельца, затем NL; хендофф —
+`oiltech-digest/docs/handoff_2026-09-23_contour-reliability.md`.
 - Мягкая остановка NL: SIGTERM → 30 с на завершение → `release` со сделанным; ядро записывает сделанное и
   сразу ставит остаток в очередь без списания попытки. Сквозной тест на процессах: `queued` за секунды,
   повторных вызовов модели 0; со старым воркером — `running`, аренда ещё 9 мин 51 с.
