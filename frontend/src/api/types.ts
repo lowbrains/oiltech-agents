@@ -732,6 +732,15 @@ export type ExternalQueueRow = {
   last_heartbeat_at: string | null;
 };
 
+// Тревоги сторожа полос (lanes.py): застой, очередь без живого воркера, истёкшие аренды.
+export type LaneAlert = {
+  queue: string | null;
+  kind: "stale" | "no_consumer" | "unknown_queue" | "expired_leases" | string;
+  count: number;
+  minutes?: number;
+  message: string;
+};
+
 export type ExternalQueueStatus = {
   totals: {
     queued: number;
@@ -743,6 +752,7 @@ export type ExternalQueueStatus = {
     expired_leases: number;
   };
   queues: ExternalQueueRow[];
+  alerts?: LaneAlert[];
 };
 
 export type MaintenanceCleanupResult = {
@@ -1009,6 +1019,57 @@ export type MonthlyStats = {
   ai_cost: MonthlyAiCostRow[];
   activity: MonthlyActivityRow[];
   activity_scope: string;
+};
+
+// --- Аналитика платформы (экран «Статистика», /api/analytics/monthly) ---
+export type AnalyticsCounters = {
+  month: string;
+  collected: number;
+  en: number;
+  full_text: number;
+  relevant: number;
+  rejected: number;
+  summarized: number;
+  scored: number;
+  strong: number;
+  top: number;
+  hidden: number;
+  reprints: number;
+  digest_selected: number;
+  sources_active: number;
+  sources_relevant: number;
+  sources_strong: number;
+  speed_p50_hours: number | null;
+  speed_p90_hours: number | null;
+};
+
+export type AnalyticsMonth = AnalyticsCounters & { digest_exports: number; complete: boolean };
+
+export type AnalyticsCost = {
+  month: string;
+  calls: number;
+  articles: number;
+  cost_usd: number;
+  // Курс ЦБ РФ на последний день месяца (у текущего — на сегодня); «допущение» — ЦБ недоступен.
+  usd_rub: number;
+  usd_rub_date: string | null;
+  usd_rub_source: "ЦБ РФ" | "допущение" | string;
+};
+
+export type MonthlyAnalytics = {
+  timezone: string;
+  today: string;
+  current_month: string;
+  current_day: number;
+  months: AnalyticsMonth[];
+  previous_same_period: AnalyticsCounters & { days: number };
+  themes: { month: string; tag_id: number; tag: string; relevant: number; strong: number }[];
+  top_sources: { month: string; source_id: number; source: string; strong: number; relevant: number; collected: number }[];
+  sources_enabled: number;
+  targets: { sources: number; articles_month: number; ai_rub_month: number };
+  // Только администратору: стоимость — коммерческая сторона.
+  ai_cost?: AnalyticsCost[];
+  ai_cost_previous_same_period?: AnalyticsCost & { days: number };
 };
 
 // --- Приём файлов: документы пользователя (экран «Материалы») ---

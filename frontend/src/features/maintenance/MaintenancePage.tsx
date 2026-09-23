@@ -136,6 +136,15 @@ export function MaintenancePage({ onUnauthorized, showToast }: Props) {
           <span>Самая старая в очереди: {formatDate(status?.external_queues.totals.oldest_queued_at)}</span>
           <span>Последний сигнал: {formatDate(status?.external_queues.totals.last_heartbeat_at)}</span>
         </div>
+        {/* Сторож полос: без него 208 задач без воркера (20.09) было видно только по
+            последствиям через 8,5 часа. */}
+        {status?.external_queues.alerts?.length ? (
+          <div className="laneAlerts" role="alert">
+            {status.external_queues.alerts.map((alert) => (
+              <span key={`${alert.kind}-${alert.queue ?? "all"}`}>{alert.message}</span>
+            ))}
+          </div>
+        ) : null}
         {status?.external_queues.queues.length ? (
           <div className="externalQueueList">
             {status.external_queues.queues.map((queue) => (

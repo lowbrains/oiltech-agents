@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+import html as html_lib
 import logging
+import re
+import threading
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -69,6 +72,33 @@ def _playwright_proxy_for(url: str) -> dict[str, str] | None:
 
 _BLOCK_STATUSES = {403, 429, 503}
 
+# Чем закончилась последняя загрузка в этом потоке: ok:200, blocked:403, error:TimeoutError.
+# fetch_rendered возвращает None и на блок, и на сбой — а задача внешнего сбора до 18.09
+# завершалась «ok» с нулями, и стена защиты (S&P: 403) выглядела как «нового нет».
+_last_fetch = threading.local()
+
+
+def last_fetch_status() -> str | None:
+    return getattr(_last_fetch, "status", None)
+
+
+def with_base_href(html_text: str, final_url: str) -> str:
+    """Вписать в отрисованную страницу `<base href>` с КОНЕЧНЫМ адресом.
+
+    Относительные ссылки браузер разрешает от адреса, на котором страница оказалась
+    после переадресации, а разбор листинга — от адреса из настройки. У CNOOC лента
+    `/zxzx/gsxw/` скриптом уходит на `/zxzx/gsxw/gsxw/`, ссылки на ней вида
+    `./202609/t….html` — и парсер собирал адреса без одного звена пути: все 404.
+    Если `<base>` на странице уже есть — не трогаем, он главнее.
+    """
+    if not final_url or re.search(r"<base\s", html_text[:20000], re.I):
+        return html_text
+    tag = f'<base href="{html_lib.escape(final_url, quote=True)}">'
+    match = re.search(r"<head[^>]*>", html_text, re.I)
+    if match:
+        return html_text[:match.end()] + tag + html_text[match.end():]
+    return tag + html_text
+
 
 def fetch_rendered(url: str, timeout_ms: int = 30_000, wait_until: str = "domcontentloaded",
                    settle_ms: int = 3500) -> bytes | None:
@@ -80,10 +110,12 @@ def fetch_rendered(url: str, timeout_ms: int = 30_000, wait_until: str = "domcon
     паузой settle_ms (важно для JS-листингов и прохождения лёгких challenge).
     Возвращает None при блокировке (403/429/503) — чтобы не разбирать challenge-страницу.
     """
+    _last_fetch.status = None
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         logger.error("playwright не установлен: pip install playwright && playwright install chromium")
+        _last_fetch.status = "error:playwright_missing"
         return None
 
     try:
@@ -110,15 +142,18 @@ def fetch_rendered(url: str, timeout_ms: int = 30_000, wait_until: str = "domcon
                 response = page.goto(url, timeout=timeout_ms, wait_until=wait_until)
                 if response is not None and response.status in _BLOCK_STATUSES:
                     logger.warning("playwright %s — статус %s (WAF/блок), пропуск", url, response.status)
+                    _last_fetch.status = f"blocked:{response.status}"
                     return None
+                _last_fetch.status = f"ok:{response.status if response is not None else '-'}"
                 if settle_ms:
                     page.wait_for_timeout(settle_ms)
-                html_content = page.content()
+                html_content = with_base_href(page.content(), page.url)
             finally:
                 browser.close()
         return html_content.encode("utf-8") if isinstance(html_content, str) else html_content
     except Exception as exc:  # noqa: BLE001
         logger.warning("playwright fetch failed for %s: %s", url, exc)
+        _last_fetch.status = f"error:{type(exc).__name__}"
         return None
 
 
@@ -137,56 +172,77 @@ def parse_source(source: dict, max_age_days: int | None = None, article_limit: i
         )
         return _empty_stats()
 
-    from oiltech_digest.ingestion.request_parser import (
-        CandidateLink,
-        extract_candidate_links,
-        insert_candidates,
-        parse_article_page,
-    )
+    from oiltech_digest.ingestion.request_parser import insert_candidates
 
     listing_url = source.get("listing_url") or source.get("url")
     if not listing_url:
         return _empty_stats()
 
-    content = fetch_rendered(listing_url, settle_ms=5000)
-    candidates = extract_candidate_links(source, listing_url, content, limit=article_limit) if content else []
-    if not candidates:
-        # JS-листинг мог не успеть дорендерить ссылки за первый проход (наблюдалось на
-        # bakerhughes.com: «то 6, то 0 кандидатов»). Даём ещё одну попытку с большим settle.
-        logger.info("playwright: 0 кандидатов на первом проходе для %s — ретрай с большим settle", source.get("name"))
-        content = fetch_rendered(listing_url, settle_ms=12000)
-        candidates = extract_candidate_links(source, listing_url, content, limit=article_limit) if content else []
+    candidates = render_listing_candidates(source, listing_url, limit=article_limit)
     if not candidates:
         logger.info("playwright: no candidates found for source %s (%s)", source.get("name"), listing_url)
         return _empty_stats()
-
-    def fetch_rendered_article(candidate: CandidateLink, source: dict) -> dict | None:
-        article_content = fetch_rendered(candidate.url)
-        if article_content is None:
-            return None
-        title, published_at, raw_text = parse_article_page(article_content, candidate.title)
-        final_published = published_at or candidate.published_at
-        if not title or len(raw_text) < MIN_ARTICLE_TEXT_CHARS:
-            return None
-        return {
-            "source_id": source["id"],
-            "title": title[:500],
-            "url": candidate.url,
-            "published_at": final_published,
-            "raw_text": raw_text,
-            "text_truncated": normalize.is_truncated(raw_text),
-            "language": _guess_language(source),
-            "content_hash": normalize.compute_content_hash(title, candidate.url),
-        }
 
     stats = insert_candidates(
         source,
         candidates,
         max_age_days=max_age_days,
-        article_fetcher=fetch_rendered_article,
+        article_fetcher=rendered_article,
     )
     repository.touch_last_parsed(source["id"])
     return stats
+
+
+# Сколько ждать, пока страница дорисуется: первая попытка и вторая, если первая дала
+# пусто. Одна попытка — это то, на чём сидел NL-воркер: у ядра повтор для листинга
+# был (замечено на bakerhughes.com: «то 6, то 0 кандидатов»), а воркер его не
+# унаследовал, как и heartbeat 17.09. Страница статьи повтора не имела нигде.
+LISTING_SETTLE_MS = (5000, 12000)
+ARTICLE_SETTLE_MS = (3500, 9000)
+
+
+def render_listing_candidates(source: dict, listing_url: str, limit: int = REQUEST_ARTICLE_LIMIT) -> list:
+    """Отрисовать листинг и извлечь кандидатов; пусто — ещё раз с ожиданием дольше.
+
+    Единственное место этой логики: ядро, NL-воркер и диагностика зовут её, а не свою
+    копию, — иначе одна из копий снова останется без повтора.
+    """
+    from oiltech_digest.ingestion.request_parser import extract_candidate_links
+
+    for attempt, settle_ms in enumerate(LISTING_SETTLE_MS, start=1):
+        content = fetch_rendered(listing_url, settle_ms=settle_ms)
+        candidates = extract_candidate_links(source, listing_url, content, limit=limit) if content else []
+        if candidates:
+            return candidates
+        if attempt < len(LISTING_SETTLE_MS):
+            logger.info("playwright: 0 кандидатов у %s за %d мс — ещё попытка", source.get("name"), settle_ms)
+    return []
+
+
+def rendered_article(candidate, source: dict) -> dict | None:
+    """Статья через браузер. Текст короче порога — ещё попытка с ожиданием дольше.
+
+    Блок (403/429/503) повтором не лечится — тогда выходим сразу.
+    """
+    from oiltech_digest.ingestion.request_parser import parse_article_page
+
+    for settle_ms in ARTICLE_SETTLE_MS:
+        content = fetch_rendered(candidate.url, settle_ms=settle_ms)
+        if content is None:
+            return None
+        title, published_at, raw_text = parse_article_page(content, candidate.title)
+        if title and len(raw_text) >= MIN_ARTICLE_TEXT_CHARS:
+            return {
+                "source_id": source["id"],
+                "title": title[:500],
+                "url": candidate.url,
+                "published_at": published_at or candidate.published_at,
+                "raw_text": raw_text,
+                "text_truncated": normalize.is_truncated(raw_text),
+                "language": _guess_language(source),
+                "content_hash": normalize.compute_content_hash(title, candidate.url),
+            }
+    return None
 
 
 def _empty_stats() -> dict[str, Any]:

@@ -19,6 +19,15 @@ oiltech-digest.ru {
 	import oiltech_routes
 }
 
+# Агентная ветвь (lowbrains/oiltech-agents): свой compose-проект и своя база рядом
+# с MVP-1 на этом же сервере. Имя agents-app, а не app: в этой сети «app» — приложение
+# MVP-1, и два контейнера с одним именем заставили бы Caddy раскидывать запросы
+# заказчика между MVP-1 и агентами. Подключение к сети — oiltech-agents/docker-compose.server.yml.
+agents.oiltech-digest.ru {
+	encode zstd gzip
+	reverse_proxy agents-app:8000
+}
+
 :80 {
 	import oiltech_routes
 }

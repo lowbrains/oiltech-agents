@@ -49,6 +49,16 @@ FULLTEXT_RETRY_TOO_SHORT="${FULLTEXT_RETRY_TOO_SHORT:-0}"
 # с РФ-сервера) фетчатся через зарубежный воркер. Шаг enqueue-external-scrape ставит
 # их в external-fetch/external-playwright; команда сама no-op при выключенном контуре.
 FETCH_EXTERNAL_ENABLED="${FETCH_EXTERNAL_ENABLED:-0}"
+EXTERNAL_REFETCH_LIMIT="${EXTERNAL_REFETCH_LIMIT:-100}"
+# Перепечатки (№21): одна новость, разошедшаяся по изданиям. Правило сужает корпус
+# до десятков пар, решает модель, копия помечается (не удаляется) и уходит из ленты.
+# Окно намеренно шире периода запуска: уже помеченные пары правило не выдаёт
+# повторно, поэтому перекрытие почти ничего не стоит, а пропуск дубля стоит того,
+# что заказчик снова видит четыре карточки одной новости.
+# Раз в REPRINTS_INTERVAL_HOURS часов по времени прошлого прогона в базе (0 — выключено).
+REPRINTS_INTERVAL_HOURS="${REPRINTS_INTERVAL_HOURS:-12}"
+REPRINTS_DAYS="${REPRINTS_DAYS:-7}"
+REPRINTS_LIMIT="${REPRINTS_LIMIT:-200}"
 SOURCE_DISCOVERY_ENABLED="${SOURCE_DISCOVERY_ENABLED:-0}"
 SOURCE_DISCOVERY_EVERY_CYCLES="${SOURCE_DISCOVERY_EVERY_CYCLES:-24}"
 SOURCE_DISCOVERY_TOPIC_LIMIT="${SOURCE_DISCOVERY_TOPIC_LIMIT:-3}"
@@ -145,6 +155,24 @@ while true; do
     # Западные источники (network_region='external') фетчим через зарубежный воркер —
     # с РФ-сервера к ним нет доступа. Задачи разберёт NL external-worker.
     run_step "enqueue-external-scrape" python -m oiltech_digest.cli enqueue-external-scrape
+    # Обрывки у тех же источников: лента даёт анонс, а локальная дозагрузка их не
+    # берёт (403 с РФ-адреса, попытка одна навсегда). Тело добирает воркер.
+    run_step "enqueue-external-refetch" python -m oiltech_digest.cli enqueue-external-refetch \
+      --limit "$EXTERNAL_REFETCH_LIMIT"
+  fi
+
+  # Срок — от прошлого прогона с записью в базе, а не «каждый 24-й цикл»: счётчик
+  # обнулялся при каждом перезапуске, а цикл идёт ~41 мин, а не 30 — «дважды в сутки»
+  # на деле выходило раз в 16,5 ч и сдвигалось каждым выкатом (19.09). Повтор при
+  # перезапуске исключает та же проверка по базе.
+  if [ "$REPRINTS_INTERVAL_HOURS" != "0" ]; then
+    if [ "$AI_OFFLINE" = "1" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
+      run_step "find-reprints" python -m oiltech_digest.cli find-reprints \
+        --days "$REPRINTS_DAYS" --limit "$REPRINTS_LIMIT" --apply \
+        --min-interval-hours "$REPRINTS_INTERVAL_HOURS"
+    else
+      log "SKIP find-reprints: OPENAI_API_KEY is empty"
+    fi
   fi
 
   if [ "$SOURCE_DISCOVERY_ENABLED" = "1" ]; then
@@ -236,6 +264,10 @@ while true; do
         $_signal_offline_flag
     fi
   fi
+
+  # Сторож полос: застой внешней очереди или очередь без живого воркера — «FAIL
+  # check-lanes» и строки ТРЕВОГА в логе (цикл не прерывается).
+  run_step "check-lanes" python -m oiltech_digest.cli check-lanes
 
   run_step "stats" python -m oiltech_digest.cli stats
   cycle=$((cycle + 1))

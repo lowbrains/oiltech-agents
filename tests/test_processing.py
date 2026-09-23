@@ -103,14 +103,20 @@ def test_relevance_article_uses_relevance_model_and_reasoning(monkeypatch):
     monkeypatch.setattr(pipeline.config, "OPENAI_RELEVANCE_REASONING", "high")
     client = _RecordingClient(relevant=True)
 
-    pipeline.relevance_article({"title": "t", "raw_text": "x", "summary": "S"}, client)
+    # Суть — различимая строка, а не одна буква: в промпте гейта с 17.09 есть блок
+    # тематик заказчика, и проверка на односимвольное «S» ловила бы любую тематику
+    # с латинской S в названии, а не подачу сути.
+    pipeline.relevance_article(
+        {"title": "t", "raw_text": "x", "summary": "ПОДКРУЧЕННАЯ-СУТЬ-НЕФТЕГАЗ"}, client
+    )
 
     call = client.calls[-1]
     assert call["name"] == "article_relevance"
     assert call["model"] == "strong-model"
     assert call["reasoning"] == "high"
     assert call["max_output_tokens"] == 2500
-    assert "S" not in call["input"]  # суть не в промпте гейта
+    assert "ПОДКРУЧЕННАЯ-СУТЬ-НЕФТЕГАЗ" not in call["input"]  # суть не в промпте гейта
+    assert "summary:" not in call["input"]
 
 
 def test_relevance_article_retries_with_compact_prompt_on_output_limit(monkeypatch):
@@ -545,3 +551,242 @@ def test_keyword_tag_keeps_old_behaviour_without_unclassified_tag():
     ]
     article = {"title": "Ничего не совпадает", "summary": "", "raw_text": ""}
     assert pipeline.keyword_tag(article, tags)["tag_id"] == 1
+
+
+def test_relevance_prompt_carries_customer_topics(monkeypatch):
+    """Тематики заказчика доезжают до гейта.
+
+    До 17.09 теги влияли только на классификацию уже отобранного: заказчик правил их
+    на экране и выборка не менялась вообще. Он спрашивал об этом прямо 07.09.
+    """
+    pipeline._TAGS_SCOPE_CACHE.update({"block": None, "at": 0.0})
+    monkeypatch.setattr(
+        pipeline.repository, "list_enabled_tags",
+        lambda: [{
+            "id": 26, "name": "Автоматизация и промышленный AI", "name_en": "Industrial AI",
+            "keywords_json": ["АСУ ТП", "телеметрия"], "keywords_en_json": ["SCADA"],
+            "negative_keywords_json": ["смартфон"],
+        }],
+    )
+    prompt = pipeline._relevance_prompt({"title": "t", "raw_text": "x"})
+    assert "тематики заказчика:" in prompt
+    assert "Автоматизация и промышленный AI" in prompt
+    assert "SCADA" in prompt
+    assert "минус: смартфон" in prompt
+
+
+def test_relevance_prompt_survives_tag_read_failure(monkeypatch):
+    """Сбой чтения тематик не роняет гейт — судим без них, как раньше."""
+    pipeline._TAGS_SCOPE_CACHE.update({"block": None, "at": 0.0})
+
+    def boom():
+        raise RuntimeError("база недоступна")
+
+    monkeypatch.setattr(pipeline.repository, "list_enabled_tags", boom)
+    prompt = pipeline._relevance_prompt({"title": "t", "raw_text": "x"})
+    assert "title: t" in prompt
+    assert "тематики заказчика" not in prompt
+
+
+def test_relevance_prompt_prefers_passed_tags_over_database(monkeypatch):
+    """Ключевое для прода: ИИ-стадия исполняется на зарубежном воркере, у которого
+    БАЗЫ НЕТ. Теги обязаны приезжать параметром, иначе чтение падает в except и
+    тематики молча не влияют ни на что именно в боевом режиме."""
+    def must_not_be_called():
+        raise AssertionError("гейт полез в базу вместо переданных тегов")
+
+    monkeypatch.setattr(pipeline.repository, "list_enabled_tags", must_not_be_called)
+    prompt = pipeline._relevance_prompt(
+        {"title": "t", "raw_text": "x"},
+        tags=[{"name": "Бурение", "keywords_json": ["направленное бурение"],
+               "keywords_en_json": [], "negative_keywords_json": []}],
+    )
+    assert "тематики заказчика:" in prompt
+    assert "Бурение" in prompt
+
+
+def test_tags_scope_keeps_english_keywords_when_russian_list_is_long():
+    """Общий срез ключей съедался русскими (их 33-52 на тематику) и до промпта не
+    доезжал ни один английский — а гейт судит и англоязычные тексты."""
+    from oiltech_digest.processing.prompts import tags_scope_block
+
+    block = tags_scope_block([{
+        "name": "Автоматизация", "name_en": "Industrial AI",
+        "keywords_json": [f"ключ{i}" for i in range(40)],
+        "keywords_en_json": ["SCADA", "digital twin"],
+        "negative_keywords_json": [],
+    }])
+    assert "SCADA" in block
+    assert "digital twin" in block
+
+
+def test_tags_scope_excludes_catch_all_tag():
+    """Служебный приёмник «Не классифицировано» — не тематика заказчика: по правилу
+    2б попадание в тематику это довод ЗА, и приёмник делал бы доводом ЗА всё непонятое."""
+    from oiltech_digest.processing.prompts import tags_scope_block
+
+    block = tags_scope_block([
+        {"name": "Не классифицировано / новая тема", "keywords_json": [],
+         "keywords_en_json": [], "negative_keywords_json": []},
+        {"name": "Бурение", "keywords_json": ["ГРП-флот"], "keywords_en_json": [],
+         "negative_keywords_json": []},
+    ])
+    assert "Не классифицировано" not in block
+    assert "Бурение" in block
+
+
+def test_external_refetch_rejects_substituted_body(monkeypatch):
+    """Страж принадлежности обязателен и на внешнем пути: воркер отдаёт то, что выдал
+    сайт, а сайт умеет отдавать пейвол или листинг на любой адрес (задача №24)."""
+    from oiltech_digest.ingestion import external_fetch
+
+    stored: list = []
+    monkeypatch.setattr(external_fetch.repository, "get_article",
+                        lambda aid: {"id": aid, "title": "Совсем про другое", "source_id": 1})
+    monkeypatch.setattr(external_fetch.repository, "update_article_full_text",
+                        lambda *a, **k: stored.append((a, k)))
+    monkeypatch.setattr(
+        "oiltech_digest.ingestion.article_fetcher._ownership_rejection",
+        lambda article, title, text: "title does not match body",
+    )
+
+    out = external_fetch.apply_refetch_text_result(
+        {"kind": "refetch_text", "results": [{"id": 5, "status": "ok", "text": "чужой текст " * 50}]}
+    )
+    assert out["mismatched"] == 1
+    assert out["applied"] == 0
+
+
+def test_reprint_primary_falls_back_to_longer_copy():
+    """Модель вернула чужой id — берём копию длиннее, а не первую попавшуюся.
+
+    В случае заказчика от 08.09 копии были 1026, 2327, 2366 и 3181 знак, и
+    короткая оказалась обрывком с дефектом склейки заголовка.
+    """
+    from oiltech_digest.processing import reprints
+
+    left = {"id": 10, "raw_text": "к" * 1026}
+    right = {"id": 20, "raw_text": "д" * 3181}
+    assert reprints._resolve_primary(999, left, right) == 20
+    assert reprints._resolve_primary(None, left, right) == 20
+    assert reprints._resolve_primary(10, left, right) == 10, "валидный id модели уважаем"
+
+
+def test_reprint_review_dry_run_writes_nothing(monkeypatch):
+    """Сухой прогон ничего не помечает: схлопывание убирает материал из ленты."""
+    from oiltech_digest.processing import reprints
+
+    written: list = []
+    monkeypatch.setattr(reprints.repository, "get_article",
+                        lambda aid: {"id": aid, "title": "t", "raw_text": "текст" * 50})
+    monkeypatch.setattr(reprints.repository, "mark_article_reprint",
+                        lambda **kw: written.append(kw))
+
+    class _Client:
+        model = "test-model"
+
+        def complete_json(self, *a, **k):
+            from oiltech_digest.processing.openai_client import AIResponse
+            return AIResponse(data={"same_event": True, "primary_id": 1, "reason": "одно испытание"},
+                              model="test-model")
+
+    out = reprints.review_candidates(
+        [{"a_id": 1, "b_id": 2, "a_title": "A", "b_title": "B", "overlap": 0.5}],
+        _Client(), dry_run=True)
+    assert out["stats"]["reprints"] == 1
+    assert written == [], "сухой прогон записал пометку"
+
+
+def test_reprint_apply_rejects_foreign_primary_id():
+    """Модель вернула id не из пары — дублем пометили бы не ту статью.
+
+    Падаем на длину: короткая копия обычно и есть обрывок (в случае заказчика
+    копия на 1026 знаков была склейкой заголовка с лидом).
+    """
+    from oiltech_digest.processing import external_ai
+
+    written: list = []
+    import oiltech_digest.db.repository as repo
+    orig = repo.mark_article_reprint
+    repo.mark_article_reprint = lambda **kw: written.append(kw)
+    try:
+        external_ai.apply_reprint_review_result({
+            "reprint_review": True,
+            "verdicts": [{"a_id": 10, "b_id": 20, "same_event": True,
+                          "primary_id": 999, "a_len": 1026, "b_len": 3181,
+                          "reason": "одно испытание", "overlap": 0.5}],
+        })
+    finally:
+        repo.mark_article_reprint = orig
+    assert len(written) == 1
+    assert written[0]["primary_id"] == 20, "главной должна стать длинная копия"
+    assert written[0]["article_id"] == 10
+
+
+def test_reprint_candidates_band_is_passed_through(monkeypatch):
+    """Полосу задаёт вызывающий, а не запрос.
+
+    Замер на живом корпусе 17.09: из 318 пар за 14 дней тривиальных (100%)
+    только 57, а полоса случая заказчика (35–49%) — 132 пары. Пока выборка
+    резалась по `ORDER BY overlap DESC`, спорные пары до модели не доезжали,
+    и судью нечем было проверить на том, ради чего он заведён.
+    """
+    from oiltech_digest.db import repository
+    from oiltech_digest.processing import reprints
+
+    seen = {}
+    monkeypatch.setattr(repository, "reprint_candidates",
+                        lambda **kw: seen.update(kw) or [])
+
+    reprints.find_candidates(days=14, min_overlap=0.35, max_overlap=0.6, limit=40)
+
+    assert seen["min_overlap"] == 0.35
+    assert seen["max_overlap"] == 0.6, "верхняя граница полосы должна доезжать до запроса"
+
+
+def test_reprint_candidate_order_is_not_by_overlap():
+    """Порядок выборки не должен коррелировать с силой совпадения."""
+    import inspect
+    import re
+    from oiltech_digest.db import repository
+
+    # Комментарии выкидываем: объяснение, ПОЧЕМУ так нельзя, само содержит
+    # запрещённую строку — на этом тест и споткнулся в первой редакции.
+    sql = inspect.getsource(repository.reprint_candidates)
+    code = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
+    orders = re.findall(r"ORDER BY .*", code)
+
+    assert orders, "в запросе должен быть явный порядок"
+    assert not any("overlap" in o for o in orders), (
+        f"срез по overlap отдаёт модели только тривиальные пары: {orders}"
+    )
+    assert any(o.startswith("ORDER BY md5(") for o in orders)
+
+
+def test_find_reprints_waits_for_interval_since_last_applied_run(isolated_db, monkeypatch, capsys):
+    """Срок — от прошлого прогона с записью в базе: перезапуск планировщика его не
+    сбивает, а сухой прогон не считается."""
+    import argparse
+
+    from oiltech_digest import cli
+    from oiltech_digest.db import repository
+    from oiltech_digest.processing import reprints
+
+    looked = []
+    monkeypatch.setattr(reprints, "find_candidates", lambda **kwargs: looked.append(kwargs) or [])
+    args = argparse.Namespace(min_overlap=0.35, max_overlap=1.0, days=7, limit=200, max_days_apart=5, show=0,
+                              candidates_only=False, offline=False, apply=True, local=False, min_interval_hours=12)
+
+    repository.create_background_job("reprint_review", {"pairs": [], "dry_run": True}, queue_name="external-ai")
+    cli.cmd_find_reprints(args)
+    assert len(looked) == 1  # сухой прогон не в счёт
+
+    job = repository.create_background_job("reprint_review", {"pairs": [], "dry_run": False}, queue_name="external-ai")
+    cli.cmd_find_reprints(args)
+    assert len(looked) == 1 and "пропуск" in capsys.readouterr().out
+
+    with repository.get_connection() as conn:
+        conn.execute("UPDATE background_jobs SET created_at = now() - interval '13 hours' WHERE id = %s", (job["id"],))
+        conn.commit()
+    cli.cmd_find_reprints(args)
+    assert len(looked) == 2  # прошло больше 12 часов — снова ищем

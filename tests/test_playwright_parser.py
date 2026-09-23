@@ -109,3 +109,45 @@ def test_playwright_proxy_for_only_overridden_hosts(monkeypatch):
         "password": "p",
     }
     assert playwright_parser._playwright_proxy_for("https://www.slb.com/news-and-insights") is None
+
+
+def test_listing_gets_a_second_longer_attempt_when_first_is_empty(monkeypatch):
+    """«Пока не получится — пара попыток»: у ядра повтор был, а NL-воркер его не
+    унаследовал. Теперь оба зовут одну функцию."""
+    settles: list[int] = []
+
+    def fake_render(url, settle_ms=0, **_):
+        settles.append(settle_ms)
+        return LISTING_HTML if len(settles) == 2 else b"<html><body>loading...</body></html>"
+    monkeypatch.setattr(playwright_parser, "fetch_rendered", fake_render)
+
+    candidates = playwright_parser.render_listing_candidates({"name": "S"}, "https://example.com/news", limit=5)
+
+    assert settles == list(playwright_parser.LISTING_SETTLE_MS)
+    assert settles[1] > settles[0], "вторая попытка ждёт дольше"
+    assert len(candidates) == 1
+
+
+def test_article_gets_a_second_longer_attempt_when_text_is_short(monkeypatch):
+    settles: list[int] = []
+
+    def fake_render(url, settle_ms=0, **_):
+        settles.append(settle_ms)
+        return ARTICLE_HTML if len(settles) == 2 else b"<html><head><title>x</title></head><body>...</body></html>"
+    monkeypatch.setattr(playwright_parser, "fetch_rendered", fake_render)
+    from oiltech_digest.ingestion.request_parser import CandidateLink
+
+    record = playwright_parser.rendered_article(
+        CandidateLink("https://example.com/news/a", "JS rendered drilling automation platform", 5), {"id": 3})
+
+    assert settles == list(playwright_parser.ARTICLE_SETTLE_MS)
+    assert record is not None and record["source_id"] == 3
+
+
+def test_blocked_article_is_not_retried(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(playwright_parser, "fetch_rendered", lambda url, settle_ms=0, **_: calls.append(1))
+    from oiltech_digest.ingestion.request_parser import CandidateLink
+
+    assert playwright_parser.rendered_article(CandidateLink("https://e.com/a", "t" * 30, 5), {"id": 1}) is None
+    assert len(calls) == 1, "блок (403/429/503) ожиданием не лечится"

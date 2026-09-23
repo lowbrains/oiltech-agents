@@ -12,7 +12,6 @@ import json
 import logging
 import re
 
-from lxml import etree, html
 
 from oiltech_digest import config
 from oiltech_digest.db import repository
@@ -61,8 +60,8 @@ def extract_og_image(content: bytes | str) -> str:
     if not content:
         return ""
     try:
-        doc = html.fromstring(content)
-    except (ValueError, TypeError, etree.ParserError):
+        doc = normalize.parse_html(content)
+    except (ValueError, TypeError):
         return ""
     for xpath in _OG_IMAGE_XPATHS:
         for value in doc.xpath(xpath):
@@ -168,7 +167,7 @@ def fetch_article_text(article: dict, min_chars: int = MIN_FULL_TEXT_CHARS) -> E
     rejected_reason: str | None = None
     rejected_method = "lxml"
 
-    extracted = extract_main_text(content)
+    extracted = extract_main_text(content, title=title)
     if _is_better_text(extracted, current, min_chars=min_chars):
         rejection = _ownership_rejection(article, title, extracted)
         if rejection is None:
@@ -214,21 +213,40 @@ def fetch_article_text(article: dict, min_chars: int = MIN_FULL_TEXT_CHARS) -> E
     )
 
 
-def extract_main_text(content: bytes | str) -> str:
+_CANDIDATE_CLASS_XPATH = (
+    "*[self::div or self::section][contains(translate(@class,"
+    " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'article')"
+    " or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'content')"
+    " or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'story')"
+    " or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'article')"
+    " or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'content')]"
+)
+
+
+def extract_main_text(content: bytes | str, title: str = "") -> str:
     """Extract readable text from an article HTML page.
 
     This is deliberately conservative: it prefers semantic article/main nodes,
     removes navigation/ads, and returns a clean text block only when there is
     enough paragraph-like content.
+
+    title — заголовок статьи, которую мы ищем. Новостные сайты с подгрузкой ленты
+    отдают на одной странице НЕСКОЛЬКО статей: у Neftegaz.ru на странице новости ОДК
+    стояли ещё пять, каждая со своим <h1>, и побеждал самый длинный блок. Так 14.09
+    пять новостей подряд (ОДК, Chevron, Казахстан, Трамп, Италия) получили текст
+    закреплённой «Гидры» СибБурМаша, а «Трамп» — 83 балла за технологию. С заголовком
+    текст ищется только внутри блока своей статьи.
     """
     if not content:
         return ""
     try:
-        doc = html.fromstring(content)
-    except (ValueError, TypeError, etree.ParserError):
+        doc = normalize.parse_html(content)
+    except (ValueError, TypeError):
         return ""
 
-    structured_text = _json_ld_article_text(doc)
+    structured_text = _json_ld_article_text(doc, title=title)
+    # Якорь — ДО чистки: <h1> статьи часто лежит в <header>, который чистка выбросит.
+    scope = _own_article_block(doc, title) if title else None
 
     for xpath in _DROP_XPATH:
         for node in doc.xpath(xpath):
@@ -236,19 +254,11 @@ def extract_main_text(content: bytes | str) -> str:
             if parent is not None:
                 parent.remove(node)
 
-    candidates = doc.xpath("//article|//main")
-    candidates.extend(
-        doc.xpath(
-            "//*[self::div or self::section][contains(translate(@class,"
-            " 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'article')"
-            " or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'content')"
-            " or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'story')"
-            " or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'article')"
-            " or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'content')]"
-        )
-    )
+    root = scope if scope is not None else doc
+    candidates = root.xpath("descendant-or-self::article|descendant-or-self::main")
+    candidates.extend(root.xpath("descendant-or-self::" + _CANDIDATE_CLASS_XPATH))
     if not candidates:
-        candidates = [doc]
+        candidates = [root]
 
     best_text = structured_text
     best_score = len(structured_text) + 300 if len(structured_text) >= 120 else -1
@@ -260,12 +270,73 @@ def extract_main_text(content: bytes | str) -> str:
         if score > best_score:
             best_score = score
             best_text = text
+    if scope is not None and best_score < 0:
+        # Внутри своего блока нет ни одного узла-кандидата: берём сам блок.
+        best_text = _node_text(scope)
     return best_text
 
 
-def _json_ld_article_text(doc) -> str:
-    """Extract articleBody/text from JSON-LD structured data when present."""
-    texts: list[str] = []
+# Слова заголовка должны почти целиком найтись в тексте <h1> страницы. Не «равен»:
+# у Neftegaz.ru внутри того же <h1> лежит лид, у других к заголовку прилипает рубрика.
+_ANCHOR_MIN_SHARE = 0.85
+_ANCHOR_CLEAR_LEADER = 0.6
+_ANCHOR_CLEAR_MARGIN = 0.3
+_ANCHOR_MIN_WORDS = 3
+_ANCHOR_MIN_BLOCK_CHARS = 200
+
+
+def _heading_words(text: str) -> list[str]:
+    return re.findall(r"[a-zа-я0-9]{2,}", (text or "").lower().replace("ё", "е"))
+
+
+def _title_share_in(title_words: set[str], text: str) -> float:
+    if not title_words:
+        return 0.0
+    return len(title_words & set(_heading_words(text))) / len(title_words)
+
+
+def _own_article_block(doc, title: str):
+    """Блок страницы, где заголовок ЭТОЙ статьи — единственный заголовок своего уровня.
+
+    None — якоря нет (заголовок не нашёлся или он на странице один): тогда извлечение
+    идёт по всей странице, как раньше."""
+    title_words = set(_heading_words(title))
+    if len(title_words) < _ANCHOR_MIN_WORDS:
+        return None
+    for tag in ("h1", "h2", "h3"):
+        headings = doc.xpath(f"//{tag}")
+        if not headings:
+            continue
+        shares = [_title_share_in(title_words, " ".join(heading.itertext())) for heading in headings]
+        best = max(shares)
+        best_index = shares.index(best)
+        runner_up = max((share for index, share in enumerate(shares) if index != best_index), default=0.0)
+        # Заголовок в ленте и на странице расходится на опечатку («На Чукотку прибило
+        # третье судно» против «прибыло» на странице — 0,83 при пороге 0,85): 40 статей
+        # Neftegaz из-за этого остались с чужим телом. Явный лидер с отрывом — тоже якорь.
+        if not (best >= _ANCHOR_MIN_SHARE
+                or (best >= _ANCHOR_CLEAR_LEADER and best - runner_up >= _ANCHOR_CLEAR_MARGIN)):
+            continue
+        anchor = headings[best_index]
+        if len(headings) < 2:
+            return None  # статья на странице одна — ограничивать нечего
+        block = anchor
+        parent = block.getparent()
+        while parent is not None and len(parent.xpath(f".//{tag}")) == 1:
+            block, parent = parent, parent.getparent()
+        if len(normalize.clean_html(block.text_content())) < _ANCHOR_MIN_BLOCK_CHARS:
+            return None  # блок — один заголовок без текста (плоская вёрстка ленты)
+        return block
+    return None
+
+
+def _json_ld_article_text(doc, title: str = "") -> str:
+    """Extract articleBody/text from JSON-LD structured data when present.
+
+    С заголовком — только тело, чей headline совпадает со статьёй. Раньше бралось
+    «самое длинное» из всех, и закреплённый материал из разметки побеждал свою
+    статью (дефект №24, 28.07). Несколько тел, и ни одно не наше, — разметке не верим."""
+    entries: list[tuple[str, str]] = []
     for node in doc.xpath("//script[contains(translate(@type, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ld+json')]"):
         raw = (node.text or "").strip()
         if not raw:
@@ -274,29 +345,40 @@ def _json_ld_article_text(doc) -> str:
             payload = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-        texts.extend(_json_ld_text_values(payload))
-    if not texts:
+        entries.extend(_json_ld_entries(payload))
+    if not entries:
         return ""
-    return max((normalize.clean_html(text) for text in texts), key=len, default="")
+    title_words = set(_heading_words(title))
+    if len(title_words) >= _ANCHOR_MIN_WORDS:
+        own = [text for headline, text in entries
+               if headline and _title_share_in(title_words, headline) >= _ANCHOR_MIN_SHARE]
+        if own:
+            return max((normalize.clean_html(text) for text in own), key=len, default="")
+        if len(entries) > 1 or any(headline for headline, _ in entries):
+            return ""
+    return max((normalize.clean_html(text) for _, text in entries), key=len, default="")
 
 
-def _json_ld_text_values(payload) -> list[str]:
+def _json_ld_entries(payload) -> list[tuple[str, str]]:
+    """(headline, тело) из JSON-LD, включая вложенный @graph."""
     if isinstance(payload, list):
-        values: list[str] = []
+        values: list[tuple[str, str]] = []
         for item in payload:
-            values.extend(_json_ld_text_values(item))
+            values.extend(_json_ld_entries(item))
         return values
     if not isinstance(payload, dict):
         return []
 
+    headline = payload.get("headline") or payload.get("name") or ""
+    headline = headline if isinstance(headline, str) else ""
     values = []
     for key in ("articleBody", "text"):
         value = payload.get(key)
         if isinstance(value, str) and len(value.strip()) >= 120:
-            values.append(value)
+            values.append((headline, value))
     graph = payload.get("@graph")
     if graph:
-        values.extend(_json_ld_text_values(graph))
+        values.extend(_json_ld_entries(graph))
     return values
 
 
@@ -310,7 +392,13 @@ def _node_text(node) -> str:
         if len(text) >= 30:
             chunks.append(text)
     text = "\n\n".join(_dedupe_preserve_order(chunks))
-    if len(text) < 200:
+    # Текст, лежащий прямо в узле, а не во вложенных тегах: тело на <br> без <p>.
+    # У Neftegaz.ru так свёрстана каждая новость, а <li> из вставок давали ~700 знаков
+    # «абзацев» — больше порога ниже, и 4,6 тыс. знаков самой новости терялись.
+    direct_text = normalize.clean_html(
+        " ".join([node.text or ""] + [child.tail or "" for child in node])
+    )
+    if len(text) < 200 or len(direct_text) >= 200:
         # Вёрстка без значимых <p> (текст лежит в <div>/таблицах — частый случай
         # у CMS вроде EnergyLand): берём очищенный текст самого узла-кандидата.
         node_text = normalize.clean_html(node.text_content())

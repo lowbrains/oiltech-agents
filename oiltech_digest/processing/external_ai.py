@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any, Callable
 
 from oiltech_digest.db import repository
@@ -19,15 +20,23 @@ from oiltech_digest.processing.pipeline import (
     title_ru_for_article,
 )
 
+logger = logging.getLogger(__name__)
+
 RECHECK_BATCH_DEFAULT = 100
 TRANSLATE_BATCH_DEFAULT = 100
 
 
-def build_process_articles_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Expand a DB-backed process_articles job into a self-contained external payload."""
+def build_process_articles_payload(payload: dict[str, Any], *, job_id: int | None = None) -> dict[str, Any]:
+    """Expand a DB-backed process_articles job into a self-contained external payload.
+
+    С job_id (выдача воркеру) статьи резервируются за задачей: соседняя ИИ-полоса не
+    возьмёт те же и не оплатит их второй раз (repository.reserve_process_articles)."""
     article_ids = [int(item) for item in payload.get("article_ids") or []]
     limit = int(payload.get("limit") or 5)
-    if article_ids:
+    if job_id is not None:
+        reserved = repository.reserve_process_articles(job_id, limit=limit, article_ids=article_ids or None)
+        articles = repository.get_articles_by_ids(reserved, include_summary=True)
+    elif article_ids:
         articles = repository.get_articles_by_ids(article_ids, include_summary=True)
     else:
         articles = repository.get_articles_needing_pipeline(limit)
@@ -141,7 +150,7 @@ def process_payload(payload: dict[str, Any], heartbeat: Callable[[], None] | Non
                 continue
             # Гейт релевантности ПЕРВЫМ — на сыром тексте, до суммаризации.
             # Нерелевантное дальше не суммируем/не тегируем/не скорим (чистота + экономия).
-            relevance_resp = relevance_article(article, client)
+            relevance_resp = relevance_article(article, client, tags=tags)
             relevant = bool(relevance_resp.data.get("relevant"))
             item["relevance"] = _response_payload(
                 relevance_resp,
@@ -341,7 +350,7 @@ def process_recheck_payload(payload: dict[str, Any], heartbeat: Callable[[], Non
                 item["relevance"] = {"relevant": False, "reason": blocked_reason, "model": "negative-keyword"}
                 result["stats"]["rejected"] += 1
             else:
-                resp = relevance_article(article, client)
+                resp = relevance_article(article, client, tags=tags)
                 relevant = bool(resp.data.get("relevant"))
                 item["relevance"] = _response_payload(resp, {"relevant": relevant, "reason": resp.data.get("reason")})
                 result["stats"]["relevant" if relevant else "rejected"] += 1
@@ -876,3 +885,128 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 def _jsonable_dict(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in dict(row).items()}
+
+
+def build_reprint_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Пары-кандидаты в перепечатки — на зарубежный воркер.
+
+    Судья зовёт OpenAI, а с РФ-адреса OpenAI отвечает 403
+    unsupported_country_region_territory. Ровно на этом 17.09 стоял радар сигналов,
+    и первый прогон судьи дал 12 ошибок из 12 по той же причине. Все ИИ-стадии
+    ходят через внешний контур, эта не исключение.
+
+    Тексты кладём в payload: у воркера нет базы.
+    """
+    from oiltech_digest.db import repository
+
+    pairs = payload.get("pairs") or []
+    if not pairs:
+        # Пустой список — это ошибка постановки, а не «нечего делать»: молча вернув
+        # пустой пакет, задача завершилась бы «успехом» и скрыла проблему.
+        raise ValueError("reprint_review: пустой список pairs")
+    packed: list[dict[str, Any]] = []
+    for pair in pairs:
+        left = repository.get_article(int(pair["a_id"]))
+        right = repository.get_article(int(pair["b_id"]))
+        if left is None or right is None:
+            continue
+        packed.append({
+            "overlap": pair.get("overlap"),
+            "a": _compact_article_for_reprint(left),
+            "b": _compact_article_for_reprint(right),
+        })
+    return {"kind": "reprint_review", "pairs": packed, "dry_run": bool(payload.get("dry_run"))}
+
+
+def _compact_article_for_reprint(article: dict[str, Any]) -> dict[str, Any]:
+    from oiltech_digest.processing.reprints import BODY_LIMIT
+
+    return {
+        "id": int(article["id"]),
+        "title": article.get("title") or "",
+        "source_name": article.get("source_name") or "",
+        "published_at": str(article.get("published_at") or ""),
+        "raw_text": (article.get("raw_text") or "")[:BODY_LIMIT],
+    }
+
+
+def process_reprint_review_payload(payload: dict[str, Any],
+                                   heartbeat: Callable[[], None] | None = None) -> dict[str, Any]:
+    """Сторона воркера: рассудить пары. В базу не ходит."""
+    from oiltech_digest.processing.reprints import judge_pair
+
+    client = make_client()
+    verdicts: list[dict[str, Any]] = []
+    for pair in payload.get("pairs") or []:
+        if heartbeat:
+            heartbeat()
+        left, right = pair["a"], pair["b"]
+        try:
+            response = judge_pair(left, right, client)
+            verdicts.append({
+                "a_id": left["id"], "b_id": right["id"], "overlap": pair.get("overlap"),
+                "same_event": bool(response.data.get("same_event")),
+                "primary_id": response.data.get("primary_id"),
+                "reason": str(response.data.get("reason") or "")[:500],
+                "model": response.model,
+                "a_len": len(left.get("raw_text") or ""),
+                "b_len": len(right.get("raw_text") or ""),
+            })
+        except Exception as exc:  # noqa: BLE001 - одна пара не валит батч
+            verdicts.append({"a_id": left["id"], "b_id": right["id"],
+                             "error": str(exc)[:300]})
+    return {
+        "reprint_review": True,
+        "kind": "reprint_review",
+        "dry_run": bool(payload.get("dry_run")),
+        "verdicts": verdicts,
+        "stats": {
+            "checked": len(verdicts),
+            "reprints": sum(1 for v in verdicts if v.get("same_event")),
+            "errors": sum(1 for v in verdicts if v.get("error")),
+        },
+    }
+
+
+def apply_reprint_review_result(result: dict[str, Any], *, job_id: int | None = None) -> dict[str, Any]:
+    """Сторона ядра: записать пометки. Удаления нет намеренно — запись обратима."""
+    from oiltech_digest.db import repository
+    from oiltech_digest.processing.reprints import resolve_primary as reprints_resolve_primary
+
+    if result.get("dry_run"):
+        # Сухой прогон ничего не пишет — это умолчание CLI и главный сценарий
+        # показа заказчику перед тем, как что-то схлопывать.
+        return {"applied": 0, "dry_run": True}
+
+    applied = 0
+    skipped = 0
+    for verdict in result.get("verdicts") or []:
+        if verdict.get("error") or not verdict.get("same_event"):
+            continue
+        try:
+            a_id, b_id = int(verdict["a_id"]), int(verdict["b_id"])
+        except (KeyError, TypeError, ValueError):
+            # Ответ воркера — недоверенный вход: битую запись пропускаем, а не падаем
+            # на всей пачке.
+            continue
+        # Правило выбора главной копии живёт в reprints.resolve_primary и только там.
+        primary = reprints_resolve_primary(
+            verdict.get("primary_id"),
+            a_id, int(verdict.get("a_len") or 0),
+            b_id, int(verdict.get("b_len") or 0),
+        )
+        duplicate = b_id if primary == a_id else a_id
+        try:
+            repository.mark_article_reprint(
+                article_id=duplicate, primary_id=primary,
+                similarity=verdict.get("overlap"), reason=verdict.get("reason"),
+                decided_by="ai", model=verdict.get("model"),
+            )
+        except ValueError as exc:
+            # Инварианты пометки (сам себе перепечатка, невидимая главная копия)
+            # отбивают одну пару, а не всю пачку: остальные вердикты годны.
+            logger.warning("reprint_mark_skipped a=%s b=%s: %s", a_id, b_id, exc)
+            skipped += 1
+            continue
+        applied += 1
+    return {"applied": applied, "skipped": skipped}

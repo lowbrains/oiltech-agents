@@ -67,7 +67,14 @@ export function TagsPage({ onUnauthorized, showToast }: Props) {
 
   /** Список через запятую ⇄ массив. Пустые куски отбрасываем, иначе в промпт уедет мусор. */
   function splitKeywords(raw: string): string[] {
-    return raw.split(",").map((word) => word.trim()).filter(Boolean);
+    // Принимаем и перевод строки, и запятую: заказчик просил 13.09 вводить ключи
+    // строчками друг под другом, но вставка списка через запятую должна работать
+    // по-прежнему — иначе сломается его привычный способ переноса из таблицы.
+    return raw.split(/[\n,]/).map((word) => word.trim()).filter(Boolean);
+  }
+
+  function joinKeywords(values: string[] | null | undefined): string {
+    return (values || []).join("\n");
   }
 
   function addParentTag() {
@@ -181,33 +188,35 @@ export function TagsPage({ onUnauthorized, showToast }: Props) {
                       <input value={parent.description || ""} onChange={(event) => updateTag(parentIndex, "description", event.target.value)} />
                     </label>
                     <label className="field fieldWide">
-                      <span>Ключевые слова RU (по ним ищем и тегируем)</span>
-                      <input
-                        value={(parent.keywords_json || []).join(", ")}
+                      <span>Ключевые слова RU — по одному в строке (по ним ищем и тегируем)</span>
+                      <textarea
+                        className="keywordList"
+                        rows={8}
+                        value={joinKeywords(parent.keywords_json)}
                         onChange={(event) => updateTag(parentIndex, "keywords_json", splitKeywords(event.target.value))}
-                        placeholder="напр.: ГРП, гидроразрыв, проппант"
+                        placeholder={"ГРП\nгидроразрыв\nпроппант"}
                       />
                     </label>
                     <label className="field fieldWide">
-                      <span>Keywords EN</span>
-                      <input
-                        value={(parent.keywords_en_json || []).join(", ")}
+                      <span>Keywords EN — по одному в строке</span>
+                      <textarea
+                        className="keywordList"
+                        rows={6}
+                        value={joinKeywords(parent.keywords_en_json)}
                         onChange={(event) => updateTag(parentIndex, "keywords_en_json", splitKeywords(event.target.value))}
-                        placeholder="e.g.: hydraulic fracturing, proppant"
+                        placeholder={"hydraulic fracturing\nproppant"}
                       />
                     </label>
                     <label className="field fieldWide">
-                      <span>Стоп-слова (исключают статью; через запятую)</span>
-                      <input
-                        value={(parent.negative_keywords_json || []).join(", ")}
+                      <span>Стоп-слова — по одному в строке (довод против статьи)</span>
+                      <textarea
+                        className="keywordList"
+                        rows={4}
+                        value={joinKeywords(parent.negative_keywords_json)}
                         onChange={(event) =>
-                          updateTag(
-                            parentIndex,
-                            "negative_keywords_json",
-                            event.target.value.split(",").map((word) => word.trim()).filter(Boolean),
-                          )
+                          updateTag(parentIndex, "negative_keywords_json", splitKeywords(event.target.value))
                         }
-                        placeholder="напр.: футбол, банкротство, вакансия"
+                        placeholder={"футбол\nбанкротство\nвакансия"}
                       />
                     </label>
                     <div className="settingsActions">

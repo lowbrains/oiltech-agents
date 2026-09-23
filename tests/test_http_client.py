@@ -152,3 +152,70 @@ def test_fetch_legacy_tls_returns_none_on_error(monkeypatch):
 
     monkeypatch.setattr(http_client, "_get_legacy_session", lambda: type("S", (), {"get": boom})())
     assert http_client._fetch_legacy_tls("https://legacy.example", 5) is None
+
+
+def test_timeout_host_gets_cooldown_and_is_skipped_next_time(monkeypatch):
+    """Молчаливый хост закрывается так же, как громкий.
+
+    До этой правки пауза ставилась только по статусу 403/429, а таймаут
+    переспрашивался заново для каждого адреса: пакет из 25 статей одного
+    издания стоил 25x63 с и не доживал до конца lease.
+    """
+    http_client._host_cooldown_until.clear()
+    http_client._host_next_allowed.clear()
+    calls = {"n": 0}
+
+    class DeadSession:
+        def get(self, *args, **kwargs):
+            calls["n"] += 1
+            raise requests.exceptions.ConnectTimeout("read timed out")
+
+    monkeypatch.setattr(http_client, "_get_session", lambda: DeadSession())
+    monkeypatch.setattr(http_client, "_wait_for_host_slot", lambda host: None)
+    monkeypatch.setattr(http_client.time, "sleep", lambda seconds: None)
+
+    assert http_client.fetch("https://dead.example.com/a") is None
+    spent_on_first = calls["n"]
+    # Вторая статья того же издания не должна стоить ни одного запроса.
+    assert http_client.fetch("https://dead.example.com/b") is None
+
+    assert spent_on_first == config.RETRY_ATTEMPTS
+    assert calls["n"] == spent_on_first
+
+
+def test_page_level_error_does_not_close_whole_host(monkeypatch):
+    """404 у одной страницы не повод закрывать издание целиком."""
+    http_client._host_cooldown_until.clear()
+    http_client._host_next_allowed.clear()
+    calls = {"n": 0}
+
+    class NotFoundSession:
+        def get(self, *args, **kwargs):
+            calls["n"] += 1
+            return DummyResponse(status_code=404, content=b"")
+
+    monkeypatch.setattr(http_client, "_get_session", lambda: NotFoundSession())
+    monkeypatch.setattr(http_client, "_wait_for_host_slot", lambda host: None)
+    monkeypatch.setattr(http_client.time, "sleep", lambda seconds: None)
+
+    assert http_client.fetch("https://live.example.com/missing") is None
+    assert not http_client._is_host_cooling_down("live.example.com")
+    assert http_client.fetch("https://live.example.com/other") is None
+    assert calls["n"] == 2 * config.RETRY_ATTEMPTS
+
+
+def test_probe_failure_does_not_blacklist_host(monkeypatch):
+    """Диагностика источника ходит с одной попыткой — закрывать по ней нельзя."""
+    http_client._host_cooldown_until.clear()
+    http_client._host_next_allowed.clear()
+
+    class DeadSession:
+        def get(self, *args, **kwargs):
+            raise requests.exceptions.ConnectionError("no route")
+
+    monkeypatch.setattr(http_client, "_get_session", lambda: DeadSession())
+    monkeypatch.setattr(http_client, "_wait_for_host_slot", lambda host: None)
+    monkeypatch.setattr(http_client.time, "sleep", lambda seconds: None)
+
+    assert http_client.probe("https://slow.example.com/feed") is None
+    assert not http_client._is_host_cooling_down("slow.example.com")

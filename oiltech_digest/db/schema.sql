@@ -107,6 +107,30 @@ CREATE INDEX IF NOT EXISTS idx_articles_published_at ON articles(published_at DE
 -- =========================================================================
 -- Карточки статей (рабочее представление в «Все статьи») — будущее
 -- =========================================================================
+-- Перепечатки: одна публикация, разошедшаяся по нескольким изданиям. Таблица
+-- ГЛОБАЛЬНАЯ, в отличие от user_article_states.status='duplicate': перепечатка —
+-- факт о материале, а не мнение конкретного пользователя.
+--
+-- Почему отдельная таблица, а не флаг в articles: запись обратима и объяснима.
+-- Храним, ЧЕГО копия, чем измерено сходство и почему судья решил именно так —
+-- без этого разбор жалобы «почему статья пропала» превращается в гадание, а
+-- заказчик уже жаловался на исчезновение материалов.
+--
+-- Идёт ПОСЛЕ articles: обе ссылки ведут туда, и порядок блоков в этом файле
+-- значим — блок исполняется сверху вниз одной транзакцией.
+CREATE TABLE IF NOT EXISTS article_reprints (
+  article_id     BIGINT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  primary_id     BIGINT NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  similarity     NUMERIC,
+  reason         TEXT,
+  decided_by     TEXT NOT NULL DEFAULT 'ai',
+  model          TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT article_reprints_not_self CHECK (article_id <> primary_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_article_reprints_primary ON article_reprints(primary_id);
+
 CREATE TABLE IF NOT EXISTS article_cards (
   id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   article_id          BIGINT NOT NULL REFERENCES articles(id),
