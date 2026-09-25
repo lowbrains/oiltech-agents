@@ -475,15 +475,11 @@ export function App() {
               {authMode === "register" ? "Зарегистрироваться" : "Войти"}
             </button>
           </div>
+          {/* Переключателя «Зарегистрироваться» больше нет: самостоятельная
+              регистрация закрыта (#33), и кнопка вела в 403. Учётки заводит
+              администратор — экран «Пользователи» или CLI create-user. */}
           <div className="authSwitchText">
-            {authMode === "login" ? "Нет аккаунта?" : "Уже есть аккаунт?"}{" "}
-            <button
-              type="button"
-              className="authSwitchLink"
-              onClick={() => setAuthMode((mode) => (mode === "login" ? "register" : "login"))}
-            >
-              {authMode === "login" ? "Зарегистрироваться" : "Войти"}
-            </button>
+            Нет доступа? Обратитесь к администратору платформы.
           </div>
         </div>
         {toast ? <div className={`toastReact ${toast.tone === "error" ? "error" : ""}`}>{toast.text}</div> : null}

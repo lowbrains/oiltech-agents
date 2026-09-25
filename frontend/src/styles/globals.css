@@ -1264,6 +1264,19 @@ button {
   font-weight: 700;
 }
 
+.laneAlerts {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--sem-bad-border);
+  background: var(--sem-bad-bg);
+  color: var(--sem-bad-fg);
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+
 .externalQueueList {
   margin-top: 12px;
   display: grid;
@@ -5561,4 +5574,15 @@ button {
   font-size: 0.82rem;
   color: var(--text-muted);
   padding: 6px 0;
+}
+
+/* Списки ключевых слов на экране «Теги»: по одному в строке.
+   В однострочном поле при 33–52 ключах на тематику не видно ничего —
+   просьба заказчика от 13.09. */
+.keywordList {
+  min-height: 84px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  resize: vertical;
 }

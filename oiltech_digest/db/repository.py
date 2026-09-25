@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from oiltech_digest import auth, config
+from oiltech_digest import auth, config, lanes
 from oiltech_digest.ingestion import normalize
 from oiltech_digest.db.connection import get_connection
 
@@ -2121,6 +2121,50 @@ def article_exists(url: str) -> bool:
         return row is not None
 
 
+def set_source_collection(source_id: int, *, listing_url: str | None, network_region: str,
+                          enabled: bool) -> None:
+    """Записать, чем и откуда собирать источник, — итог перебора стратегий.
+
+    Архивный источник этим не воскрешается: `enabled` ставится только вместе с
+    `archived_at IS NULL`, как и в add_rss_source.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE sources
+            SET listing_url = %s, network_region = %s,
+                enabled = (%s AND archived_at IS NULL), updated_at = now()
+            WHERE id = %s
+            """,
+            (listing_url, network_region, bool(enabled), int(source_id)),
+        )
+        conn.commit()
+
+
+def recent_article_urls_for_site(site_url: str | None, limit: int = 500) -> list[str]:
+    """Последние адреса статей этого сайта и его поддоменов — от любого источника.
+
+    Для внешнего воркера: базы у него нет, и без этого списка он качает каждую статью
+    листинга на каждом цикле. Сайт, а не источник: у JPT восемь разделов-источников
+    делят одни статьи, и знакомую для соседа статью качать тоже незачем.
+    """
+    host = (urlsplit(site_url or "").netloc or "").lower().removeprefix("www.")
+    if not host:
+        return []
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT url FROM articles
+            WHERE lower(split_part(url, '/', 3)) IN (%s, %s)
+               OR lower(split_part(url, '/', 3)) LIKE %s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (host, "www." + host, "%." + host, int(limit)),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
 def update_source_request_state(
     source_id: int,
     *,
@@ -2387,6 +2431,10 @@ def create_background_job(
     max_attempts: int = 3,
     agent_run_id: int | None = None,
 ) -> dict:
+    # Агентные задачи — в свою полосу, как бы их ни назвал вызывающий код (lanes.route).
+    queue_name = lanes.route(queue_name, kind)
+    # Внешняя очередь принимает только то, что её воркер умеет исполнять (lanes.py).
+    lanes.check_enqueue(queue_name, kind)
     with get_connection() as conn:
         cur = conn.cursor(row_factory=dict_row)
         cur.execute(
@@ -2684,50 +2732,54 @@ def background_job_status_counts(*, capability: str | None = None, kind_prefix: 
         return {str(row["status"]): int(row["count"]) for row in cur.fetchall()}
 
 
-def external_queue_status() -> dict:
-    with get_connection() as conn:
-        cur = conn.cursor(row_factory=dict_row)
-        cur.execute(
-            """
-            SELECT
+_EXTERNAL_QUEUE_STATUS_COLUMNS = """
               COUNT(*) FILTER (WHERE status = 'queued') AS queued,
               COUNT(*) FILTER (WHERE status = 'running') AS running,
               COUNT(*) FILTER (WHERE status = 'finalizing') AS finalizing,
               COUNT(*) FILTER (WHERE status = 'failed') AS failed,
               COUNT(*) FILTER (WHERE status = 'ok') AS ok,
               MIN(created_at) FILTER (WHERE status = 'queued') AS oldest_queued_at,
+              -- «Ждёт с» — от момента, когда задачу можно было взять: отложенная
+              -- на повтор (run_after в будущем) — не застой.
+              MIN(GREATEST(created_at, run_after)) FILTER (
+                WHERE status = 'queued' AND run_after <= now()
+              ) AS oldest_ready_at,
               MAX(last_heartbeat_at) FILTER (WHERE status = 'running') AS last_heartbeat_at,
+              MAX(GREATEST(started_at, last_heartbeat_at, finished_at)) AS last_activity_at,
               COUNT(*) FILTER (
                 WHERE status = 'running'
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at < now()
               ) AS expired_leases
-            FROM background_jobs
-            WHERE execution_region = 'external'
-            """
+"""
+# Внешней считается и задача с чужим регионом в очереди external-*: такая ошибка
+# маршрута как раз и должна быть видна, а не выпадать из сводки.
+_EXTERNAL_JOBS_WHERE = "(execution_region = 'external' OR queue_name LIKE 'external%%')"
+
+
+def external_queue_status() -> dict:
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            f"SELECT {_EXTERNAL_QUEUE_STATUS_COLUMNS} FROM background_jobs WHERE {_EXTERNAL_JOBS_WHERE}"
         )
         totals = cur.fetchone() or {}
         cur.execute(
-            """
-            SELECT queue_name,
-                   COUNT(*) FILTER (WHERE status = 'queued') AS queued,
-                   COUNT(*) FILTER (WHERE status = 'running') AS running,
-                   COUNT(*) FILTER (WHERE status = 'finalizing') AS finalizing,
-                   COUNT(*) FILTER (WHERE status = 'failed') AS failed,
-                   COUNT(*) FILTER (WHERE status = 'ok') AS ok,
-                   MIN(created_at) FILTER (WHERE status = 'queued') AS oldest_queued_at,
-                   MAX(last_heartbeat_at) FILTER (WHERE status = 'running') AS last_heartbeat_at
+            f"""
+            SELECT queue_name, {_EXTERNAL_QUEUE_STATUS_COLUMNS}
             FROM background_jobs
-            WHERE execution_region = 'external'
+            WHERE {_EXTERNAL_JOBS_WHERE}
             GROUP BY queue_name
             ORDER BY queue_name
             """
         )
         queues = cur.fetchall()
-    return {
+    status = {
         "totals": dict(totals),
         "queues": [dict(row) for row in queues],
     }
+    status["alerts"] = lanes.lane_alerts(status)
+    return status
 
 
 def mark_background_job_running(job_id: int) -> None:
@@ -3231,6 +3283,32 @@ def insert_article(rec: dict) -> bool:
             ).fetchone()
             if seen is not None:
                 return False
+        # Третий рубеж: одинаковое ТЕЛО у того же источника. Такая же проверка уже
+        # стояла в дозагрузке (article_fetcher), но только на замену текста — на
+        # первичной вставке её не было, и брак заезжал свободно.
+        #
+        # Замер прода 17.09: 830 статей с повторяющимся телом, 311 у активных
+        # источников, за 134 уже заплачен ИИ. У Новатэка так набралось 82 «статьи»
+        # из 86 — это оказались страницы навигации сайта (/ru/esg, /ru/press/
+        # calculator, даже PDF политики конфиденциальности): парсер берёт из
+        # листинга все ссылки подряд, включая меню, а сайт отдаёт на них одну и ту
+        # же оболочку. Разные статьи одного источника не совпадают телом побайтово,
+        # поэтому проверка безопасна. Перепечатки между источниками НЕ трогаем —
+        # это задача №21, и там нужен семантический дедуп, а не хэш.
+        body_hash = rec.get("body_hash")
+        source_id = rec.get("source_id")
+        if body_hash and source_id is not None:
+            # NOT pending_deletion — как на соседнем рубеже по url_key. Скрытая копия
+            # иначе блокировала бы пересбор навсегда: у RSS телом на вставке служит
+            # summary ленты, и один постоянный тизер-заглушка отрезал бы источник
+            # целиком после первой же статьи.
+            twin = conn.execute(
+                "SELECT 1 FROM articles WHERE source_id = %s AND body_hash = %s "
+                "AND NOT pending_deletion LIMIT 1",
+                (int(source_id), body_hash),
+            ).fetchone()
+            if twin is not None:
+                return False
         cur = conn.execute(
             """
             INSERT INTO articles (source_id, title, url, url_key, published_at,
@@ -3338,6 +3416,12 @@ def get_articles_needing_full_text(limit: int = 50, retry_too_short: bool = Fals
             FROM articles a
             JOIN sources s ON s.id = a.source_id
             WHERE a.url IS NOT NULL
+              -- Источники зарубежного контура пропускаем: они там именно потому, что
+              -- с РФ-адреса закрыты, и локальная дозагрузка ловит на них 403
+              -- гарантированно. Попытка ОДНА и навсегда — статья получила бы
+              -- full_text_status='failed' и больше никогда не переспрашивалась, даже
+              -- когда тело уже добрал зарубежный воркер (external_fetch).
+              AND COALESCE(s.network_region, 'auto') <> 'external'
               {status_filter}
               AND (
                 COALESCE(a.text_truncated, FALSE) = TRUE
@@ -3700,6 +3784,266 @@ def cross_dup_candidates() -> int:
 #  AI processing: articles, cards, tags, scoring, metrics
 # ---------------------------------------------------------------------------
 
+def external_refetch_candidates(limit: int = 200) -> list[dict]:
+    """Статьи-обрывки у источников зарубежного контура — кандидаты на дозаполнение.
+
+    Локальная дозагрузка их не берёт намеренно (см. get_articles_needing_full_text):
+    с РФ-адреса эти сайты отдают 403, а попытка одна и навсегда. Тело для них может
+    добрать только внешний воркер, и до 17.09 такого пути не было вовсе — замер
+    показал 25 из 25 статей короче 600 знаков у Oil & Gas Journal и Offshore Magazine.
+
+    Берём и уже помеченные failed: прежние пометки ставились локальной дозагрузкой,
+    то есть отражают недоступность с РФ, а не непригодность статьи.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            """
+            SELECT a.id, a.url, a.title
+            FROM articles a
+            JOIN sources s ON s.id = a.source_id
+            WHERE a.url IS NOT NULL
+              AND s.network_region = 'external'
+              AND s.archived_at IS NULL
+              AND (
+                a.full_text_status IS NULL
+                -- Повтор после неудачи — но НЕ каждый цикл. Статусы failed/too_short
+                -- ставит сама же внешняя попытка, поэтому без паузы статья
+                -- переочередивалась бы вечно: в июле так задача 1181 крутилась в
+                -- петле по часу и жгла деньги. Даём сутки на остыть.
+                OR (a.full_text_status IN ('failed', 'too_short')
+                    AND (a.full_text_fetched_at IS NULL
+                         OR a.full_text_fetched_at < now() - interval '1 day'))
+              )
+              AND length(COALESCE(a.raw_text, '')) < %s
+            ORDER BY a.published_at DESC NULLS LAST, a.id DESC
+            LIMIT %s
+            """,
+            (config.MIN_FULL_TEXT_CHARS, limit),
+        )
+        return cur.fetchall()
+
+
+def get_articles_for_external_refetch(article_ids: list[int]) -> list[dict]:
+    """Адреса и заголовки по списку id — то, что уезжает на воркер без базы."""
+    if not article_ids:
+        return []
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            "SELECT id, url, title FROM articles WHERE id = ANY(%s) AND url IS NOT NULL",
+            (list(article_ids),),
+        )
+        return cur.fetchall()
+
+
+def reprint_candidates(*, days: int = 14, min_overlap: float = 0.35,
+                       max_overlap: float = 1.0,
+                       max_days_apart: int = 5, limit: int = 200) -> list[dict]:
+    """Пары-кандидаты в перепечатки: разные источники, близкие даты, общие слова.
+
+    Правило намеренно широкое — оно отвечает за полноту, а решает модель. Замер на
+    случае заказчика от 08.09: настоящие дубли дали пересечение от 36% до 78%, то
+    есть порога, который ловит все и не ловит лишнего, не существует.
+
+    Слова режем до 6 знаков вместо лемматизации: «установки/установок/установках»
+    сходятся, а тащить морфологию в SQL ради этого незачем. Короче 5 знаков
+    отбрасываем — предлоги и «нефть» есть почти везде и только шумят.
+
+    Разные источники — условие, а не настройка: внутри одного издания повтор
+    заголовка это серийная сводка, и схлопывание таких пар уже уничтожало сотни
+    статей в июле.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            r"""
+            WITH t AS (
+              SELECT a.id, a.source_id, a.title, a.published_at,
+                     ARRAY(SELECT DISTINCT left(w, 6)
+                           FROM unnest(regexp_split_to_array(
+                                lower(regexp_replace(a.title, '[^[:alnum:][:space:]]', ' ', 'g')),
+                                '\s+')) w
+                           WHERE length(w) >= 5) AS toks
+              FROM articles a
+              LEFT JOIN article_reprints r ON r.article_id = a.id
+              JOIN sources s ON s.id = a.source_id
+              LEFT JOIN article_cards c ON c.article_id = a.id
+              WHERE a.created_at > now() - make_interval(days => %(days)s)
+                AND length(a.title) > 25
+                AND r.article_id IS NULL
+                -- Только то, что реально видно в ленте. Замер 17.09 на 71 паре,
+                -- признанной дублем: 39 пар состояли ИЗ ДВУХ невидимых статей
+                -- (модель звали впустую), а в 6 главной копией становилась
+                -- невидимая — то есть пометка не схлопывала дубль, а убирала
+                -- новость из ленты совсем. Полезными были 21 пара из 71.
+                -- Условия те же, что в ленте (api.articles_feed) и в выпуске.
+                AND s.archived_at IS NULL
+                AND NOT a.pending_deletion
+                AND c.relevant IS NOT FALSE
+            )
+            SELECT x.id AS a_id, y.id AS b_id,
+                   x.title AS a_title, y.title AS b_title,
+                   round(
+                     cardinality(ARRAY(SELECT unnest(x.toks) INTERSECT SELECT unnest(y.toks)))::numeric
+                     / NULLIF(cardinality(ARRAY(SELECT unnest(x.toks) UNION SELECT unnest(y.toks))), 0),
+                   3) AS overlap
+            FROM t x
+            JOIN t y ON y.id > x.id
+                    AND y.source_id <> x.source_id
+                    AND (x.published_at IS NULL OR y.published_at IS NULL
+                         OR abs(EXTRACT(EPOCH FROM (x.published_at - y.published_at)))
+                            < %(apart)s * 86400)
+            WHERE cardinality(x.toks) >= 3 AND cardinality(y.toks) >= 3
+              AND cardinality(ARRAY(SELECT unnest(x.toks) INTERSECT SELECT unnest(y.toks)))::numeric
+                  / NULLIF(cardinality(ARRAY(SELECT unnest(x.toks) UNION SELECT unnest(y.toks))), 0)
+                  >= %(overlap)s
+              AND cardinality(ARRAY(SELECT unnest(x.toks) INTERSECT SELECT unnest(y.toks)))::numeric
+                  / NULLIF(cardinality(ARRAY(SELECT unnest(x.toks) UNION SELECT unnest(y.toks))), 0)
+                  <= %(max_overlap)s
+            -- Порядок намеренно НЕ по overlap. Замер 17.09 на живом корпусе: из 318
+            -- пар за 14 дней только 57 тривиальных (100%%), а полоса, ради которой
+            -- судья и заведён (35-49%% — случай заказчика от 08.09), самая большая:
+            -- 132 пары. При ORDER BY overlap DESC любой LIMIT отдавал модели ровно
+            -- верхушку, и спорные пары не доезжали до неё никогда. md5 по паре id
+            -- даёт порядок, не связанный с силой совпадения, и при этом устойчивый
+            -- между прогонами.
+            ORDER BY md5(x.id::text || ':' || y.id::text)
+            LIMIT %(limit)s
+            """,
+            {"days": days, "apart": max_days_apart, "overlap": min_overlap,
+             "max_overlap": max_overlap, "limit": limit},
+        )
+        return cur.fetchall()
+
+
+def resolve_reprint_root(conn, article_id: int, *, max_hops: int = 8) -> int:
+    """Корень группы перепечаток: главная копия, которая сама ничьей копией не является.
+
+    Пометки ставятся ПОПАРНО, и без разрешения до корня получалась бы цепочка
+    C→A→D: каждая пара выбирает главную независимо. С фильтром ленты, который
+    прячет всё, что значится копией, такая цепочка унесла бы из выборки ВСЮ группу
+    вместе с оригиналом. Ограничение по шагам — защита от кольца в уже накопленных
+    данных, а не теоретическая.
+    """
+    current = int(article_id)
+    for _ in range(max_hops):
+        row = conn.execute(
+            "SELECT primary_id FROM article_reprints WHERE article_id = %s", (current,)
+        ).fetchone()
+        if row is None:
+            return current
+        nxt = int(row[0])
+        if nxt == current:
+            return current
+        current = nxt
+    return current
+
+
+def article_visible_in_feed(conn, article_id: int) -> bool:
+    """Видна ли статья в ленте — теми же условиями, что и сама лента.
+
+    Заведено не ради стройности: перепечатки решает модель на внешнем воркере, а
+    её ответ это недоверенный вход. Пометка прячет копию, и если главной окажется
+    статья, которой в ленте нет (архивный источник, помечена на удаление, отбита
+    гейтом), то новость исчезнет целиком вместо схлопывания дубля.
+    """
+    row = conn.execute(
+        """
+        SELECT 1 FROM articles a
+        JOIN sources s ON s.id = a.source_id
+        LEFT JOIN article_cards c ON c.article_id = a.id
+        WHERE a.id = %s
+          AND s.archived_at IS NULL
+          AND NOT a.pending_deletion
+          AND c.relevant IS NOT FALSE
+        """,
+        (int(article_id),),
+    ).fetchone()
+    return row is not None
+
+
+def mark_article_reprint(*, article_id: int, primary_id: int, similarity: float | None,
+                         reason: str | None, decided_by: str = "ai",
+                         model: str | None = None) -> None:
+    """Пометить статью перепечаткой. Запись обратима: удаления нет намеренно."""
+    if int(article_id) == int(primary_id):
+        raise ValueError("статья не может быть перепечаткой самой себя")
+    with get_connection() as conn:
+        # Главной назначаем КОРЕНЬ группы, а не соседа по паре: иначе цепочка
+        # C→A→D спрячет из ленты и оригинал.
+        primary_id = resolve_reprint_root(conn, int(primary_id))
+        if int(article_id) == int(primary_id):
+            raise ValueError("статья уже является корнем своей группы перепечаток")
+        # Прятать копию можно только в пользу той, которую читатель увидит.
+        if not article_visible_in_feed(conn, primary_id):
+            raise ValueError(
+                f"главная копия {primary_id} не видна в ленте — пометка убрала бы новость целиком"
+            )
+        conn.execute(
+            """
+            INSERT INTO article_reprints (article_id, primary_id, similarity, reason, decided_by, model)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (article_id) DO UPDATE
+               SET primary_id = EXCLUDED.primary_id,
+                   similarity = EXCLUDED.similarity,
+                   reason = EXCLUDED.reason,
+                   decided_by = EXCLUDED.decided_by,
+                   model = EXCLUDED.model
+            """,
+            (int(article_id), int(primary_id), similarity, reason, decided_by, model),
+        )
+        conn.commit()
+
+
+def unmark_article_reprint(article_id: int) -> bool:
+    """Снять пометку перепечатки — статья возвращается в ленту и в выпуск.
+
+    Без этой операции «обратимо» было бы только на словах: пометка ставится ИИ, и
+    у человека должен быть способ её отменить, иначе ошибка модели становится
+    необратимой ровно так же, как удаление.
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM article_reprints WHERE article_id = %s RETURNING article_id",
+            (int(article_id),),
+        )
+        removed = cur.fetchone() is not None
+        conn.commit()
+    return removed
+
+
+def list_article_reprints(limit: int = 50) -> list[dict]:
+    """Помеченные перепечатки с объяснением — чтобы решение можно было проверить."""
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            """
+            SELECT r.article_id, r.primary_id, r.similarity, r.reason, r.decided_by,
+                   r.created_at, d.title AS duplicate_title, p.title AS primary_title,
+                   ds.name AS duplicate_source, ps.name AS primary_source
+            FROM article_reprints r
+            JOIN articles d ON d.id = r.article_id
+            JOIN articles p ON p.id = r.primary_id
+            JOIN sources ds ON ds.id = d.source_id
+            JOIN sources ps ON ps.id = p.source_id
+            ORDER BY r.created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def reprint_stats() -> dict:
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            "SELECT count(*) AS total, count(DISTINCT primary_id) AS groups FROM article_reprints"
+        )
+        return cur.fetchone() or {"total": 0, "groups": 0}
+
+
 def get_article(article_id: int) -> dict | None:
     with get_connection() as conn:
         cur = conn.cursor(row_factory=dict_row)
@@ -3918,26 +4262,14 @@ def get_articles_needing_summary(limit: int = 20) -> list[dict]:
         return cur.fetchall()
 
 
-def get_articles_needing_pipeline(limit: int = 20) -> list[dict]:
-    """Статьи, которым не хватает любого AI-этапа канонического pipeline.
-
-    Используется process/process-full/background/external enqueue. Старый выбор только по
-    ``summary IS NULL`` не поднимал статьи после частичного сбоя на тегировании/скоринге.
-    """
-    with get_connection() as conn:
-        cur = conn.cursor(row_factory=dict_row)
-        cur.execute(
-            """
-            SELECT a.*, c.summary, c.relevant, c.title_ru,
-                   at.id AS existing_tag_id, sc.id AS existing_score_id,
-                   s.name AS source_name, s.priority AS source_priority,
-                   s.category AS source_category
+_NEEDS_PIPELINE_FROM = """
             FROM articles a
             JOIN sources s ON s.id = a.source_id
             LEFT JOIN article_cards c ON c.article_id = a.id
             LEFT JOIN article_tags at ON at.article_id = a.id
             LEFT JOIN article_scores sc ON sc.article_id = a.id
-            WHERE c.relevant IS NULL
+            WHERE (
+                  c.relevant IS NULL
                OR (
                     c.relevant IS TRUE
                     AND (
@@ -3948,12 +4280,124 @@ def get_articles_needing_pipeline(limit: int = 20) -> list[dict]:
                     )
                )
                OR c.article_id IS NULL
+            )
+"""
+
+
+def get_articles_needing_pipeline(limit: int = 20) -> list[dict]:
+    """Статьи, которым не хватает любого AI-этапа канонического pipeline.
+
+    Используется process/process-full/background/external enqueue. Старый выбор только по
+    ``summary IS NULL`` не поднимал статьи после частичного сбоя на тегировании/скоринге.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute(
+            f"""
+            SELECT a.*, c.summary, c.relevant, c.title_ru,
+                   at.id AS existing_tag_id, sc.id AS existing_score_id,
+                   s.name AS source_name, s.priority AS source_priority,
+                   s.category AS source_category
+            {_NEEDS_PIPELINE_FROM}
             ORDER BY a.published_at DESC NULLS LAST, a.id DESC
             LIMIT %s
             """,
             (limit,),
         )
         return cur.fetchall()
+
+
+# Ключ advisory-lock: выбор статей для ИИ-пакета при выдаче идёт по одному.
+_PROCESS_RESERVE_LOCK = 7_290_921
+
+
+class ArticlesBusy(RuntimeError):
+    """Статьи явного списка сейчас в работе у другой задачи — выдачу надо отложить."""
+
+
+def reserve_process_articles(job_id: int, *, limit: int, article_ids: list[int] | None = None) -> list[int]:
+    """Статьи ИИ-пакета при выдаче — за вычетом тех, что уже в работе у других задач.
+
+    Пакет без article_ids выбирает «статьи без обработки» в момент выдачи; две ИИ-полосы
+    (поток дня и пересчёты) взяли бы одни и те же и оплатили бы их дважды — поэтому второй
+    ИИ-воркер 18.09 и не ставили. Выбор и запись резерва — в одной транзакции под
+    advisory-lock: параллельная выдача ждёт, а не читает резерв до записи.
+
+    Явный список не урезается: соседняя задача могла взять статью со СТАРЫМ текстом
+    (пересчёт ставят после перекачки тела), и выброшенная из пересчёта статья осталась бы
+    посчитанной по обрывку. Такой список — ArticlesBusy: выдачу откладывают, пока соседка
+    не закончит."""
+    with get_connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_PROCESS_RESERVE_LOCK,))
+        # Только настоящий массив: payload с "article_ids": null (так его пишет
+        # /api/jobs/process) — это jsonb null, а не SQL NULL, COALESCE его не пропускает,
+        # и выдача падала бы для всех ИИ-задач, пока такая задача выполняется.
+        busy_rows = conn.execute(
+            """
+            SELECT DISTINCT (jsonb_array_elements_text(CASE
+                       WHEN jsonb_typeof(payload_json->'reserved_article_ids') = 'array'
+                           THEN payload_json->'reserved_article_ids'
+                       WHEN jsonb_typeof(payload_json->'article_ids') = 'array'
+                           THEN payload_json->'article_ids'
+                       ELSE '[]'::jsonb
+                   END))::bigint
+            FROM background_jobs
+            WHERE kind = 'process_articles'
+              AND status IN ('running', 'finalizing')
+              AND id <> %s
+            """,
+            (job_id,),
+        ).fetchall()
+        busy = [int(row[0]) for row in busy_rows]
+        if article_ids:
+            overlap = sorted(set(int(item) for item in article_ids) & set(busy))
+            if overlap:
+                raise ArticlesBusy(f"статьи {overlap[:10]} сейчас в работе у другой задачи")
+            chosen = [int(item) for item in article_ids]
+        else:
+            chosen = [
+                int(row[0])
+                for row in conn.execute(
+                    f"""
+                    SELECT a.id
+                    {_NEEDS_PIPELINE_FROM}
+                      AND a.id <> ALL(%s::bigint[])
+                    ORDER BY a.published_at DESC NULLS LAST, a.id DESC
+                    LIMIT %s
+                    """,
+                    (busy, limit),
+                ).fetchall()
+            ]
+        conn.execute(
+            """
+            UPDATE background_jobs
+            SET payload_json = payload_json || jsonb_build_object('reserved_article_ids', %s::jsonb)
+            WHERE id = %s
+            """,
+            (Json(chosen), job_id),
+        )
+        conn.commit()
+    return chosen
+
+
+def defer_claimed_background_job(job_id: int, *, seconds: int = 120) -> bool:
+    """Вернуть только что выданную задачу в очередь на потом, не тратя попытку."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE background_jobs
+            SET status = 'queued',
+                attempts = GREATEST(attempts - 1, 0),
+                run_after = now() + (%s::text || ' seconds')::interval,
+                claimed_by = NULL,
+                lease_token_hash = NULL,
+                lease_expires_at = NULL
+            WHERE id = %s AND status = 'running'
+            """,
+            (seconds, job_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1
 
 
 def get_articles_needing_relevance(limit: int = 20) -> list[dict]:
@@ -4847,6 +5291,10 @@ def digest_candidates(month: str | None = None, limit: int = 20, min_score: floa
             LEFT JOIN tags parent ON parent.id = t.parent_id
             WHERE uas.status = 'digest'
               AND s.archived_at IS NULL          -- архивный источник не попадает и в выпуск
+              -- Перепечатка в выпуск не идёт: в дайджесте нужна одна копия новости,
+              -- и это ровно то, что заказчик делает руками («одну заберу в дайджест,
+              -- вторую отмечу как дубликат», 22.08).
+              AND NOT EXISTS (SELECT 1 FROM article_reprints ar WHERE ar.article_id = a.id)
               AND c.relevant IS NOT FALSE
               AND (a.published_at IS NULL OR a.published_at <= now() + interval '2 days')
               AND COALESCE(sc.total_score, 0) >= %(min_score)s

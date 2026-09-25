@@ -155,7 +155,7 @@ def channel_from_url(raw_url: str) -> str | None:
 def extract_posts(content: bytes | str, limit: int = 20) -> list[TelegramPost]:
     try:
         doc = html.fromstring(content)
-    except (ValueError, TypeError, etree.ParserError):
+    except (ValueError, TypeError, etree.ParserError):  # пустое тело — «Document is empty»
         return []
 
     posts: list[TelegramPost] = []

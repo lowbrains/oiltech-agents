@@ -1666,6 +1666,9 @@ def test_scrape_source_endpoint_rejects_non_scraper_strategy(monkeypatch):
 
 
 def test_auth_register_login_me_and_logout(monkeypatch):
+    # Самостоятельная регистрация по умолчанию закрыта (#33) — здесь включаем её
+    # явно, чтобы проверять сам сценарий, а не запрет.
+    monkeypatch.setattr(api.config, "AUTH_ALLOW_SELF_REGISTRATION", True)
     app = api.app
     sessions = {}
     users = {"user@example.com": {"id": 1, "email": "user@example.com"}}
@@ -1698,6 +1701,11 @@ def test_auth_rejects_invalid_payloads_and_missing_session(monkeypatch):
     client = TestClient(api.app)
 
     assert client.get("/api/auth/me").status_code == 401
+
+    # Закрытая регистрация отвечает 403 ДО валидации полей: путь существует, но выключен.
+    assert client.post("/api/auth/register", json={"email": "bad", "password": "12345678"}).status_code == 403
+
+    monkeypatch.setattr(api.config, "AUTH_ALLOW_SELF_REGISTRATION", True)
     assert client.post("/api/auth/register", json={"email": "bad", "password": "12345678"}).status_code == 400
     assert client.post("/api/auth/register", json={"email": "user@example.com", "password": "1234567"}).status_code == 400
 
@@ -2039,10 +2047,12 @@ def test_external_worker_claim_requires_token(monkeypatch):
 def test_external_worker_claim_returns_leased_job(monkeypatch):
     monkeypatch.setattr(api.config, "EXTERNAL_WORKER_TOKEN_HASH", api._sha256_hex("secret"))
     monkeypatch.setattr(api.repository, "requeue_expired_external_leases", lambda: 0)
+    built_for = []
     monkeypatch.setattr(
         api.external_ai,
         "build_process_articles_payload",
-        lambda payload: {"kind": "process_articles", "articles": [{"id": 1}], "tags": [], "criteria": []},
+        lambda payload, job_id=None: built_for.append(job_id)
+        or {"kind": "process_articles", "articles": [{"id": 1}], "tags": [], "criteria": []},
     )
     captured = {}
 
@@ -2085,6 +2095,7 @@ def test_external_worker_claim_returns_leased_job(monkeypatch):
     assert response.json()["job"]["queue"] == "external-ai"
     assert response.json()["job"]["payload"]["articles"] == [{"id": 1}]
     assert response.json()["job"]["lease_token"]
+    assert built_for == [10]  # статьи резервируются за выданной задачей
 
 
 def test_external_worker_claim_hydrates_external_scrape_payload(monkeypatch):
@@ -2143,7 +2154,7 @@ def test_external_worker_claim_hydrates_source_candidate_evaluation_payload(monk
         lambda **kwargs: {
             "id": 12,
             "kind": "source_candidate_evaluate",
-            "queue_name": "external-ai",
+            "queue_name": "external-agents",
             "execution_region": "external",
             "capability": "openai",
             "status": "running",
@@ -2164,7 +2175,7 @@ def test_external_worker_claim_hydrates_source_candidate_evaluation_payload(monk
     response = client.post(
         "/api/external-worker/claim",
         headers={"Authorization": "Bearer secret"},
-        json={"worker_id": "eu-1", "queues": ["external-ai"], "capabilities": ["openai"]},
+        json={"worker_id": "nl-agents-1", "queues": ["external-agents"], "capabilities": ["openai"]},
     )
 
     assert response.status_code == 200
@@ -2783,7 +2794,7 @@ def test_external_worker_claim_hydrates_signal_discovery_payload(monkeypatch):
         api.repository,
         "claim_external_background_job",
         lambda **kwargs: {
-            "id": 13, "kind": "signal_discovery", "queue_name": "external-ai", "execution_region": "external",
+            "id": 13, "kind": "signal_discovery", "queue_name": "external-agents", "execution_region": "external",
             "capability": "openai", "status": "running", "progress": 10, "attempts": 1, "max_attempts": 1,
             "run_after": None, "payload_json": {"web_only": True}, "result_json": None, "error_message": None,
             "created_at": None, "started_at": None, "finished_at": None,
@@ -2794,7 +2805,7 @@ def test_external_worker_claim_hydrates_signal_discovery_payload(monkeypatch):
     response = client.post(
         "/api/external-worker/claim",
         headers={"Authorization": "Bearer secret"},
-        json={"worker_id": "eu-1", "queues": ["external-ai"], "capabilities": ["openai"]},
+        json={"worker_id": "nl-agents-1", "queues": ["external-agents"], "capabilities": ["openai"]},
     )
 
     assert response.status_code == 200
@@ -2837,3 +2848,12 @@ def test_external_worker_complete_applies_signal_discovery_and_keeps_only_summar
     assert applied == [(worker_result, {"job_id": 10})]
     # В задаче остаётся итог, а не мегабайты кандидатов.
     assert completed[0][1]["result"] == {"signal_discovery": True, "applied": {"signals": 2, "topics": []}}
+def test_self_registration_closed_by_default():
+    """Предусловие релиза #33: платформа выходит на корпоративный портал заказчика,
+    и /api/auth/register позволял любому завести себе учётку."""
+    client = TestClient(api.app)
+    response = client.post(
+        "/api/auth/register", json={"email": "stranger@example.com", "password": "12345678"}
+    )
+    assert response.status_code == 403
+    assert "администратор" in response.json()["detail"]

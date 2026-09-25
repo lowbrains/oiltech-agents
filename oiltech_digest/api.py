@@ -24,10 +24,10 @@ from oiltech_digest import auth, background_jobs, backlog, config
 from oiltech_digest.benchmarks import run_readiness_benchmark
 from oiltech_digest.config import REPO_ROOT
 from oiltech_digest.db.connection import get_connection
-from oiltech_digest.db import documents_repo, repository
+from oiltech_digest.db import analytics, documents_repo, repository
 from oiltech_digest.logging_utils import setup_logging
 from oiltech_digest.maintenance import maintenance_cleanup, maintenance_status
-from oiltech_digest import network_policy
+from oiltech_digest import lanes, network_policy
 from oiltech_digest.processing.pipeline import (
     make_client,
     process_pipeline_articles,
@@ -39,7 +39,7 @@ from oiltech_digest.documents import external as documents_external
 from oiltech_digest.documents import parsing as doc_parsing
 from oiltech_digest.documents.model import DocumentError
 from oiltech_digest.ingestion.manual_import import ManualImportError, import_article as import_manual_article
-from oiltech_digest.ingestion.source_diagnostics import diagnose_source
+from oiltech_digest.ingestion.source_diagnostics import diagnose_source, probe_strategies
 from oiltech_digest.processing.digest import (
     build_digest_content,
     get_digest_branding,
@@ -479,6 +479,11 @@ def auth_me(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
 
 @app.post("/api/auth/register")
 def auth_register(payload: AuthPayload, response: Response) -> dict[str, Any]:
+    if not config.AUTH_ALLOW_SELF_REGISTRATION:
+        # Самостоятельная регистрация закрыта (#33). Учётки заводит администратор:
+        # экран «Пользователи» или CLI create-user. 403, а не 404: путь существует,
+        # просто выключен, и честный код помогает разобраться при настройке.
+        raise HTTPException(status_code=403, detail="Регистрация закрыта, обратитесь к администратору")
     email = auth.normalize_email(payload.email)
     if not auth.validate_email(email):
         raise HTTPException(status_code=400, detail="Некорректный email")
@@ -667,6 +672,12 @@ def list_articles(
     # Именно этого не делало `enabled = FALSE`: сбор прекращался, а накопленный мусор
     # продолжал висеть в ленте у ВСЕХ пользователей — лента джойнит sources без условия.
     clauses.append("s.archived_at IS NULL")
+    # Перепечатка не показывается: в ленте остаётся одна главная копия группы.
+    # Без этого условия пометка была бы мёртвой записью — таблица заполняется, а
+    # заказчик по-прежнему видит четыре карточки одной новости, ровно как 08.09.
+    # Скрыта именно КОПИЯ: главная (primary_id) в таблице не значится и остаётся.
+    # Запись обратима — удаления нет, строку можно снять и статья вернётся.
+    clauses.append("NOT EXISTS (SELECT 1 FROM article_reprints ar WHERE ar.article_id = a.id)")
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     order_by = {
         "date_desc": "a.published_at DESC NULLS LAST, COALESCE(sc.total_score, 0) DESC, a.id DESC",
@@ -1272,19 +1283,28 @@ def approve_source_candidate(
 
 @app.post("/api/sources")
 def create_source(payload: SourceCreate, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-    # Пользователь вставляет просто ссылку на источник — система сама ищет RSS-ленту.
-    # Нашла → parse_strategy='rss' с найденным фидом; не нашла → 'request' (скрейп
-    # страницы новостей). RSS можно передать и явно (тогда discover пропускается).
+    # Пользователь вставляет просто ссылку — система пробует к ней КАЖДУЮ стратегию:
+    # RSS-ленту (и проверяет, что она не мёртвая), обычный запрос, браузер; если с
+    # РФ-ядра сайт закрыт — ставит сбор через зарубежный воркер. До 18.09 здесь был
+    # только поиск RSS, а без него — молча `request` по введённому адресу: так
+    # заводились источники, не давшие ни одной статьи никогда. RSS, переданный явно,
+    # берётся как есть.
     site_url = (payload.url or payload.rss_url or "").strip()
     rss_url = (payload.rss_url or "").strip()
-    parse_strategy = "rss"
+    parse_strategy, listing_url, network_region, enabled, probe = "rss", None, "auto", True, None
     if not rss_url and site_url:
-        from oiltech_digest.ingestion.rss_discovery import discover_feed
-        found = discover_feed(site_url)
-        if found:
-            rss_url = found
+        probe = probe_strategies(site_url)
+        chosen = probe.get("chosen")
+        if chosen:
+            parse_strategy = chosen["parse_strategy"]
+            rss_url = chosen.get("rss_url") or ""
+            listing_url = chosen.get("listing_url")
+            network_region = chosen.get("network_region") or "auto"
         else:
-            parse_strategy = "request"
+            # Сайт открылся, но статей не дала ни одна стратегия. Заводим выключенным:
+            # включённый он опрашивался бы вечно впустую. Настроить селектор и
+            # включить — руками, отчёт перебора в ответе.
+            parse_strategy, listing_url, enabled = "request", site_url, False
     source_id = repository.add_rss_source(
         name=payload.name,
         rss_url=rss_url,
@@ -1294,7 +1314,11 @@ def create_source(payload: SourceCreate, user: dict[str, Any] = Depends(require_
         update_frequency=payload.update_frequency,
         parse_strategy=parse_strategy,
     )
-    return {"ok": True, "id": source_id, "rss_url": rss_url or None, "parse_strategy": parse_strategy}
+    repository.set_source_collection(source_id, listing_url=listing_url, network_region=network_region,
+                                     enabled=enabled)
+    return {"ok": True, "id": source_id, "rss_url": rss_url or None, "parse_strategy": parse_strategy,
+            "listing_url": listing_url, "network_region": network_region, "enabled": enabled,
+            "probe": _clean(probe) if probe else None}
 
 
 @app.post("/api/articles/import")
@@ -1942,7 +1966,14 @@ def external_worker_claim(
     )
     if job is None:
         return {"job": None}
-    return {"job": {**_job_payload(job), "payload": _external_worker_payload(job), "lease_token": lease_token}}
+    try:
+        worker_payload = _external_worker_payload(job)
+    except repository.ArticlesBusy:
+        # Статьи явного списка держит соседняя задача: выдадим позже, когда она закончит,
+        # а не параллельно (иначе итог зависел бы от того, чей apply придёт последним).
+        repository.defer_claimed_background_job(int(job["id"]), seconds=120)
+        return {"job": None}
+    return {"job": {**_job_payload(job), "payload": worker_payload, "lease_token": lease_token}}
 
 
 @app.post("/api/external-worker/jobs/{job_id}/progress")
@@ -2022,6 +2053,10 @@ def external_worker_complete(
             result = {**documents_external.scrub_result(result), "applied": applied}
         if job.get("kind") == "scrape_source" and result.get("external_fetch"):
             result = {**result, "applied": external_fetch.apply_scrape_result(result)}
+        if job.get("kind") == "reprint_review" and result.get("reprint_review"):
+            result = {**result, "applied": external_ai.apply_reprint_review_result(result, job_id=job_id)}
+        if job.get("kind") == "refetch_text" and result.get("kind") == "refetch_text":
+            result = {**result, "applied": external_fetch.apply_refetch_text_result(result)}
         if job.get("kind") == "signal_discovery" and result.get("signal_discovery"):
             from oiltech_digest import signal_discovery
 
@@ -2081,6 +2116,19 @@ def monthly_stats(
             "activity_scope": "all",
         }
     )
+
+
+@app.get("/api/analytics/monthly")
+def analytics_monthly(
+    months: int = Query(6, ge=1, le=24),
+    user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """Месячная аналитика платформы: воронка, источники, темы, скорость, цели ГД.
+
+    Только администратору — решение владельца 19.09 («показываем только админам»):
+    в ответе стоимость ИИ, коммерческая сторона. Гейт на API, а не только во фронте
+    (аудит изоляции 24.07)."""
+    return _clean(analytics.monthly_analytics(months, include_cost=True))
 
 
 @app.get("/api/maintenance/status")
@@ -2413,25 +2461,36 @@ def _get_scoped_background_job(job_id: int, user: dict[str, Any]) -> dict[str, A
     return repository.get_background_job(job_id, user_id=int(user["id"]))
 
 
-def _external_worker_payload(row: dict[str, Any]) -> dict[str, Any]:
-    payload = dict(row.get("payload_json") or {})
-    if row.get("kind") == "process_articles" and row.get("queue_name") == "external-ai":
-        return _clean(external_ai.build_process_articles_payload(payload))
-    if row.get("kind") == "recheck_relevance" and row.get("queue_name") == "external-ai":
-        return _clean(external_ai.build_recheck_payload(payload))
-    if row.get("kind") == "translate_titles" and row.get("queue_name") == "external-ai":
-        return _clean(external_ai.build_translate_payload(payload))
-    if row.get("kind") == "source_candidate_evaluate" and row.get("queue_name") == "external-ai":
-        return _clean(external_ai.build_source_candidate_evaluate_payload(payload))
-    if row.get("kind") == "process_document" and row.get("queue_name") == "external-ai":
-        return _clean(documents_external.build_document_payload(payload))
-    if row.get("kind") == "scrape_source" and str(row.get("queue_name") or "").startswith("external-"):
-        return _clean(external_fetch.build_scrape_source_payload(int(payload["source_id"]), payload))
-    if row.get("kind") == "signal_discovery" and row.get("queue_name") == "external-ai":
-        from oiltech_digest import signal_discovery
+def _signal_discovery_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    from oiltech_digest import signal_discovery
 
-        return _clean(signal_discovery.build_external_payload(payload))
-    return _clean(payload)
+    return signal_discovery.build_external_payload(payload)
+
+
+_EXTERNAL_PAYLOAD_BUILDERS: dict[str, Any] = {
+    "process_articles": lambda payload, job_id: external_ai.build_process_articles_payload(payload, job_id=job_id),
+    "recheck_relevance": lambda payload, job_id: external_ai.build_recheck_payload(payload),
+    "translate_titles": lambda payload, job_id: external_ai.build_translate_payload(payload),
+    "process_document": lambda payload, job_id: documents_external.build_document_payload(payload),
+    "scrape_source": lambda payload, job_id: external_fetch.build_scrape_source_payload(int(payload["source_id"]), payload),
+    "reprint_review": lambda payload, job_id: external_ai.build_reprint_review_payload(payload),
+    "refetch_text": lambda payload, job_id: external_fetch.build_refetch_text_payload(payload),
+    # Агенты (полоса external-agents): снимок базы для радара, статьи кандидата для оценки.
+    "source_candidate_evaluate": lambda payload, job_id: external_ai.build_source_candidate_evaluate_payload(payload),
+    "signal_discovery": lambda payload, job_id: _signal_discovery_payload(payload),
+}
+
+
+def _external_worker_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Payload для воркера — по таблице полос (lanes.py), а не по имени очереди.
+
+    Раньше ИИ-виды собирались только при queue_name == "external-ai": задача той же
+    природы в новой полосе (external-ai-bulk) ушла бы воркеру сырым payload без статей."""
+    payload = dict(row.get("payload_json") or {})
+    builder = _EXTERNAL_PAYLOAD_BUILDERS.get(str(row.get("kind") or ""))
+    if builder is None or not lanes.serves(row.get("queue_name"), row.get("kind")):
+        return _clean(payload)
+    return _clean(builder(payload, int(row["id"])))
 
 
 def _score_items_by_article(conn, article_ids: list[int]) -> dict[int, list[dict[str, Any]]]:

@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from typing import Any
+
+import logging
 
 from oiltech_digest import config
 from oiltech_digest.db import repository
@@ -23,7 +26,11 @@ from oiltech_digest.processing.prompts import (
     TAGGING_INSTRUCTIONS,
     TRANSLATE_INSTRUCTIONS,
     TRANSLATE_SCHEMA,
+    tags_scope_block,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def make_client(offline: bool = False):
@@ -97,7 +104,7 @@ def process_relevance_articles(articles: list[dict], client) -> dict:
                 stats["processed"] += 1
                 stats["rejected"] += 1
                 continue
-            response = relevance_article(article, client)
+            response = relevance_article(article, client, tags=tags)
             relevant = bool(response.data.get("relevant"))
             repository.set_article_relevance(
                 article["id"], relevant, response.data.get("reason"), response.model
@@ -144,7 +151,7 @@ def recheck_relevance_articles(articles: list[dict], client, *, force: bool = Fa
             if blocked_reason:
                 relevant, reason, model = False, blocked_reason, "negative-keyword"
             else:
-                resp = relevance_article(article, client)
+                resp = relevance_article(article, client, tags=tags)
                 relevant = bool(resp.data.get("relevant"))
                 reason, model = resp.data.get("reason"), resp.model
                 _record_run(article, "relevance", client, resp)
@@ -268,7 +275,7 @@ def process_pipeline_articles(articles: list[dict], client, fetch_full: bool = T
             elif article.get("relevant") is False:
                 relevant = False
             else:
-                rel_resp = relevance_article(article, client)
+                rel_resp = relevance_article(article, client, tags=tags)
                 relevant = bool(rel_resp.data.get("relevant"))
                 repository.set_article_relevance(article["id"], relevant, rel_resp.data.get("reason"), rel_resp.model)
                 _record_run(article, "relevance", client, rel_resp)
@@ -338,7 +345,7 @@ def summarize_article(article: dict, client) -> AIResponse:
     )
 
 
-def relevance_article(article: dict, client) -> AIResponse:
+def relevance_article(article: dict, client, tags: list[dict] | None = None) -> AIResponse:
     # Гейт судит по СЫРОМУ тексту (title+source+text), БЕЗ AI-сути: суммаризатор
     # обязан притягивать любую статью к нефтегазу, и подача его сути на вход гейта
     # давала самосбывающуюся релевантность (мусор проходил). Модель/effort — отдельные,
@@ -346,7 +353,7 @@ def relevance_article(article: dict, client) -> AIResponse:
     try:
         return client.complete_json(
             RELEVANCE_INSTRUCTIONS,
-            _relevance_prompt(article),
+            _relevance_prompt(article, tags=tags),
             RELEVANCE_SCHEMA,
             max_output_tokens=2500,
             model=config.OPENAI_RELEVANCE_MODEL,
@@ -357,7 +364,7 @@ def relevance_article(article: dict, client) -> AIResponse:
             raise
         return client.complete_json(
             RELEVANCE_INSTRUCTIONS,
-            _relevance_prompt(article, text_limit=1500),
+            _relevance_prompt(article, tags=tags, text_limit=1500),
             RELEVANCE_SCHEMA,
             max_output_tokens=2500,
             model=config.OPENAI_RELEVANCE_MODEL,
@@ -556,19 +563,60 @@ def _article_prompt(article: dict) -> str:
     return f"{base}\n\n{glossary}" if glossary else base
 
 
-def _relevance_prompt(article: dict, *, text_limit: int = 6000) -> str:
+_TAGS_SCOPE_CACHE: dict[str, Any] = {"block": None, "at": 0.0}
+_TAGS_SCOPE_TTL_SECONDS = 300
+
+
+def _tags_scope() -> str:
+    """Блок тематик заказчика для гейта, с коротким кэшем.
+
+    Гейт зовётся на КАЖДОЙ статье, а справочник тегов меняется редко и руками, так
+    что ходить в базу каждый раз незачем. TTL короткий намеренно: заказчик правит
+    тематики на экране и ждёт, что новая выборка поедет по ним, а не после деплоя.
+    Сбой чтения не должен ронять гейт — тогда просто судим без тематик, как раньше.
+    """
+    now = time.monotonic()
+    cached = _TAGS_SCOPE_CACHE.get("block")
+    if cached is not None and now - float(_TAGS_SCOPE_CACHE.get("at") or 0) < _TAGS_SCOPE_TTL_SECONDS:
+        return cached
+    try:
+        block = tags_scope_block(repository.list_enabled_tags())
+    except Exception:  # noqa: BLE001 - тематики это подсказка, а не обязательный вход
+        logger.warning("не удалось прочитать тематики для гейта релевантности")
+        block = ""
+    _TAGS_SCOPE_CACHE["block"] = block
+    _TAGS_SCOPE_CACHE["at"] = now
+    return block
+
+
+def _relevance_prompt(article: dict, *, tags: list[dict] | None = None, text_limit: int = 6000) -> str:
     """Вход гейта релевантности — БЕЗ AI-сути (намеренно): только сырые поля статьи,
-    чтобы суждение шло по реальному содержанию, а не по подкрученной нефтегаз-сути."""
-    return "\n".join(
-        [
-            f"title: {article.get('title') or ''}",
-            f"source: {article.get('source_name') or ''}",
-            f"url: {article.get('url') or ''}",
-            f"language: {article.get('language') or 'unknown'}",
-            f"published_at: {article.get('published_at') or ''}",
-            f"text: {_compact(article.get('raw_text') or '', text_limit)}",
-        ]
-    )
+    чтобы суждение шло по реальному содержанию, а не по подкрученной нефтегаз-сути.
+
+    С 17.09 сюда добавлен блок тематик заказчика: до этого теги влияли только на
+    классификацию уже отобранного, и заказчик, расширяя их, не менял выборку вообще.
+    Блок идёт в пользовательскую часть, а не в инструкции, чтобы не ломать кэш
+    префикса: инструкции у всех статей одни и те же.
+    """
+    lines = [
+        f"title: {article.get('title') or ''}",
+        f"source: {article.get('source_name') or ''}",
+        f"url: {article.get('url') or ''}",
+        f"language: {article.get('language') or 'unknown'}",
+        f"published_at: {article.get('published_at') or ''}",
+        f"text: {_compact(article.get('raw_text') or '', text_limit)}",
+    ]
+    # Тематики берём из переданного списка, если он есть, и только иначе идём в базу.
+    # Это не оптимизация: на проде стадия исполняется на зарубежном воркере, у
+    # которого БАЗЫ НЕТ (docker-compose.external-worker.yml без DATABASE_URL).
+    # Там чтение падало бы в except и блок молча уезжал пустым — то есть тематики
+    # не влияли бы ни на что именно в боевом режиме. Теги в payload воркера уже
+    # кладутся для стадии тегирования (external_ai.build_process_articles_payload).
+    scope = tags_scope_block(tags) if tags else _tags_scope()
+    if scope:
+        lines.append("")
+        lines.append(scope)
+    return "\n".join(lines)
 
 
 def _title_prompt(article: dict) -> str:

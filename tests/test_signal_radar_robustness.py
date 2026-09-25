@@ -420,7 +420,7 @@ def test_enqueue_never_runs_external_queue_inline(monkeypatch, isolated_db):
     monkeypatch.setattr(background_jobs._executor, "submit", lambda *args, **kwargs: submitted.append(args))
     monkeypatch.setitem(background_jobs._HANDLERS, "test_queued", lambda payload, job_id: {"ok": True})
 
-    external = background_jobs.enqueue("test_queued", {}, queue_name="external-ai", execution_region="external")
+    external = background_jobs.enqueue("scrape_source", {"source_id": 1}, queue_name="external-fetch", execution_region="external")
     local = background_jobs.enqueue("test_queued", {}, queue_name="default")
 
     assert repository.get_background_job(int(external["id"]))["status"] == "queued"
@@ -443,7 +443,7 @@ def test_daily_radar_routed_abroad_is_not_executed_by_the_enqueuing_process(monk
     result = background_jobs.enqueue_daily_signal_discovery()
 
     assert result["enqueued"] is True
-    assert result["job"]["queue_name"] == "external-ai"
+    assert result["job"]["queue_name"] == "external-agents"
     assert submitted == []
 
 

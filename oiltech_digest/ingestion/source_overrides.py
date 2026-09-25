@@ -201,7 +201,10 @@ SOURCE_OVERRIDES: dict[str, dict] = {
     "Petronas": {"parse_strategy": "request",
                  "listing_url": "https://www.petronas.com/media/media-releases"},  # был rss.xml = НАГРАДЫ
     "Mubadala Energy": {"parse_strategy": "request",
-                        "listing_url": "https://mubadalaenergy.com/all-news/"},
+                        "listing_url": "https://mubadalaenergy.com/all-news/",
+                        # 18.09: без селектора свежие новости («Learn more»-карточки)
+                        # проигрывали по очкам отчётам 2022–2023; с ним 12 кандидатов, 10 с датой.
+                        "article_link_selector": 'a[href*="/news/"]'},
     # NB: rss_url НЕ прописывать — /feed/ отдаёт дефолтный WordPress с единственным
     # постом «Hello world!» от 2022; источник замолчал бы навсегда.
     "OPEC": {"parse_strategy": "playwright",
@@ -283,8 +286,53 @@ SOURCE_OVERRIDES: dict[str, dict] = {
     "АЦ ТЭК": {"parse_strategy": "telegram", "url": "https://t.me/actekactek"},
 
     # Группа 🟡 (Playwright рендерит, нужен правильный news-URL) — добавляем после проверки:
-    # "Weatherford": {"parse_strategy": "playwright", "listing_url": "..."},
     # "BCG Energy": {"parse_strategy": "playwright", "listing_url": "..."},
+
+    # ==== Обход 30 молчащих источников, 18.09 (docs/handoff_2026-09-18_obhod-istochnikov.md) ====
+    # Эти источники не «перестали работать» — они не работали никогда: у ЦДУ ТЭК все 16
+    # «статей» — декабрь 2024 и дубли, у Сургутнефтегаза — «Банковские реквизиты». Каждая
+    # настройка ниже проверена НОВЫМ кодом парсера на живой ленте с РФ-прода (§11.3).
+    "Томский политехнический университет": {
+        # Новости живут на поддомене news.tpu.ru, а источник смотрел на tpu.ru — ссылки на
+        # поддомен парсер отсекал как чужой хост. Проверка: 12 кандидатов, все с датой.
+        "parse_strategy": "request", "listing_url": "https://news.tpu.ru/news/"},
+    "Сколтех": {"parse_strategy": "request", "listing_url": "https://skoltech.ru/news",
+                "article_link_selector": 'a[href*="/news/"]'},  # 12 кандидатов, статья 5 тыс. знаков
+    "Белоруснефть": {
+        # Плитки li.list-entry, ссылка /ru/detail-pages/event/… БЕЗ текста — без селектора их
+        # резал фильтр мусора по слову event. curl не проходит устаревший TLS, парсер проходит.
+        "parse_strategy": "request", "listing_url": "https://www.belorusneft.by/ru/mediacenter/news/",
+        "article_link_selector": 'li.list-entry a[href*="/detail-pages/"]'},
+    "ТеДо": {"parse_strategy": "playwright", "listing_url": "https://tedo.ru/press-center",
+             "article_link_selector": 'a[href*="/press-center/news-"]'},  # 12 с датой, статья 9 тыс. знаков
+    "Минобрнауки РФ": {"parse_strategy": "rss",
+                       "rss_url": "https://minobrnauki.gov.ru/press-center/news/rss/"},  # 40 пунктов
+    "Б1": {
+        # Отдельного списка нет (/analytics/ = 404): карточки обзоров — на главной.
+        "parse_strategy": "request", "listing_url": "https://b1.ru",
+        "article_link_selector": 'a[href*="/analytics/"]'},
+    "Яков и Партнёры": {
+        # Самый профильный («Рынок нефтесервиса до 8,4 трлн к 2035»), но дат на сайте нет вовсе.
+        "parse_strategy": "request",
+        "listing_url": "https://yakovpartners.ru/publications/?industiry=energy-oil-gas",
+        "article_link_selector": 'a[href*="/publications/"]:not([href*="industiry"])'},
+    "CNOOC / 中国海油": {
+        # Браузер парсера с РФ проходит JS-заглушку (curl — нет): 10 кандидатов с датой.
+        # Маршрут — auto, а не external: ставится `set-source-region`, не здесь.
+        "parse_strategy": "playwright", "listing_url": "https://www.cnooc.com.cn/zxzx/gsxw/"},
+    # Ниже — западные сайты, которые с РФ закрыты: маршрут через NL задаётся по id
+    # (`set-source-region --region external`), здесь только стратегия и лента.
+    "Weatherford": {
+        "parse_strategy": "playwright",
+        "listing_url": "https://www.weatherford.com/investor-relations/investor-news-and-events/news/",
+        "article_link_selector": 'a[href*="news-article"]'},
+    "S&P Global Commodity Insights": {
+        # Бренд переименован в S&P Global Energy: старый адрес ведёт на лендинг.
+        "parse_strategy": "playwright", "url": "https://www.spglobal.com/energy",
+        "listing_url": "https://www.spglobal.com/energy/en/news-research/latest-news"},
+    "PetroChina / 中国石油股份": {
+        "parse_strategy": "playwright",
+        "listing_url": "https://www.petrochina.com.cn/petrochina/xwxx/xwgg_list.shtml"},
 }
 
 

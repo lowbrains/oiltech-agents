@@ -122,6 +122,14 @@ const maintenanceStatus = {
         last_heartbeat_at: "2026-06-07T06:05:00Z",
       },
     ],
+    alerts: [
+      {
+        queue: "external-fetch",
+        kind: "no_consumer",
+        count: 208,
+        message: "Очередь external-fetch: 208 задач ждут, а воркер не появлялся ни разу — нет живого потребителя",
+      },
+    ],
   },
 };
 
@@ -512,9 +520,9 @@ describe("App smoke", () => {
 
     expect(await screen.findByRole("heading", { name: "Вход в админ-панель" })).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Зарегистрироваться" }));
-    expect(screen.getByRole("heading", { name: "Регистрация" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Войти" }));
+    // Самостоятельной регистрации нет с 17.09: доступ выдаёт администратор.
+    expect(screen.queryByRole("button", { name: "Зарегистрироваться" })).not.toBeInTheDocument();
+    expect(screen.getByText(/Обратитесь к администратору/)).toBeInTheDocument();
 
     await user.type(screen.getByPlaceholderText("you@example.com"), "user@example.com");
     await user.type(screen.getByPlaceholderText("Не короче 8 символов"), "12345678");
@@ -574,6 +582,8 @@ describe("App smoke", () => {
     expect(screen.getByText("Истекшие сессии")).toBeInTheDocument();
     expect(screen.getByText("Фоновые задачи к очистке")).toBeInTheDocument();
     expect(screen.getByText("Внешний контур")).toBeInTheDocument();
+    // Сторож полос: тревога видна на экране, а не только в логе планировщика.
+    expect(screen.getByRole("alert")).toHaveTextContent("208 задач ждут");
     expect(screen.getByText("external-ai")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Обслуживание сервиса" })).not.toBeInTheDocument();
 

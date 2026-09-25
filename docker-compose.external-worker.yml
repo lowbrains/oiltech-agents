@@ -1,17 +1,93 @@
+# Зарубежный контур (NL): полосы по назначению, каждая — свой контейнер (lanes.py).
+#
+# До 18.09 один контейнер слушал все очереди и брал задачи по одной, строго по времени
+# создания: 30 пакетов ИИ-пересчёта держали за собой 42 задачи сбора. 18.09 ИИ и сбор
+# разошлись по двум контейнерам, но внутри полос осталась та же беда: 18.09 28 пакетов
+# пересчёта держали поток дня 4,5 ч, а браузерный сайт держит за собой RSS/HTTP.
+# Выдача задач идёт через FOR UPDATE SKIP LOCKED, поэтому одну задачу два воркера (и
+# два потока) не получат никогда; статьи ИИ-пакета резервируются за задачей при выдаче
+# (repository.reserve_process_articles) — две ИИ-полосы не оплатят одни статьи дважды.
+#
+# Аренду задачи каждый воркер продлевает фоном сам (external_worker.LeaseKeeper), а по
+# потолку времени задачи процесс выходит — restart: unless-stopped поднимает его заново.
+#
+# Память (1,9 ГБ): ИИ-воркеры ждут сеть, Chromium живёт только в полосе браузера.
+# Перед первым `up` проверить `free -m` и `docker stats --no-stream`.
 services:
+  # ИИ — поток дня: пакеты планировщика, перепечатки, документы пользователей.
   external-worker:
     build: .
-    # Уникальное имя: на NL-сервере рядом живёт воркер MVP-1 с именем
-    # oiltech_external_worker. С одинаковыми именами второй не поднялся бы, а
-    # пересоздание «не в той папке» погасило бы воркер заказчика.
-    container_name: oiltech_agents_external_worker
+    container_name: oiltech_external_worker
     restart: unless-stopped
     env_file:
       - .env.external-worker
     environment:
       PYTHONUNBUFFERED: "1"
-      # Агентам сейчас нужен только радар (ИИ): сбор источников ведёт MVP-1, и воркер
-      # агентов с очередями fetch/playwright забирал бы хвосты сбора из дампа MVP-1.
-      EXTERNAL_WORKER_QUEUES: ${EXTERNAL_WORKER_QUEUES:-external-ai}
-      EXTERNAL_WORKER_CAPABILITIES: ${EXTERNAL_WORKER_CAPABILITIES:-openai}
+      EXTERNAL_WORKER_ID: nl-ai-1
+      EXTERNAL_WORKER_QUEUES: external-ai
+      EXTERNAL_WORKER_CAPABILITIES: openai
+    command: ["python", "-m", "oiltech_digest.cli", "-v", "external-worker"]
+
+  # ИИ — пересчёты корпуса (перекачка тел, перепроверка релевантности, перевод):
+  # долгие пачки не стоят перед потоком дня. На ядре включается AI_BULK_LANE_ENABLED=1
+  # только после того, как этот контейнер поднят.
+  external-worker-bulk:
+    build: .
+    container_name: oiltech_external_worker_bulk
+    restart: unless-stopped
+    env_file:
+      - .env.external-worker
+    environment:
+      PYTHONUNBUFFERED: "1"
+      EXTERNAL_WORKER_ID: nl-ai-bulk-1
+      EXTERNAL_WORKER_QUEUES: external-ai-bulk
+      EXTERNAL_WORKER_CAPABILITIES: openai
+    command: ["python", "-m", "oiltech_digest.cli", "-v", "external-worker"]
+
+  # Сбор запросом: RSS, листинги, статьи, дозагрузка тел. I/O — три потока.
+  external-worker-fetch:
+    build: .
+    container_name: oiltech_external_worker_fetch
+    restart: unless-stopped
+    env_file:
+      - .env.external-worker
+    environment:
+      PYTHONUNBUFFERED: "1"
+      EXTERNAL_WORKER_ID: nl-fetch-1
+      EXTERNAL_WORKER_QUEUES: external-fetch
+      EXTERNAL_WORKER_CAPABILITIES: http_fetch
+      EXTERNAL_WORKER_CONCURRENCY: "3"
+    command: ["python", "-m", "oiltech_digest.cli", "-v", "external-worker"]
+
+  # Сбор браузером: один поток — Chromium тяжёлый, а зависший сайт больше не держит
+  # за собой RSS/HTTP-полосу.
+  external-worker-browser:
+    build: .
+    container_name: oiltech_external_worker_browser
+    restart: unless-stopped
+    env_file:
+      - .env.external-worker
+    environment:
+      PYTHONUNBUFFERED: "1"
+      EXTERNAL_WORKER_ID: nl-browser-1
+      EXTERNAL_WORKER_QUEUES: external-playwright
+      EXTERNAL_WORKER_CAPABILITIES: playwright
+    command: ["python", "-m", "oiltech_digest.cli", "-v", "external-worker"]
+
+  # Агенты — радар сигналов и оценка кандидатов агента источников (ADR 0001). Прогон
+  # радара — до 17 мин (медиана 4): в общей полосе с потоком дня пакет статей ждал бы
+  # его, а радар — пакеты. Поиск радара — Brave: ключ BRAVE_SEARCH_API_KEY обязан быть
+  # в .env.external-worker, иначе поиск вернёт ноль и радар молча ничего не найдёт.
+  external-worker-agents:
+    build: .
+    container_name: oiltech_external_worker_agents
+    restart: unless-stopped
+    env_file:
+      - .env.external-worker
+    environment:
+      PYTHONUNBUFFERED: "1"
+      EXTERNAL_WORKER_ID: nl-agents-1
+      EXTERNAL_WORKER_QUEUES: external-agents
+      EXTERNAL_WORKER_CAPABILITIES: openai
+      SOURCE_DISCOVERY_SEARCH_PROVIDER: brave
     command: ["python", "-m", "oiltech_digest.cli", "-v", "external-worker"]

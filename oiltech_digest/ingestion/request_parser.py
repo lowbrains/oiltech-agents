@@ -9,12 +9,22 @@ import logging
 import re
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 
-from dateutil import parser as dateparser
-from lxml import etree, html
 
 from oiltech_digest.config import MIN_ARTICLE_TEXT_CHARS, REQUEST_ARTICLE_LIMIT
 from oiltech_digest.db import repository
-from oiltech_digest.ingestion import normalize
+from oiltech_digest.ingestion import dates, normalize
+from oiltech_digest.ingestion.dates import guess_date_text as _guess_date_from_text
+from oiltech_digest.ingestion.dates import parse_datetime as _parse_datetime
+from oiltech_digest.ingestion.listing_cards import (
+    GENERIC_LINK_TEXT_RE as _GENERIC_LINK_TEXT_RE,
+    card_of as _card_of,
+    fallback_title as _fallback_title,
+    ordered as _ordered,
+    safe_text_content as _safe_text_content,
+    same_site as _same_site,
+    spaced_text as _spaced_text,
+)
+from oiltech_digest.ingestion.listing_cards import link_key as _link_key
 from oiltech_digest.ingestion.article_fetcher import extract_main_text
 from oiltech_digest.ingestion.http_client import fetch
 from oiltech_digest.ingestion.relevance_filter import should_keep_article
@@ -33,14 +43,6 @@ _BAD_LINK_RE = re.compile(
 )
 _MEDIA_LINK_EXT_RE = re.compile(r"\.(?:avif|gif|jpe?g|png|svg|webp|bmp|ico|pdf|zip|rar|7z|mp4|mov|webm|mp3|wav)$", re.I)
 _DATE_HINT_RE = re.compile(r"/20\d{2}/\d{1,2}/\d{1,2}/")
-_DATE_TEXT_RE = re.compile(r"\b(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\b")
-# Форма даты внутри более длинной строки: ISO, «19 August 2026», «August 25, 2026».
-# Используется только как запасной путь в _parse_datetime — см. комментарий там.
-_DATE_IN_TEXT_RE = re.compile(
-    r"\b\d{4}-\d{2}-\d{2}\b"
-    r"|\b\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{4}\b"
-    r"|\b[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}\b"
-)
 
 
 @dataclass(frozen=True)
@@ -111,7 +113,11 @@ def insert_candidates(
             skipped_old += 1
             continue
 
-        article = article_fetcher(candidate, source)
+        try:
+            article = article_fetcher(candidate, source)
+        except Exception as exc:  # noqa: BLE001 - одна статья не роняет весь источник
+            logger.warning("request_parser: статья %s пропущена: %s: %s", candidate.url, type(exc).__name__, exc)
+            continue
         if article is None:
             continue
         if cutoff is not None and article.get("published_at") and article["published_at"] < cutoff:
@@ -156,27 +162,31 @@ def extract_candidate_links(source: dict | str, listing_url: str | bytes, conten
         return []
 
     try:
-        doc = html.fromstring(body)
-    except (ValueError, TypeError, etree.ParserError):
+        doc = normalize.parse_html(body)
+    except (ValueError, TypeError):
         return []
 
+    # <base href> — адрес, от которого страница велит разрешать относительные ссылки.
+    # Его же браузер парсера вписывает после переадресации (with_base_href).
+    base_href = doc.xpath("string(//base/@href)").strip()
+    if base_href:
+        home_url = urljoin(home_url, base_href)
     explicit = _extract_candidates_with_selector(doc, home_url, source_dict)
     if explicit:
         return explicit[:limit]
 
     base_host = (urlsplit(home_url).netloc or "").lower()
     seen: set[str] = set()
-    candidates: list[CandidateLink] = []
+    candidates: list[tuple[int, CandidateLink]] = []
 
-    for node in doc.xpath("//a[@href]"):
+    for index, node in enumerate(doc.xpath("//a[@href]")):
         item = _build_candidate_from_anchor(home_url, base_host, node)
         if item is None or item.url in seen:
             continue
         seen.add(item.url)
-        candidates.append(item)
+        candidates.append((index, item))
 
-    candidates.sort(key=lambda item: (-item.score, item.published_at is None, item.published_at or datetime.min.replace(tzinfo=timezone.utc), item.url))
-    return candidates[:limit]
+    return _ordered(candidates, trust_page_order=False)[:limit]
 
 
 def fetch_article_candidate(candidate: CandidateLink, source: dict) -> dict | None:
@@ -200,12 +210,9 @@ def fetch_article_candidate(candidate: CandidateLink, source: dict) -> dict | No
 
 
 def parse_article_page(content: bytes | str, fallback_title: str = "") -> tuple[str, datetime | None, str]:
-    # Пустое тело при 200 (или одни пробелы/комментарий) lxml встречает ParserError
-    # «Document is empty» — это НЕ ValueError. Без него одна пустая страница роняла
-    # весь прогон радара (докачка полного текста, 21.09), а сбор — весь источник.
     try:
-        doc = html.fromstring(content)
-    except (ValueError, TypeError, etree.ParserError):
+        doc = normalize.parse_html(content)
+    except (ValueError, TypeError):
         return fallback_title, None, ""
 
     title = _first_non_empty(
@@ -218,6 +225,11 @@ def parse_article_page(content: bytes | str, fallback_title: str = "") -> tuple[
         # Склейка ломала и дедуп: content_hash считается по заголовку, поэтому одна
         # публикация с лидом и без лида давала разные хэши.
         _text_with_separators(doc, "//h1[1]"),
+        # Заголовок карточки ленты — раньше <title> страницы. У CNOOC нет ни og:title, ни
+        # <h1>, а <title> — название раздела: 18.09 все 7 собранных новостей получили
+        # один заголовок «中国海洋石油集团有限公司 公司新闻». Короткая подпись карточки
+        # («Подробнее») заголовком не считается.
+        fallback_title if len(normalize.clean_html(fallback_title or "")) >= 12 else "",
         doc.xpath("string(//title)"),
         fallback_title,
     )
@@ -230,12 +242,29 @@ def parse_article_page(content: bytes | str, fallback_title: str = "") -> tuple[
             doc.xpath("string(//time[1]/@datetime)"),
             _guess_date_from_text(doc.xpath("string(//time[1])")),
         )
-    )
+    ) or dates.date_from_markup(doc)
 
-    raw_text = extract_main_text(content)
+    raw_text = extract_main_text(content, title=title)
     if len(raw_text) < MIN_ARTICLE_TEXT_CHARS:
-        raw_text = normalize.clean_html(doc.text_content())
+        raw_text = _visible_text(doc)
     return title, published_at, raw_text
+
+
+# Запасной текст страницы длиннее этого — уже не статья, а вся страница целиком.
+_FALLBACK_TEXT_LIMIT = 20000
+
+
+def _visible_text(doc) -> str:
+    """Текст страницы без скриптов и стилей — запасной путь, когда статья не выделилась.
+
+    `text_content()` забирает и содержимое `<script>`: у ТеДо в «текст статьи» ложилось
+    132 тыс. знаков JSON, у Kuwait Oil — 444 тыс. На проде 18.09 — 42 статьи длиннее
+    50 тыс. знаков, 36 из них со скриптами, самая большая 768 тыс. Модель читает
+    первые 6000 знаков — то есть судила бы JavaScript вместо новости.
+    """
+    for node in doc.xpath("//script|//style|//noscript|//template|//svg"):
+        node.drop_tree()
+    return normalize.clean_html(" ".join(doc.itertext()))[:_FALLBACK_TEXT_LIMIT]
 
 
 def _extract_candidates_with_selector(doc, listing_url: str, source: dict) -> list[CandidateLink]:
@@ -257,21 +286,23 @@ def _extract_candidates_with_selector(doc, listing_url: str, source: dict) -> li
         nodes = [doc]
 
     seen: set[str] = set()
-    candidates: list[CandidateLink] = []
+    candidates: list[tuple[int, CandidateLink]] = []
     for node in nodes:
         link_nodes = _nodes_by_selector(node, link_selector) if link_selector else node.xpath(".//a[@href]")
         for link in link_nodes:
-            item = _build_candidate_from_anchor(listing_url, base_host, link)
+            item = _build_candidate_from_anchor(listing_url, base_host, link, trusted=bool(link_selector))
             if item is None or item.url in seen:
                 continue
             published_at = item.published_at
             if date_selector:
                 date_nodes = _nodes_by_selector(node, date_selector)
-                published_at = _parse_datetime(_first_non_empty(*[_node_text(n) for n in date_nodes])) or published_at
+                date_text = _first_non_empty(*[_node_text(n) for n in date_nodes])
+                published_at = (_parse_datetime(date_text) or dates.date_from_text(date_text)
+                                or published_at)
             seen.add(item.url)
-            candidates.append(CandidateLink(item.url, item.title, item.score + 2, published_at))
-    candidates.sort(key=lambda item: (-item.score, item.url))
-    return candidates
+            candidates.append((len(candidates), CandidateLink(item.url, item.title, item.score + 2, published_at)))
+    # Селектор задан человеком под эту ленту — её порядок и есть порядок свежести.
+    return _ordered(candidates, trust_page_order=True)
 
 
 _TRACKING_PARAMS = {
@@ -292,15 +323,22 @@ def _clean_query(query: str) -> str:
     return urlencode(kept)
 
 
-def _build_candidate_from_anchor(home_url: str, base_host: str, node) -> CandidateLink | None:
+def _build_candidate_from_anchor(home_url: str, base_host: str, node,
+                                 trusted: bool = False) -> CandidateLink | None:
+    """`trusted` — ссылку выбрал селектор, заданный человеком под эту ленту. Тогда
+    общие эвристики «мусорности» её не отбрасывают: у Белоруснефти новости лежат по
+    адресам `/detail-pages/event/…`, и фильтр против календарей мероприятий
+    (слово `event`) резал всю ленту даже при правильном селекторе."""
     href = (node.get("href") or "").strip()
-    if not href or _BAD_LINK_RE.search(href):
+    if not href or href.startswith(("#", "javascript:", "mailto:")):
+        return None
+    if not trusted and _BAD_LINK_RE.search(href):
         return None
     url = urljoin(home_url, href)
     parts = urlsplit(url)
     if parts.scheme not in {"http", "https"}:
         return None
-    if (parts.netloc or "").lower() != base_host:
+    if not _same_site(parts.netloc, base_host):
         return None
     if _MEDIA_LINK_EXT_RE.search(parts.path or ""):
         return None
@@ -326,22 +364,43 @@ def _build_candidate_from_anchor(home_url: str, base_host: str, node) -> Candida
     # Главная/раздел без статейного таргета (нет ни пути, ни query) — не статья.
     if not path.rstrip("/") and not query:
         return None
+    # Ссылка на саму ленту («Новости» в меню, «перейти к содержимому») — не статья.
+    if not query and _link_key(clean_url) == _link_key(home_url):
+        return None
     title = normalize.clean_html(_safe_text_content(node))
+    card = None
+    if len(title) < 18 or _GENERIC_LINK_TEXT_RE.match(title):
+        # Ссылка-картинка или «Подробнее»: заголовок — рядом, в карточке. Раньше такие
+        # ссылки отбрасывались (текст < 18), и у Белоруснефти, Б1, «Яков и Партнёры»
+        # лента не давала ни одного кандидата; а «View Press Release» (ровно 18 знаков)
+        # у Weatherford прошёл бы заголовком статьи.
+        card = _card_of(node, home_url, clean_url)
+        title = _fallback_title(node, card)
     if len(title) < 18:
         return None
+    parent_text = _node_text(node.getparent()) if node.getparent() is not None else ""
     published_at = _parse_datetime(
         _first_non_empty(
             node.get("datetime"),
             node.get("content"),
             node.get("data-date"),
-            _guess_date_from_text(_node_text(node.getparent()) if node.getparent() is not None else ""),
+            _guess_date_from_text(parent_text),
         )
     )
+    if published_at is None:
+        # Дата из текста карточки — только из карточки ЭТОЙ статьи, а не из общего
+        # списка: иначе ссылка получит дату соседа.
+        if card is None:
+            card = _card_of(node, home_url, clean_url)
+        published_at = (dates.date_from_text(_spaced_text(card)) if card is not None else None) \
+            or dates.date_from_text(_spaced_text(node)) or dates.date_from_url(clean_url)
     score = _score_candidate(parts.path, title)
     if published_at is not None:
         score += 2
     if score <= 0:
-        return None
+        if not trusted:
+            return None
+        score = 1
     return CandidateLink(clean_url, title[:500], score, published_at)
 
 
@@ -361,13 +420,6 @@ def _score_candidate(path: str, title: str) -> int:
     if _BAD_LINK_RE.search(path_lower):
         score -= 5
     return score
-
-
-def _safe_text_content(node) -> str:
-    try:
-        return node.text_content()
-    except UnicodeDecodeError:
-        return ""
 
 
 def _nodes_by_selector(node, selector: str | None) -> list:
@@ -414,46 +466,6 @@ def _first_non_empty(*values: str) -> str:
         if value and str(value).strip():
             return str(value).strip()
     return ""
-
-
-def _guess_date_from_text(raw: str) -> str:
-    if not raw:
-        return ""
-    match = _DATE_TEXT_RE.search(raw)
-    return match.group(1) if match else ""
-
-
-def _try_parse_datetime(raw: str) -> datetime | None:
-    try:
-        return dateparser.parse(raw)
-    except (ValueError, TypeError, OverflowError):
-        return None
-
-
-def _parse_datetime(raw: str) -> datetime | None:
-    if not raw:
-        return None
-    parsed = _try_parse_datetime(raw)
-    if parsed is None:
-        # В карточке листинга дата почти никогда не лежит одна: рядом автор и название
-        # издания («August 25, 2026 • JPT Staff • Journal of Petroleum Technology»).
-        # Строгий разбор на такой строке падает, и источник годами идёт с пустым
-        # published_at — ровно это было у JPT.
-        #
-        # dateparser.parse(fuzzy=True) сюда НЕ годится, проверено на реальных строках:
-        # он выдумывает дату там, где её нет — «Section 5 of 12» превращалось в
-        # 2026-05-12, а «Halliburton 2026 Q3 results webcast» в 2026-03-25. Поэтому
-        # сначала вырезаем ФОРМУ даты, и разбираем только её.
-        match = _DATE_IN_TEXT_RE.search(raw)
-        if match:
-            parsed = _try_parse_datetime(match.group(0))
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    if normalize.is_future_date(parsed):
-        return None  # дата-анонс из будущего (календарь событий) — не дата публикации
-    return parsed
 
 
 def _listing_hash(candidates: list[CandidateLink]) -> str | None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 import feedparser
@@ -108,17 +109,12 @@ def diagnose_playwright_source(source: dict, limit: int = 5) -> dict:
     if not playwright_parser.is_available():
         return {**base, "verdict": "playwright_unavailable", "candidates": []}
 
-    content = playwright_parser.fetch_rendered(listing_url)
-    listing_probe = {
-        "url": listing_url,
-        "status": "rendered" if content is not None else "ERR",
-        "bytes": len(content or b""),
-    }
-    payload = {**base, "listing_probe": listing_probe}
-    if content is None:
-        return {**payload, "verdict": "listing_render_failed", "candidates": []}
-
-    candidates = request_parser.extract_candidate_links(source, listing_url, content, limit=limit)
+    # Та же функция, что у парсера: с парой попыток. Прежде диагностика рендерила один
+    # раз с ожиданием по умолчанию и видела сайт иначе, чем сбор.
+    candidates = playwright_parser.render_listing_candidates(source, listing_url, limit=limit)
+    payload = {**base, "listing_probe": {"url": listing_url, "status": "rendered" if candidates else "ERR"}}
+    if not candidates:
+        return {**payload, "verdict": "no_candidates", "candidates": []}
     payload["candidate_count"] = len(candidates)
     payload["candidates"] = [
         {
@@ -134,21 +130,15 @@ def diagnose_playwright_source(source: dict, limit: int = 5) -> dict:
 
     article_checks = []
     for candidate in candidates[:limit]:
-        article_content = playwright_parser.fetch_rendered(candidate.url)
-        check = {
-            "candidate_url": candidate.url,
-            "article_probe": {
-                "url": candidate.url,
-                "status": "rendered" if article_content is not None else "ERR",
-                "bytes": len(article_content or b""),
-            },
-        }
-        if article_content is None:
+        record = playwright_parser.rendered_article(candidate, {**source, "id": source.get("id") or 0})
+        check = {"candidate_url": candidate.url,
+                 "article_probe": {"url": candidate.url, "status": "rendered" if record else "ERR"}}
+        if record is None:
             check["verdict"] = "article_render_failed"
             article_checks.append(check)
             continue
 
-        title, published_at, raw_text = request_parser.parse_article_page(article_content, candidate.title)
+        title, published_at, raw_text = record["title"], record["published_at"], record["raw_text"]
         pre_filter = should_keep_article(title, raw_text, source)
         check.update(
             {
@@ -213,11 +203,92 @@ def diagnose_rss_source(source: dict, limit: int = 5) -> dict:
     entries = []
     for entry in feed.entries[:limit]:
         entries.append({"title": entry.get("title", ""), "url": entry.get("link", "")})
+    # Дата свежайшего пункта: ленты умирают молча. У PETRONAS фид отдаёт пункты, но
+    # последний — от 07.05.2025, при живом сайте с релизами каждые 2–3 дня.
+    stamps = [e.get("published_parsed") or e.get("updated_parsed") for e in feed.entries]
+    stamps = [datetime(*s[:6], tzinfo=timezone.utc) for s in stamps if s]
     return {
         **payload,
         "entry_count": len(feed.entries),
         "entries": entries,
+        "latest_entry": max(stamps).isoformat() if stamps else None,
         "verdict": "ok" if feed.entries else "no_entries",
+    }
+
+
+# Лента, чей свежайший пункт старше этого, считается мёртвой.
+FEED_STALE_DAYS = 90
+# Какие коды ответа означают «с этого адреса не пускают», а не «страницы нет».
+_BLOCK_STATUSES = {401, 403, 429, 503, "ERR"}
+
+
+def probe_strategies(url: str, limit: int = 2) -> dict:
+    """Попробовать к ссылке каждую стратегию по очереди: RSS → запрос → браузер.
+
+    Только чтение. Раньше при ручном вводе ссылки искалась только RSS-лента, а без
+    неё источник молча получал `request` по введённому адресу — без проверки, что
+    запрос даёт хоть одну статью, без браузера и без маршрута через зарубежный
+    воркер. Так заводились источники, которые не дали ни одной статьи никогда.
+
+    Возвращает отчёт по каждой попытке и выбор: `parse_strategy`, `rss_url`,
+    `listing_url`, `network_region`. `chosen = None` — сайт открылся, но статей не
+    нашла ни одна стратегия: заводить такой источник включённым нельзя.
+    """
+    from oiltech_digest.ingestion.rss_discovery import discover_feed
+
+    stub = {"id": None, "name": url, "url": url, "listing_url": url}
+    attempts: list[dict] = []
+
+    feed_url = discover_feed(url)
+    if feed_url:
+        rss = diagnose_rss_source({**stub, "rss_url": feed_url, "parse_strategy": "rss"}, limit=limit)
+        latest = rss.get("latest_entry")
+        fresh = bool(latest) and (datetime.now(timezone.utc) - datetime.fromisoformat(latest)).days <= FEED_STALE_DAYS
+        attempts.append({"strategy": "rss", "rss_url": feed_url, "verdict": rss["verdict"],
+                         "entries": rss.get("entry_count", 0), "latest_entry": latest, "fresh": fresh})
+        if rss["verdict"] == "ok" and fresh:
+            return {"url": url, "attempts": attempts,
+                    "chosen": {"parse_strategy": "rss", "rss_url": feed_url, "network_region": "auto"}}
+    else:
+        attempts.append({"strategy": "rss", "verdict": "feed_not_found"})
+
+    request = diagnose_request_source({**stub, "parse_strategy": "request"}, limit=limit)
+    attempts.append(_attempt_summary("request", request))
+    if _works(request):
+        return {"url": url, "attempts": attempts,
+                "chosen": {"parse_strategy": "request", "listing_url": url, "network_region": "auto"}}
+
+    browser = diagnose_playwright_source({**stub, "parse_strategy": "playwright"}, limit=limit)
+    attempts.append(_attempt_summary("playwright", browser))
+    if _works(browser):
+        return {"url": url, "attempts": attempts,
+                "chosen": {"parse_strategy": "playwright", "listing_url": url, "network_region": "auto"}}
+
+    listing_status = (request.get("listing_probe") or {}).get("status")
+    if listing_status in _BLOCK_STATUSES and browser.get("verdict") == "no_candidates":
+        # С РФ-ядра сайт не открылся ни запросом, ни браузером. Проверить отсюда, что
+        # он откроется из NL, нельзя — это покажет первый сбор воркера.
+        return {"url": url, "attempts": attempts,
+                "chosen": {"parse_strategy": "playwright", "listing_url": url, "network_region": "external",
+                           "note": "с РФ-ядра не открылся — сбор пойдёт через зарубежный воркер, "
+                                   "результат будет виден после первого цикла"}}
+    return {"url": url, "attempts": attempts, "chosen": None}
+
+
+def _works(report: dict) -> bool:
+    """Стратегия работает, если хоть одна статья дала текст. Префильтр по теме сюда
+    не входит: он про содержание, а не про то, умеем ли мы достать страницу."""
+    return any(check.get("text_chars", 0) >= 200 for check in report.get("article_checks") or [])
+
+
+def _attempt_summary(strategy: str, report: dict) -> dict:
+    return {
+        "strategy": strategy,
+        "verdict": report.get("verdict"),
+        "listing_status": (report.get("listing_probe") or {}).get("status"),
+        "candidates": report.get("candidate_count", 0),
+        "sample": [c.get("title", "")[:90] for c in (report.get("candidates") or [])[:5]],
+        "articles_with_text": sum(1 for c in report.get("article_checks") or [] if c.get("text_chars", 0) >= 200),
     }
 
 

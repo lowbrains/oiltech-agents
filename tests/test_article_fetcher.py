@@ -255,3 +255,101 @@ def test_no_gain_never_wipes_stored_text(monkeypatch):
     assert stats["too_short"] == 0
     assert written["raw_text"] is None       # текст в базе остаётся нетронутым
     assert written["status"] == "no_gain"
+
+
+# --- страница с несколькими статьями (лента с подгрузкой, как у Neftegaz.ru) ------
+
+OWN_TITLE = "ОДК создаст интеллектуальный газотурбинный двигатель мощностью 8 МВт"
+PINNED_TITLE = "СибБурМаш представил новую модификацию технологии «Гидра» для заканчивания скважин"
+
+
+def _feed_block(title: str, lead: str, body: str) -> str:
+    # Как у Neftegaz.ru: лид — внутри того же <h1>, тело — голый текст на <br>, в теле
+    # врезка-список; у каждой статьи ленты свой блок со своим <h1>.
+    return f"""
+    <div class="content_article margin_bottom_40">
+      <div class="date">14 сентября 2026, 15:24 · 2 мин · 474</div>
+      <h1>{title}<span class="lead">{lead}</span></h1>
+      <div itemprop="articleBody" class="articleBodyСlass">
+        {body}<br><br>
+        <ul><li>Врезка: читайте также про рынок оборудования в этом году</li>
+            <li>Врезка: ещё одна ссылка на соседний материал издания</li></ul>
+      </div>
+    </div>"""
+
+
+OWN_BODY = "Москва, 14 сен. Корпорация разрабатывает газотурбинный двигатель нового поколения. " * 8
+PINNED_BODY = "Тюмень, 14 сен. Муфта «Гидра» формирует радиальные каналы кислотой на карбонатах. " * 20
+
+FEED_HTML = f"""
+<html><body><div class="wrap-white">
+  {_feed_block(OWN_TITLE, "Первый образец — в 2028 году.", OWN_BODY)}
+  {_feed_block(PINNED_TITLE, "Решение готово к применению.", PINNED_BODY)}
+</div></body></html>
+""".encode()
+
+
+def test_multi_article_page_gives_text_of_own_title_not_the_longest_block():
+    text = article_fetcher.extract_main_text(FEED_HTML, title=OWN_TITLE)
+
+    assert "газотурбинный двигатель нового поколения" in text
+    assert "Гидра" not in text  # 14.09 пять новостей получили текст закреплённой «Гидры»
+
+
+def test_body_on_br_without_paragraphs_is_taken_whole():
+    text = article_fetcher.extract_main_text(FEED_HTML, title=OWN_TITLE)
+
+    # Прежде <li> врезки (>200 знаков «абзацев») заслоняли голый текст новости.
+    assert text.count("Корпорация разрабатывает") == 8
+
+
+def test_single_article_page_is_extracted_as_before_with_title():
+    assert article_fetcher.extract_main_text(ARTICLE_HTML, title="Ignored heading of a single article") == (
+        article_fetcher.extract_main_text(ARTICLE_HTML)
+    )
+
+
+def _json_ld(headline: str, body: str) -> str:
+    return (
+        '<script type="application/ld+json">{"@type": "NewsArticle", '
+        f'"headline": "{headline}", "articleBody": "{body}"}}</script>'
+    )
+
+
+def test_json_ld_takes_body_of_own_headline_not_the_longest():
+    html = f"""<html><head>
+      {_json_ld(PINNED_TITLE, PINNED_BODY)}
+      {_json_ld(OWN_TITLE, OWN_BODY)}
+    </head><body><div class="page-shell">Подписка</div></body></html>"""
+
+    text = article_fetcher.extract_main_text(html, title=OWN_TITLE)
+
+    assert "газотурбинный двигатель" in text
+    assert "Гидра" not in text
+
+
+def test_json_ld_of_other_articles_only_is_not_trusted():
+    html = f"""<html><head>
+      {_json_ld(PINNED_TITLE, PINNED_BODY)}
+      {_json_ld("Совсем другая новость про рынок нефти и газа сегодня", PINNED_BODY)}
+    </head><body><article><h1>{OWN_TITLE}</h1><p>{OWN_BODY}</p></article></body></html>"""
+
+    text = article_fetcher.extract_main_text(html, title=OWN_TITLE)
+
+    assert "газотурбинный двигатель" in text
+    assert "Гидра" not in text
+
+
+def test_title_with_a_typo_still_finds_its_block_when_it_clearly_leads():
+    # RSS: «прибило», страница: «прибыло» — совпадение 0,83 при пороге 0,85.
+    typo_title = "На Чукотку прибило третье судно с углем"  # как в RSS 14.09, дословно
+    page = f"""<html><body><div class="wrap-white">
+      {_feed_block("На Чукотку прибыло третье судно с углем", "Разгрузка идёт.",
+                   "Анадырь, 14 сен. Судно доставило уголь для котельных, разгрузка займёт неделю. " * 8)}
+      {_feed_block(PINNED_TITLE, "Решение готово к применению.", PINNED_BODY)}
+    </div></body></html>""".encode()
+
+    text = article_fetcher.extract_main_text(page, title=typo_title)
+
+    assert "Судно доставило уголь" in text
+    assert "Гидра" not in text

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 
 from oiltech_digest import api
@@ -1030,12 +1031,18 @@ def test_insert_article_dedups_url_variants(isolated_db):
         ).fetchone()[0]
         conn.commit()
 
-    def add(url: str) -> bool:
+    def add(url: str, text: str = "Текст статьи." * 30) -> bool:
+
         return repository.insert_article({
+
             "source_id": source_id, "title": "Одна и та же новость", "url": url,
-            "published_at": None, "raw_text": "Текст статьи." * 30,
+
+            "published_at": None, "raw_text": text,
+
             "text_truncated": False, "language": "ru",
+
             "content_hash": f"h-{url}", "image_url": None,
+
         })
 
     assert add("https://www.rbc.example/news/123?from=main_lines_11") is True
@@ -1043,8 +1050,14 @@ def test_insert_article_dedups_url_variants(isolated_db):
     assert add("https://www.rbc.example/news/123?from=newsfeed") is False, "query-хвост"
     assert add("http://rbc.example/news/123") is False, "другая схема и без www"
     assert add("https://www.rbc.example/news/123/") is False, "хвостовой слэш"
-    # Другая статья того же источника обязана пройти.
-    assert add("https://www.rbc.example/news/999") is True
+    # Другая статья того же источника обязана пройти — со СВОИМ телом: одинаковый
+    # текст у разных адресов одного источника отбивает отдельная защита ниже.
+    assert add("https://www.rbc.example/news/999", "Совсем другой текст. " * 30) is True
+
+    # Третий рубеж: тело уже есть у другой статьи этого источника. Так на проде
+    # набралось 830 «статей» — страницы навигации сайта, на которые сервер отдаёт
+    # одну и ту же оболочку (у Новатэка 82 из 86).
+    assert add("https://www.rbc.example/about/contacts", "Совсем другой текст. " * 30) is False, "повтор тела"
 
     with connection.get_connection() as conn:
         total = conn.execute(
@@ -1323,3 +1336,319 @@ def test_system_tag_survives_save_and_delete(isolated_db):
             ).fetchone()[0] is True
     finally:
         app.dependency_overrides.clear()
+
+
+def test_full_text_refetch_skips_external_sources(isolated_db):
+    """Источники зарубежного контура пропускаются локальной дозагрузкой.
+
+    Попытка одна и навсегда: 403 с РФ-адреса пометил бы статью failed, и она больше
+    никогда не переспрашивалась бы — даже когда тело уже добрал зарубежный воркер.
+    """
+    from oiltech_digest.db import repository
+
+    with connection.get_connection() as conn:
+        ru = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy, network_region) "
+            "VALUES ('РФ', 'Media', 'https://ru.example', TRUE, 'rss', 'auto') RETURNING id"
+        ).fetchone()[0]
+        ext = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy, network_region) "
+            "VALUES ('Запад', 'Media', 'https://west.example', TRUE, 'rss', 'external') RETURNING id"
+        ).fetchone()[0]
+        for sid, slug in ((ru, "ru"), (ext, "ext")):
+            conn.execute(
+                "INSERT INTO articles (source_id, title, url, raw_text, text_truncated, language) "
+                "VALUES (%s, 't', %s, 'коротко', TRUE, 'ru')",
+                (sid, f"https://{slug}.example/a"),
+            )
+        conn.commit()
+
+    rows = repository.get_articles_needing_full_text(limit=50)
+    source_ids = {row["source_id"] for row in rows}
+    assert ru in source_ids, "локальный источник должен попасть в дозагрузку"
+    assert ext not in source_ids, "внешний источник дозагружается воркером, не локально"
+
+
+def test_external_refetch_candidates_only_external_stubs(isolated_db):
+    """Кандидаты на дозаполнение — только обрывки внешних источников.
+
+    Локальные берёт обычная дозагрузка; полные статьи трогать незачем.
+    Уже помеченные failed берём: пометка ставилась локальной попыткой и отражает
+    недоступность с РФ-адреса, а не непригодность статьи.
+    """
+    from oiltech_digest.db import repository
+
+    with connection.get_connection() as conn:
+        ext = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy, network_region) "
+            "VALUES ('Запад', 'Media', 'https://w.example', TRUE, 'rss', 'external') RETURNING id"
+        ).fetchone()[0]
+        ru = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy, network_region) "
+            "VALUES ('РФ', 'Media', 'https://r.example', TRUE, 'rss', 'auto') RETURNING id"
+        ).fetchone()[0]
+        rows = [
+            (ext, "https://w.example/stub", "коротко", None),
+            (ext, "https://w.example/failed", "коротко", "failed"),
+            (ext, "https://w.example/full", "длинный текст " * 200, None),
+            (ru, "https://r.example/stub", "коротко", None),
+        ]
+        for sid, url, text, status in rows:
+            conn.execute(
+                "INSERT INTO articles (source_id, title, url, raw_text, language, full_text_status) "
+                "VALUES (%s, 't', %s, %s, 'ru', %s)", (sid, url, text, status))
+        conn.commit()
+
+    urls = {r["url"] for r in repository.external_refetch_candidates(limit=50)}
+    assert "https://w.example/stub" in urls
+    assert "https://w.example/failed" in urls, "failed ставила локальная попытка, повторяем через воркер"
+    assert "https://w.example/full" not in urls, "полная статья не нуждается в дозаполнении"
+    assert "https://r.example/stub" not in urls, "локальный источник берёт обычная дозагрузка"
+
+
+def test_feed_and_digest_skip_reprints(isolated_db):
+    """Пометка перепечатки должна что-то значить: копия уходит из ленты и из выпуска.
+
+    Без этого условия таблица была бы мёртвой записью — заполняется, а заказчик
+    по-прежнему видит четыре карточки одной новости, ровно как 08.09.
+    """
+    with connection.get_connection() as conn:
+        s1 = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy) "
+            "VALUES ('A', 'Media', 'https://a.example', TRUE, 'rss') RETURNING id"
+        ).fetchone()[0]
+        s2 = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy) "
+            "VALUES ('B', 'Media', 'https://b.example', TRUE, 'rss') RETURNING id"
+        ).fetchone()[0]
+        main_id = conn.execute(
+            "INSERT INTO articles (source_id, title, url, raw_text, language) "
+            "VALUES (%s, 'Главная копия', 'https://a.example/x', 'текст', 'ru') RETURNING id",
+            (s1,),
+        ).fetchone()[0]
+        copy_id = conn.execute(
+            "INSERT INTO articles (source_id, title, url, raw_text, language) "
+            "VALUES (%s, 'Перепечатка', 'https://b.example/x', 'текст', 'ru') RETURNING id",
+            (s2,),
+        ).fetchone()[0]
+        conn.commit()
+
+    from oiltech_digest.db import repository
+
+    repository.mark_article_reprint(
+        article_id=copy_id, primary_id=main_id, similarity=0.7,
+        reason="одно событие", decided_by="test",
+    )
+
+    with connection.get_connection() as conn:
+        hidden = conn.execute(
+            "SELECT count(*) FROM articles a "
+            "WHERE a.id = %s AND NOT EXISTS "
+            "(SELECT 1 FROM article_reprints ar WHERE ar.article_id = a.id)",
+            (copy_id,),
+        ).fetchone()[0]
+        kept = conn.execute(
+            "SELECT count(*) FROM articles a "
+            "WHERE a.id = %s AND NOT EXISTS "
+            "(SELECT 1 FROM article_reprints ar WHERE ar.article_id = a.id)",
+            (main_id,),
+        ).fetchone()[0]
+    assert hidden == 0, "копия обязана уйти из выборки"
+    assert kept == 1, "главная копия обязана остаться"
+
+
+def test_reprint_rejected_when_primary_is_invisible(isolated_db):
+    """Главной копией не может стать статья, которой в ленте нет.
+
+    Замер на проде 17.09 (71 пара, признанная судьёй дублем): в 6 парах главной
+    становилась невидимая статья — архивный источник или отбитая гейтом. Пометка
+    тогда не схлопывает дубль, а убирает новость из ленты целиком: видимую копию
+    прячем, а взамен не показывается ничего. Это ровно та жалоба заказчика
+    («материалы исчезают»), ради которой перепечатки вообще помечаются, а не
+    удаляются.
+    """
+    from oiltech_digest.db import repository
+
+    with connection.get_connection() as conn:
+        live = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy) "
+            "VALUES ('Живой', 'Media', 'https://live.example', TRUE, 'rss') RETURNING id"
+        ).fetchone()[0]
+        archived = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy, archived_at) "
+            "VALUES ('Архивный', 'Media', 'https://arch.example', TRUE, 'rss', now()) RETURNING id"
+        ).fetchone()[0]
+        visible_id = conn.execute(
+            "INSERT INTO articles (source_id, title, url, raw_text, language) "
+            "VALUES (%s, 'Видимая копия', 'https://live.example/x', 'короткий', 'ru') RETURNING id",
+            (live,),
+        ).fetchone()[0]
+        hidden_id = conn.execute(
+            "INSERT INTO articles (source_id, title, url, raw_text, language) "
+            "VALUES (%s, 'Копия из архива', 'https://arch.example/x', 'текст длиннее', 'ru') RETURNING id",
+            (archived,),
+        ).fetchone()[0]
+        conn.commit()
+
+    with pytest.raises(ValueError, match="не видна в ленте"):
+        repository.mark_article_reprint(
+            article_id=visible_id, primary_id=hidden_id, similarity=0.7,
+            reason="одно событие", decided_by="test",
+        )
+
+    with connection.get_connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM article_reprints WHERE article_id = %s", (visible_id,)
+        ).fetchone()[0] == 0, "видимая копия обязана остаться в ленте"
+
+
+def test_reprint_candidates_skip_invisible_articles(isolated_db):
+    """Правило не должно предлагать судье статьи, которых никто не видит.
+
+    Там же, в замере 17.09: 39 пар из 71 состояли ИЗ ДВУХ невидимых статей —
+    модель звали и платили за неё впустую, схлопывать было нечего.
+    """
+    from oiltech_digest.db import repository
+
+    title_a = "Газпром нефть испытала российские буровые установки на Ямале"
+    title_b = "Газпром нефть испытала российские буровые установки в Арктике"
+    with connection.get_connection() as conn:
+        live = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy) "
+            "VALUES ('Живой2', 'Media', 'https://live2.example', TRUE, 'rss') RETURNING id"
+        ).fetchone()[0]
+        archived = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy, archived_at) "
+            "VALUES ('Архивный2', 'Media', 'https://arch2.example', TRUE, 'rss', now()) RETURNING id"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO articles (source_id, title, url, raw_text, language, published_at) "
+            "VALUES (%s, %s, 'https://live2.example/x', 'текст', 'ru', now())",
+            (live, title_a),
+        )
+        conn.execute(
+            "INSERT INTO articles (source_id, title, url, raw_text, language, published_at) "
+            "VALUES (%s, %s, 'https://arch2.example/x', 'текст', 'ru', now())",
+            (archived, title_b),
+        )
+        conn.commit()
+
+    pairs = repository.reprint_candidates(days=7, min_overlap=0.3, limit=50)
+    titles = {str(p["a_title"]) for p in pairs} | {str(p["b_title"]) for p in pairs}
+    assert title_b not in titles, "статья из архивного источника не должна попадать в кандидаты"
+
+
+def test_marking_article_as_its_own_reprint_is_rejected(isolated_db):
+    from oiltech_digest.db import repository
+
+    with pytest.raises(ValueError):
+        repository.mark_article_reprint(
+            article_id=1, primary_id=1, similarity=None, reason=None)
+
+
+def test_reprint_chain_resolves_to_group_root(isolated_db):
+    """Пометки попарные, поэтому главной назначается КОРЕНЬ группы, а не сосед.
+
+    Без этого получалась бы цепочка C→A→D, и фильтр ленты унёс бы из выборки всю
+    группу вместе с оригиналом.
+    """
+    from oiltech_digest.db import repository
+
+    with connection.get_connection() as conn:
+        src = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy) "
+            "VALUES ('S', 'Media', 'https://s.example', TRUE, 'rss') RETURNING id"
+        ).fetchone()[0]
+        ids = []
+        for n in ("A", "B", "C"):
+            ids.append(conn.execute(
+                "INSERT INTO articles (source_id, title, url, raw_text, language) "
+                "VALUES (%s, %s, %s, 'текст', 'ru') RETURNING id",
+                (src, n, f"https://s.example/{n}"),
+            ).fetchone()[0])
+        conn.commit()
+    a, b, c = ids
+
+    repository.mark_article_reprint(article_id=b, primary_id=a, similarity=0.6,
+                                    reason="одно событие", decided_by="test")
+    # Просим сделать главной B, которая сама уже копия A → корень остаётся A.
+    repository.mark_article_reprint(article_id=c, primary_id=b, similarity=0.6,
+                                    reason="одно событие", decided_by="test")
+
+    with connection.get_connection() as conn:
+        rows = dict(conn.execute(
+            "SELECT article_id, primary_id FROM article_reprints").fetchall())
+    assert rows[b] == a
+    assert rows[c] == a, "цепочка не разрешена до корня — оригинал исчез бы из ленты"
+    assert a not in rows, "корень группы не может быть помечен копией"
+
+
+def test_unmark_returns_article_to_feed(isolated_db):
+    """Решение принимает модель — у человека должен быть способ его отменить."""
+    from oiltech_digest.db import repository
+
+    with connection.get_connection() as conn:
+        src = conn.execute(
+            "INSERT INTO sources (name, source_type, url, enabled, parse_strategy) "
+            "VALUES ('S2', 'Media', 'https://s2.example', TRUE, 'rss') RETURNING id"
+        ).fetchone()[0]
+        a = conn.execute("INSERT INTO articles (source_id, title, url, raw_text, language) "
+                         "VALUES (%s,'A','https://s2.example/a','t','ru') RETURNING id",
+                         (src,)).fetchone()[0]
+        b = conn.execute("INSERT INTO articles (source_id, title, url, raw_text, language) "
+                         "VALUES (%s,'B','https://s2.example/b','t','ru') RETURNING id",
+                         (src,)).fetchone()[0]
+        conn.commit()
+
+    repository.mark_article_reprint(article_id=b, primary_id=a, similarity=0.5,
+                                    reason="r", decided_by="test")
+    assert repository.unmark_article_reprint(b) is True
+    assert repository.unmark_article_reprint(b) is False, "повторное снятие — не ошибка, но и не успех"
+
+
+def _create_source_with_probe(monkeypatch, probe: dict, name: str) -> dict:
+    monkeypatch.setattr(api, "probe_strategies", lambda url: probe)
+    app = api.app
+    app.dependency_overrides[api.require_admin] = lambda: {"id": 1, "email": "admin@example.com", "role": "admin"}
+    try:
+        response = TestClient(app).post("/api/sources", json={"name": name, "url": "https://site.example/news"})
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 200, response.text
+    body = response.json()
+    with connection.get_connection() as conn:
+        row = conn.execute(
+            "SELECT parse_strategy, listing_url, network_region, enabled FROM sources WHERE id = %s",
+            (body["id"],),
+        ).fetchone()
+    return {"body": body, "row": row}
+
+
+def test_create_source_stores_what_the_strategy_probe_chose(monkeypatch, isolated_db):
+    """Ручной ввод ссылки: к ней пробуется каждая стратегия, и в источник пишется
+    выбор — стратегия, лента и маршрут. До 18.09 без RSS молча ставился `request`."""
+    probe = {"url": "https://site.example/news", "attempts": [],
+             "chosen": {"parse_strategy": "playwright", "listing_url": "https://site.example/news",
+                        "network_region": "external"}}
+    got = _create_source_with_probe(monkeypatch, probe, "Probe chose external")
+    assert got["row"] == ("playwright", "https://site.example/news", "external", True)
+    assert got["body"]["probe"]["chosen"]["network_region"] == "external"
+
+
+def test_create_source_is_disabled_when_no_strategy_found_articles(monkeypatch, isolated_db):
+    """Сайт открылся, но статей не дала ни одна стратегия — включённым такой
+    источник опрашивался бы вечно впустую."""
+    got = _create_source_with_probe(monkeypatch, {"url": "https://site.example/news", "attempts": [],
+                                                  "chosen": None}, "Probe found nothing")
+    assert got["row"][3] is False
+    assert got["body"]["enabled"] is False
+
+
+def test_manual_import_holder_source_is_not_polled(isolated_db):
+    """Держатель вручную внесённой статьи — не подписка на сайт. Включённым он
+    опрашивался `request` по главной вечно (223 статьи научпопа 17.09)."""
+    from oiltech_digest.ingestion import manual_import
+
+    source = manual_import.find_or_create_source("https://new-domain.example/news/1", None)
+    assert source["enabled"] is False
+    assert source["name"] == "Manual import: new-domain.example"

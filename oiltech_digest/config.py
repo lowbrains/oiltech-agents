@@ -32,7 +32,12 @@ RETRY_BACKOFF_BASE = 1.0      # базовая задержка backoff (1с, 2�
 HTTP_MIN_INTERVAL_SECONDS = float(os.environ.get("HTTP_MIN_INTERVAL_SECONDS", "1.5"))
 HTTP_JITTER_SECONDS = float(os.environ.get("HTTP_JITTER_SECONDS", "0.4"))
 HTTP_BLOCK_COOLDOWN_SECONDS = int(os.environ.get("HTTP_BLOCK_COOLDOWN_SECONDS", "900"))
-REQUEST_ARTICLE_LIMIT = int(os.environ.get("REQUEST_ARTICLE_LIMIT", "6"))
+# Хост, который МОЛЧИТ (таймаут), должен стоить столько же, сколько хост, который
+# отказал вслух (403). Пауза короче, чем при блокировке: таймаут бывает разовым,
+# а бан — нет. Ставится только после исчерпания всех попыток, т.е. когда хост не
+# ответил три раза подряд.
+HTTP_DEAD_HOST_COOLDOWN_SECONDS = int(os.environ.get("HTTP_DEAD_HOST_COOLDOWN_SECONDS", "300"))
+REQUEST_ARTICLE_LIMIT = int(os.environ.get("REQUEST_ARTICLE_LIMIT", "12"))
 # Минимум значимого текста для первичной вставки request/playwright-статей.
 # Корпоративные новости и press release бывают короткими; старый порог 200 символов
 # отбрасывал часть релевантных заметок ещё до AI-гейта.
@@ -64,6 +69,11 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 # очереди, чтобы обновление кода не остановило текущий single-server deployment.
 EXTERNAL_WORKERS_ENABLED = os.environ.get("EXTERNAL_WORKERS_ENABLED", "0").lower() in {"1", "true", "yes"}
 AI_EXECUTION_REGION = os.environ.get("AI_EXECUTION_REGION", "ru").strip().lower()
+# Пересчёты корпуса (перекачка тел, перепроверка релевантности, перевод заголовков) —
+# своей полосой external-ai-bulk, чтобы не стоять перед потоком дня (18.09: 28 пакетов
+# пересчёта задержали обычную обработку на 4,5 ч). Включать, только когда на NL поднят
+# воркер этой очереди, — иначе задачи будут ждать (сторож очередей это покажет).
+AI_BULK_LANE_ENABLED = os.environ.get("AI_BULK_LANE_ENABLED", "0").lower() in {"1", "true", "yes"}
 FETCH_EXTERNAL_ENABLED = os.environ.get("FETCH_EXTERNAL_ENABLED", "0").lower() in {"1", "true", "yes"}
 EXTERNAL_WORKER_TOKEN_HASH = os.environ.get("EXTERNAL_WORKER_TOKEN_HASH", "").strip()
 EXTERNAL_WORKER_DEFAULT_LEASE_SECONDS = int(os.environ.get("EXTERNAL_WORKER_DEFAULT_LEASE_SECONDS", "600"))
@@ -81,6 +91,16 @@ EXTERNAL_WORKER_CAPABILITIES = [
     if item.strip()
 ]
 EXTERNAL_WORKER_POLL_SECONDS = float(os.environ.get("EXTERNAL_WORKER_POLL_SECONDS", "3"))
+# Потоков выдачи в одном процессе воркера: полоса сбора запросом — I/O, ей хватает
+# потоков (http_client потокобезопасен: пауза на хост под замком, сессия на поток).
+# Браузер и ИИ — по одному.
+EXTERNAL_WORKER_CONCURRENCY = int(os.environ.get("EXTERNAL_WORKER_CONCURRENCY", "1"))
+# Аренду задачи продлевает фоновый поток раз в столько секунд — независимо от того,
+# зовёт ли код обработчика heartbeat (24.07, 17.09, 21.09 — трижды забывали).
+EXTERNAL_WORKER_HEARTBEAT_SECONDS = float(os.environ.get("EXTERNAL_WORKER_HEARTBEAT_SECONDS", "60"))
+# Сколько задача может не подавать признаков продвижения, если для её вида нет своего
+# предела (external_worker._JOB_STALL_SECONDS). Не общее время: большая пачка идёт долго.
+EXTERNAL_JOB_MAX_SECONDS = int(os.environ.get("EXTERNAL_JOB_MAX_SECONDS", "1200"))
 
 # --- Прокси для парсинга (residential, напр. 2captcha) ---
 # PROXY_URL — полная строка подключения: "http://user:pass@host:port"
@@ -107,7 +127,6 @@ def _parse_proxy_host_overrides(raw: str) -> dict[str, str]:
         if host and proxy_url:
             overrides[host] = proxy_url
     return overrides
-
 
 # Карта "домен → строка прокси". Совпавший суффикс хоста имеет приоритет
 # над PROXY_URL: например, override для "rbc.ru" сработает и для "www.rbc.ru".
@@ -233,6 +252,15 @@ SIGNAL_RADAR_TOPIC_SOURCE = os.environ.get("SIGNAL_RADAR_TOPIC_SOURCE", "tags").
 # воркеру в снимке задачи — менять можно без пересборки NL.
 SIGNAL_DEDUP_MAX_PAIRS = int(os.environ.get("SIGNAL_DEDUP_MAX_PAIRS", "400"))
 
+# Целевые показатели экрана «Статистика» — из презентации ГД «Нефтесервисный радар»
+# (июль 2026): >120 источников (слайды 4–5); бюджет ИИ ≈10 000 ₽/мес при потоке
+# 5 000 статей/мес (слайд 7). Курс для пересчёта cost_usd в рубли берётся у ЦБ РФ
+# (fx.py); ANALYTICS_USD_RUB — только запасной, если ЦБ недоступен, и на экране он
+# подписан как допущение.
+ANALYTICS_TARGET_SOURCES = int(os.environ.get("ANALYTICS_TARGET_SOURCES", "120"))
+ANALYTICS_TARGET_ARTICLES_MONTH = int(os.environ.get("ANALYTICS_TARGET_ARTICLES_MONTH", "5000"))
+ANALYTICS_TARGET_AI_RUB_MONTH = float(os.environ.get("ANALYTICS_TARGET_AI_RUB_MONTH", "10000"))
+ANALYTICS_USD_RUB = float(os.environ.get("ANALYTICS_USD_RUB", "85"))
 
 def price_for_model(model: str | None) -> tuple[float, float]:
     """USD/1М-токенов (input, output) для модели по префиксу имени.
@@ -242,7 +270,6 @@ def price_for_model(model: str | None) -> tuple[float, float]:
             if model.startswith(prefix):
                 return OPENAI_MODEL_PRICES[prefix]
     return (OPENAI_INPUT_USD_PER_MTOK, OPENAI_OUTPUT_USD_PER_MTOK)
-
 
 # --- Брендинг дайджеста ---
 # Путь к digest_branding.json. Пусто — файл берётся из пакета (локальная разработка,
@@ -259,4 +286,12 @@ AUTH_SESSION_DAYS = int(os.environ.get("AUTH_SESSION_DAYS", "30"))
 # Флаг Secure на сессионной cookie. Прод за HTTPS (Caddy) → должно быть True (тех-долг T8).
 # Для локальной разработки по http:// выставить AUTH_COOKIE_SECURE=0, иначе браузер
 # не сохранит cookie и вход не сработает.
+# Открытая регистрация: по умолчанию ЗАКРЫТА. Платформа выходит на корпоративный
+# портал заказчика, и /api/auth/register позволял любому завести себе учётку —
+# предусловие релиза #33. Пользователей заводит администратор: экран «Пользователи»
+# или CLI create-user. Первый администратор создаётся так же, до открытия доступа.
+AUTH_ALLOW_SELF_REGISTRATION = os.environ.get(
+    "AUTH_ALLOW_SELF_REGISTRATION", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
 AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "true").strip().lower() in ("1", "true", "yes", "on")
