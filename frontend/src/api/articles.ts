@@ -20,6 +20,9 @@ export type ArticleQuery = {
   dateTo?: string;
   sort?: "date_desc" | "score_desc" | "score_asc";
   changedOnly?: boolean;
+  // Один месяц «ГГГГ-ММ». Без него сервер отдаёт открытые месяцы окна; прошлый месяц —
+  // архив, только просмотр (правку статуса сервер отклоняет с 409).
+  month?: string;
 };
 
 // Без фильтров возвращает дефолтный лёгкий топ-2000. С `search` (и др.) запрос
@@ -39,6 +42,7 @@ export function listArticles(query: ArticleQuery = {}) {
   if (query.dateTo) params.set("date_to", query.dateTo);
   if (query.sort) params.set("sort", query.sort);
   if (query.changedOnly) params.set("changed_only", "1");
+  if (query.month) params.set("month", query.month);
   return apiFetch<Article[]>(`/api/articles?${params.toString()}`);
 }
 

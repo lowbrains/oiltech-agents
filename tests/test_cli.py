@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import pytest
 
@@ -154,6 +155,78 @@ def test_enqueue_external_scrape_enqueues_only_external_sources(monkeypatch, cap
     queues = {k["queue_name"] for _, _, k in jobs}
     assert queues == {"external-playwright", "external-fetch"}
     assert "задач=2" in capsys.readouterr().out
+
+
+def _resummarize_args(**overrides):
+    values = {"article_id": None, "limit": 0, "batch_size": 20, "dry_run": True}
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_enqueue_resummarize_by_default_only_selects(monkeypatch, capsys):
+    monkeypatch.setattr("oiltech_digest.processing.mixed_script.resummarize_selection",
+                        lambda ids=None: {"summary": [1], "title": [3], "source_title": [5, 6]})
+    created = []
+    monkeypatch.setattr("oiltech_digest.db.repository.create_background_job", lambda *a, **k: created.append(a))
+
+    cli.cmd_enqueue_resummarize(_resummarize_args())
+
+    assert created == []
+    out = capsys.readouterr().out
+    assert "суть — 1 статей, только заголовок — 1; брак в самом исходном заголовке (переводом не лечится) — 2" in out
+
+
+def test_enqueue_resummarize_marks_jobs_to_write_only_summary_and_translation(monkeypatch):
+    monkeypatch.setattr("oiltech_digest.config.EXTERNAL_WORKERS_ENABLED", True)
+    monkeypatch.setattr("oiltech_digest.config.AI_EXECUTION_REGION", "external")
+    monkeypatch.setattr("oiltech_digest.config.AI_BULK_LANE_ENABLED", True)
+    monkeypatch.setattr("oiltech_digest.processing.mixed_script.resummarize_selection",
+                        lambda ids=None: {"summary": [1], "title": [3], "source_title": [5]})
+    jobs = []
+    monkeypatch.setattr("oiltech_digest.db.repository.create_background_job",
+                        lambda kind, payload, **k: jobs.append((kind, payload, k["queue_name"])) or {"id": len(jobs)})
+
+    cli.cmd_enqueue_resummarize(_resummarize_args(dry_run=False))
+
+    assert jobs == [
+        ("process_articles", {"article_ids": [1], "limit": 1, "offline": False, "only": ["summary", "translation"]},
+         "external-ai-bulk"),
+        ("translate_titles", {"article_ids": [3]}, "external-ai-bulk"),
+    ]
+
+
+def test_enqueue_resummarize_refuses_local_pipeline(monkeypatch):
+    """Локальный конвейер пометки only не знает и готовые стадии пропускает — задача прошла бы впустую."""
+    monkeypatch.setattr("oiltech_digest.config.EXTERNAL_WORKERS_ENABLED", False)
+    monkeypatch.setattr("oiltech_digest.processing.mixed_script.resummarize_selection",
+                        lambda ids=None: {"summary": [1], "title": [], "source_title": []})
+    created = []
+    monkeypatch.setattr("oiltech_digest.db.repository.create_background_job", lambda *a, **k: created.append(a))
+
+    with pytest.raises(SystemExit, match="внешний контур"):
+        cli.cmd_enqueue_resummarize(_resummarize_args(dry_run=False))
+    assert created == []
+
+
+def test_scripts_only_json_keeps_every_change_for_rollback(monkeypatch, capsys):
+    """Ревью 27.09: --json обрезал список до --show (30 из 185) — откатить было не по чему."""
+    changes = [{"article_id": index, "field": "summary", "before": "вхoдит", "after": "входит"} for index in range(5)]
+    monkeypatch.setattr("oiltech_digest.processing.mixed_script.repair_cards",
+                        lambda **kwargs: {"changed_fields": 5, "applied": False, "changes": changes})
+
+    cli.cmd_repair_terminology(argparse.Namespace(scripts_only=True, dry_run=True, article_id=None, json=True, show=2))
+
+    assert json.loads(capsys.readouterr().out)["changes"] == changes
+
+
+def test_repair_telegram_titles_needs_before_to_write(monkeypatch):
+    called = []
+    monkeypatch.setattr("oiltech_digest.ingestion.telegram_titles.repair", lambda **kwargs: called.append(kwargs))
+
+    with pytest.raises(SystemExit, match="--before"):
+        cli.cmd_repair_telegram_titles(argparse.Namespace(dry_run=False, before=None, json=False, show=0))
+    assert called == []
+    assert cli._utc_datetime("2026-09-25T12:00:00").tzinfo is not None
 
 
 def test_source_dump_listing_prints_anchors_with_container(monkeypatch, capsys):

@@ -52,6 +52,7 @@ services:
   agents-app:
     build: .
     container_name: oiltech_agents_app
+    init: true  # подбирает зомби Chromium — см. scheduler
     depends_on:
       bootstrap:
         condition: service_completed_successfully
@@ -79,11 +80,10 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # Конвейер статей (tasks, worker, playwright-worker, scheduler) агентам не нужен:
-  # сбор и ИИ-обработку ведёт MVP-1, радар ходит в веб, агент источников — в поиск.
-  # 20.09 голый `up -d --build` поднял их все, и за 8,5 ч планировщик задублировал
-  # сбор MVP-1 ($4,48 ИИ) и уронил радар дня. Под профилем их поднимает только
-  # явное `--profile pipeline`, а выкат ядра — `up -d --no-deps agents-app`.
+  # Трекер задач — архивный модуль (сессия B, решение владельца 23.09). Здесь он пока в
+  # профиле `pipeline`: так ждёт тест границы Германа (test_bare_compose_up_starts_only_core_services).
+  # Голый `compose up` его не поднимает ни так, ни так; профиль `archive` — со сменой
+  # идентичности стека в D, где этот тест меняется всё равно.
   tasks:
     build: .
     profiles: ["pipeline"]
@@ -98,6 +98,7 @@ services:
       PYTHONUNBUFFERED: "1"
       BACKGROUND_JOB_INLINE: "0"
       TASKS_APP_MODE: "1"
+      ARCHIVED_MODULES: backlog
       DIGEST_BRANDING_PATH: /app/branding/digest_branding.json
     dns:
       - 1.1.1.1
@@ -116,10 +117,16 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Конвейер статей (worker, playwright-worker, scheduler) — под профилем pipeline:
+  # 21.09 голый `up -d --build` у агентов поднял лишний планировщик, и за 8,5 ч он
+  # задублировал сбор и ИИ ($4,48). Голый `up -d` их не поднимает; выкат — только
+  # scripts/deploy-core.sh с явным списком сервисов (названный сервис профиль включает
+  # сам). Второй планировщик и так не начнёт шагов — он ждёт замок (singleton.py).
   worker:
     build: .
     profiles: ["pipeline"]
     container_name: oiltech_agents_worker
+    init: true  # подбирает зомби Chromium — см. scheduler
     depends_on:
       bootstrap:
         condition: service_completed_successfully
@@ -148,6 +155,7 @@ services:
     build: .
     profiles: ["pipeline"]
     container_name: oiltech_agents_playwright_worker
+    init: true  # подбирает зомби Chromium — см. scheduler
     depends_on:
       bootstrap:
         condition: service_completed_successfully
@@ -176,6 +184,11 @@ services:
     build: .
     profiles: ["pipeline"]
     container_name: oiltech_agents_scheduler
+    # init (tini) под PID 1 подбирает осиротевшие процессы. Chromium при каждом рендере
+    # оставляет 2 хелпера, а python под PID 1 их не подбирает: 25.09 было 2259 зомби при
+    # pids.max 2315 (DefaultTasksMax systemd), и рендеры падали с «Target crashed». На
+    # исчерпанном лимите Playwright и падает, и виснет навсегда. То же — везде, где есть Chromium.
+    init: true
     depends_on:
       bootstrap:
         condition: service_completed_successfully
@@ -204,7 +217,7 @@ services:
       HTTP_MIN_INTERVAL_SECONDS: ${HTTP_MIN_INTERVAL_SECONDS:-1.5}
       HTTP_JITTER_SECONDS: ${HTTP_JITTER_SECONDS:-0.4}
       HTTP_BLOCK_COOLDOWN_SECONDS: ${HTTP_BLOCK_COOLDOWN_SECONDS:-900}
-      REQUEST_ARTICLE_LIMIT: ${REQUEST_ARTICLE_LIMIT:-6}
+      REQUEST_ARTICLE_LIMIT: ${REQUEST_ARTICLE_LIMIT:-12}
       SOURCE_DISCOVERY_MODE: ${SOURCE_DISCOVERY_MODE:-plan}
       SOURCE_DISCOVERY_MAX_ITERATIONS: ${SOURCE_DISCOVERY_MAX_ITERATIONS:-3}
       SOURCE_DISCOVERY_MAX_DAILY_LOOP_RUNS: ${SOURCE_DISCOVERY_MAX_DAILY_LOOP_RUNS:-4}
@@ -229,9 +242,13 @@ services:
       - documents:/data/documents
     restart: unless-stopped
 
+  # Архивный модуль «Справка /help» (утверждён владельцем 23.09): 0 открытий страниц с
+  # 13.09 по логу mkdocs, ссылок из интерфейса нет. Вернуть: этот сервис с профилем
+  # `archive` и блок /help* в Caddyfile (там он оставлен комментарием).
   docs:
     image: squidfunk/mkdocs-material:9
-    profiles: ["docs"]
+    profiles:
+      - archive
     container_name: oiltech_agents_docs
     restart: unless-stopped
     ports:

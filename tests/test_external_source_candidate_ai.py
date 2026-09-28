@@ -17,11 +17,13 @@ def test_process_source_candidate_payload_builds_article_results(monkeypatch):
     tags = [{"id": 7, "name": "Бурение", "parent_id": None, "keywords_json": [], "keywords_en_json": ["drilling"]}]
     criteria = [{"id": 9, "name": "Технологичность", "weight": 100, "keywords_json": [], "keywords_en_json": ["drilling"]}]
 
+    gate_tags = []
     monkeypatch.setattr(external_ai, "make_client", lambda offline: object())
     monkeypatch.setattr(
         external_ai,
         "relevance_article",
-        lambda article, client: AIResponse({"relevant": True, "reason": "topic match"}, "fake", 10, 2),
+        lambda article, client, tags=None: gate_tags.append(tags)
+        or AIResponse({"relevant": True, "reason": "topic match"}, "fake", 10, 2),
     )
     monkeypatch.setattr(
         external_ai,
@@ -60,6 +62,8 @@ def test_process_source_candidate_payload_builds_article_results(monkeypatch):
     assert result["source_candidate_evaluate"] is True
     assert result["stats"]["processed"] == 1
     assert result["stats"]["relevant"] == 1
+    # Гейт на NL судит по тематикам заказчика из payload: базы у воркера нет.
+    assert gate_tags == [tags]
     assert result["articles"][0]["candidate_article_id"] == 101
     assert result["articles"][0]["summary"]["summary"] == "Короткая суть"
     assert result["articles"][0]["tagging"]["tag_id"] == 7

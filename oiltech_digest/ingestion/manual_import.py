@@ -48,8 +48,13 @@ def import_article(url: str, explicit_source_id: int | None = None) -> ManualImp
             full_text_chars=int(existing.get("full_text_chars") or 0),
         )
 
-    source = find_or_create_source(normalized_url, explicit_source_id)
+    # Сначала СКАЧИВАЕМ, только потом заводим источник. Обратный порядок плодил
+    # источники-призраки: упавшая загрузка оставляла в каталоге строку
+    # «Manual import: домен» с enabled=TRUE и листингом на главную, и планировщик
+    # начинал опрашивать её вечно. Так в ленту заехало 223 статьи научпопа со
+    # scientificrussia.ru и 17 инвест-релизов IT-компании — замер 17.09.
     content, fetch_method = fetch_content(normalized_url)
+    source = find_or_create_source(normalized_url, explicit_source_id)
     title, published_at, raw_text = parse_article_page(content, "")
     title = (title or normalized_url).strip()
     raw_text = (raw_text or title).strip()
@@ -123,12 +128,17 @@ def find_or_create_source(article_url: str, explicit_source_id: int | None) -> d
     bare_like = f"%{bare}%"
     with get_connection() as conn:
         cur = conn.cursor(row_factory=dict_row)
+        # Ищем среди ВСЕХ источников домена, а не только включённых. Фильтр
+        # `enabled = TRUE` означал, что ссылка с заархивированного домена заводит
+        # ему дубль-призрак с enabled=TRUE — и домен, который осознанно убрали из
+        # работы, молча возвращался в опрос. После архивации 28 источников 13–17.09
+        # это стало вопросом времени. Архивный источник переиспользуем как есть:
+        # статья привяжется к нему и останется скрытой, что и требуется.
         cur.execute(
             """
             SELECT *
             FROM sources
-            WHERE enabled = TRUE
-              AND (
+            WHERE (
                 lower(coalesce(url, '')) LIKE %s
                 OR lower(coalesce(url, '')) LIKE %s
                 OR lower(coalesce(rss_url, '')) LIKE %s
@@ -136,7 +146,7 @@ def find_or_create_source(article_url: str, explicit_source_id: int | None) -> d
                 OR lower(coalesce(listing_url, '')) LIKE %s
                 OR lower(coalesce(listing_url, '')) LIKE %s
               )
-            ORDER BY priority DESC NULLS LAST, id
+            ORDER BY (archived_at IS NOT NULL), priority DESC NULLS LAST, id
             LIMIT 1
             """,
             (host_like, bare_like, host_like, bare_like, host_like, bare_like),
@@ -152,6 +162,12 @@ def find_or_create_source(article_url: str, explicit_source_id: int | None) -> d
         url=f"{urlparse(article_url).scheme}://{host}",
         parse_strategy="request",
     )
+    # Держатель для вручную внесённой статьи, а не подписка на сайт: выключен.
+    # Включённым он опрашивался `request` по главной вечно — так 17.09 в ленту
+    # заехали 223 статьи научпопа с scientificrussia.ru. Статья видна в ленте и так
+    # (скрывает только архив). Подписаться на сайт — через добавление источника,
+    # где к ссылке пробуется каждая стратегия.
+    repository.set_source_collection(source_id, listing_url=None, network_region="auto", enabled=False)
     source = repository.get_source(source_id)
     if source is None:
         raise ManualImportError("fallback source was not created")

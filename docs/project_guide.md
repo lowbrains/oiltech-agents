@@ -118,12 +118,12 @@ sources
 
 - `db` — PostgreSQL;
 - `app` — FastAPI и UI на `127.0.0.1:8000`;
-- `scheduler` — циклический ingestion и AI-processing.
+- `scheduler` — циклический ingestion и AI-processing (профиль `pipeline`).
 
 Команда:
 
 ```bash
-docker compose up -d --build
+docker compose --profile pipeline up -d --build
 ```
 
 ### Вариант B: локально по шагам
@@ -233,6 +233,7 @@ docker compose up -d --build
 - `source-enable`
 - `source-add-rss`
 - `source-diagnose`
+- `source-probe` — путь сбора источника с вердиктом рубежей вставки по каждому кандидату, только чтение
 
 ### Дайджест
 

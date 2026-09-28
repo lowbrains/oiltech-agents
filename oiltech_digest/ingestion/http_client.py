@@ -5,6 +5,7 @@ The goal is reliability from a server environment without looking overly aggress
   - minimum interval + small jitter per host;
   - respect Retry-After for 429/503 when present;
   - temporary cooldown for hosts returning 403/429 repeatedly;
+  - the same cooldown for hosts that time out on every attempt;
   - SSL fallback only for certificate failures.
 """
 
@@ -23,6 +24,7 @@ import requests
 
 from oiltech_digest.config import (
     HTTP_BLOCK_COOLDOWN_SECONDS,
+    HTTP_DEAD_HOST_COOLDOWN_SECONDS,
     HTTP_JITTER_SECONDS,
     HTTP_MIN_INTERVAL_SECONDS,
     PROXY_HOST_OVERRIDES,
@@ -48,6 +50,8 @@ _DEFAULT_HEADERS = {
 }
 
 _thread_local = threading.local()
+# (запрошенный адрес, конечный после переадресаций) последнего удачного запроса потока.
+_last_response = threading.local()
 _host_lock = threading.Lock()
 _host_next_allowed: dict[str, float] = {}
 _host_cooldown_until: dict[str, float] = {}
@@ -68,7 +72,19 @@ def probe(url: str, timeout: int = 10) -> bytes | None:
     return _request(url, timeout=timeout, quiet=True, retries=1)
 
 
+def final_url_of(url: str) -> str | None:
+    """Куда привели переадресации последний удачный `fetch(url)` в этом потоке.
+
+    None — не знаем: запрос был к другому адресу, не удался или ответ пришёл запасным
+    путём (SSL-фоллбэк). Нужен, чтобы отличить статью от главной, на которую сайт увёл со
+    статьи: у Сколково Energy любой адрес energy.skolkovo.ru — 301 на www.skolkovo.ru/.
+    """
+    requested, final = getattr(_last_response, "pair", (None, None))
+    return final if requested == url else None
+
+
 def _request(url: str, timeout: int, quiet: bool, retries: int) -> bytes | None:
+    _last_response.pair = (None, None)
     host = _host(url)
     if _is_host_cooling_down(host):
         logger.debug("HTTP %s — host cooldown active, skip", url)
@@ -100,6 +116,7 @@ def _request(url: str, timeout: int, quiet: bool, retries: int) -> bytes | None:
                 if resp.status_code in {403, 429}:
                     return None
             resp.raise_for_status()
+            _last_response.pair = (url, getattr(resp, "url", None) or None)
             return resp.content
         except requests.exceptions.SSLError as exc:
             last_err = exc
@@ -112,11 +129,31 @@ def _request(url: str, timeout: int, quiet: bool, retries: int) -> bytes | None:
             if attempt < retries:
                 time.sleep(_retry_delay(attempt))
 
+    # Хост не ответил НИ РАЗУ за все попытки — значит он недоступен отсюда, а не
+    # занят именно этим адресом. Без этой паузы пакет из 25 статей одного издания
+    # стоил 25x63 с: каждая статья заново выясняла то, что уже известно с первой.
+    # Громкий отказ (403) такую паузу получал всегда, молчаливый (таймаут) — нет,
+    # и эта асимметрия съедала lease внешней задачи целиком.
+    #
+    # Только для настоящей загрузки: probe ходит с retries=1, и одна неудачная
+    # проба не должна закрывать хост для диагностики источника.
+    if retries > 1 and _is_unreachable(last_err):
+        _set_cooldown(_host(url), HTTP_DEAD_HOST_COOLDOWN_SECONDS, f"no answer in {retries} attempts")
+
     if quiet:
         logger.debug("HTTP %s — отказ после %d попыток: %s", url, retries, last_err)
     else:
         logger.warning("HTTP %s — отказ после %d попыток: %s", url, retries, last_err)
     return None
+
+
+def _is_unreachable(err: Exception | None) -> bool:
+    """Недоступность хоста, а не отказ по конкретному адресу.
+
+    404/500 прилетают как HTTPError и означают проблему со страницей — закрывать
+    из-за них всё издание нельзя.
+    """
+    return isinstance(err, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
 
 
 _ext_bundle_lock = threading.Lock()
@@ -365,18 +402,19 @@ def _is_host_cooling_down(host: str) -> bool:
 
 
 def _register_block(host: str, response: requests.Response) -> None:
-    if not host:
-        return
     retry_after = _retry_after_seconds(response)
     cooldown = max(retry_after, HTTP_BLOCK_COOLDOWN_SECONDS if response.status_code in {403, 429} else 120)
+    _set_cooldown(host, cooldown, f"status {response.status_code}")
+
+
+def _set_cooldown(host: str, seconds: int, why: str) -> None:
+    """Единственное место, где хост закрывается на паузу — чтобы правила для
+    громкого и молчаливого отказа не разъехались при следующей правке."""
+    if not host:
+        return
     with _host_lock:
-        _host_cooldown_until[host] = time.monotonic() + cooldown
-    logger.warning(
-        "HTTP %s — host cooldown %ss after status %s",
-        host,
-        cooldown,
-        response.status_code,
-    )
+        _host_cooldown_until[host] = time.monotonic() + seconds
+    logger.warning("HTTP %s — host cooldown %ss (%s)", host, seconds, why)
 
 
 def _retry_after_seconds(response: requests.Response) -> int:

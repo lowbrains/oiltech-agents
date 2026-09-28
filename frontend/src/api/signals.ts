@@ -24,6 +24,27 @@ export function updateSignal(signalId: number, payload: SignalPatch) {
   });
 }
 
+// Здоровье поиска последнего ежедневного прогона — отдаётся только админу (/api/signals/search-health).
+export type SignalSearchHealth = {
+  run_id: number;
+  job_id: number | null;
+  run_at: string | null;
+  status: string;
+  signals: number | null;
+  topics: number;
+  failed: number;
+  first_error: string | null;
+  http_status: number | null;
+  provider: string | null;
+  // not_configured — поиск не вызывался (нет ключа, провайдер не подключён); network — таймаут
+  // или обрыв соединения; connection — TLS или прокси; null — сбоя нет. Считает ядро (signal_discovery._search_failure_cause).
+  cause: "not_configured" | "unsupported_provider" | "http" | "network" | "connection" | "other" | null;
+};
+
+export function getSignalSearchHealth() {
+  return apiFetch<{ search_health: SignalSearchHealth | null }>("/api/signals/search-health");
+}
+
 export function createSignalFeedback(payload: SignalFeedbackPayload) {
   return apiFetch<{ ok: boolean; event_id: number; memory_ids: number[]; memories: number }>("/api/signals/feedback", {
     method: "POST",

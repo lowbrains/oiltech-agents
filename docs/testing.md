@@ -33,7 +33,7 @@ docker compose run --rm test
 
 ```bash
 cp .env.example .env
-docker compose up -d --build
+docker compose --profile pipeline up -d --build
 docker compose logs -f scheduler
 ```
 

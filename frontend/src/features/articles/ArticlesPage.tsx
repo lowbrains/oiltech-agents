@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_ARTICLE_LIMIT, listArticles, type ArticleQuery, updateArticle } from "../../api/articles";
 import { getDashboardStats } from "../../api/stats";
-import type { Article, DashboardStats } from "../../api/types";
+import type { ArchiveMonth, Article, DashboardStats } from "../../api/types";
 import { FeedbackPanel } from "../feedback/FeedbackPanel";
+import { archiveNoticeText, monthLabel, useFeedWindow, windowPeriodText } from "./feedWindow";
+
+const NO_ARCHIVE_MONTHS: ArchiveMonth[] = [];
 
 type ToastWriter = (text: string, tone?: "default" | "error") => void;
 
@@ -63,10 +66,19 @@ export function ArticlesPage(props: Props) {
   const [viewTab, setViewTab] = useState<"all" | "withStatus">("all");
   // #9: группы-теги свёрнуты по умолчанию. Храним РАСКРЫТЫЕ (пустой набор = всё скрыто).
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  // Окно месяца (ADR 0001, п. 6): лента — открытые месяцы; прошлый месяц открывается
+  // архивом только на просмотр. Пусто — текущий период.
+  const [archiveMonth, setArchiveMonth] = useState("");
+  const archiveMonths = useFeedWindow()?.archive ?? NO_ARCHIVE_MONTHS;
+  // Счётчики архива держим здесь, а не в App: общий stats приложения — всегда текущий период.
+  const [archiveStats, setArchiveStats] = useState<DashboardStats | null>(null);
 
-  // serverResults != null → активен серверный поиск по всей базе; иначе — дефолтный топ-2000.
+  // serverResults != null → активна серверная выборка за период (окно или месяц архива);
+  // иначе — дефолтный топ-2000 текущего периода.
   const articles = serverResults ?? initialArticles;
-  const stats = initialStats;
+  const stats = archiveMonth ? archiveStats : initialStats;
+  // Архив — только просмотр: статус и «в дайджест» не меняются (сервер ответит 409).
+  const readOnly = Boolean(archiveMonth) && (archiveStats?.window?.read_only ?? true);
   // Вкладка «Со статусом»: статьи, у которых статус сменили (review/digest/archive/noise/duplicate).
   const statusChangedCount = articles.filter((article) => article.status !== "new").length;
 
@@ -116,7 +128,8 @@ export function ArticlesPage(props: Props) {
     || Boolean(dateFrom)
     || Boolean(dateTo)
     || sort !== DEFAULT_SIGNAL_SORT
-    || viewTab === "withStatus";
+    || viewTab === "withStatus"
+    || Boolean(archiveMonth);
   // ВАЖНО: только useMemo, иначе объект пересоздаётся на каждом рендере. Он стоит в deps
   // ДВУХ эффектов ниже (серверный поиск + 40с-автообновление), а эффект поиска сам зовёт
   // setServerResults/setSearching → рендер → новая идентичность объекта → эффект снова →
@@ -137,25 +150,41 @@ export function ArticlesPage(props: Props) {
             dateTo: dateTo || undefined,
             sort: sort as ArticleQuery["sort"],
             changedOnly: viewTab === "withStatus",
+            month: archiveMonth || undefined,
             limit: 5000,
           }
         : null,
-    [hasServerQuery, search, tag, status, source, language, scoreMin, scoreMax, dateFrom, dateTo, sort, viewTab],
+    [hasServerQuery, search, tag, status, source, language, scoreMin, scoreMax, dateFrom, dateTo, sort, viewTab, archiveMonth],
   );
+
+  // Ключ текущей выборки. Обновление, ушедшее со старым ключом, свой ответ не применяет:
+  // иначе, если за время запроса человек вернулся из архива к текущему периоду, строки
+  // августа встали бы под шапку сентября — с активным выбором статуса.
+  const activeQueryKey = JSON.stringify(activeServerQuery);
+  const activeQueryKeyRef = useRef(activeQueryKey);
+  useEffect(() => {
+    activeQueryKeyRef.current = activeQueryKey;
+  }, [activeQueryKey]);
 
   async function refreshCatalog(options: { silent?: boolean; keepQuery?: boolean } = {}) {
     const query = options.keepQuery ? activeServerQuery : null;
+    const requestedKey = JSON.stringify(query);
     const [articlesPayload, statsPayload] = await Promise.all([
       listArticles(query ?? DEFAULT_SIGNAL_ARTICLE_QUERY),
-      getDashboardStats(),
+      getDashboardStats(archiveMonth || undefined),
     ]);
+    if (options.keepQuery && requestedKey !== activeQueryKeyRef.current) return;
     if (query) {
       setServerResults(articlesPayload);
     } else {
       setServerResults(null);
       onArticlesReloaded(articlesPayload);
     }
-    onStatsReloaded(statsPayload);
+    if (archiveMonth) {
+      setArchiveStats(statsPayload);
+    } else {
+      onStatsReloaded(statsPayload);
+    }
     if (!options.silent) {
       props.showToast("Данные обновлены");
     }
@@ -163,7 +192,26 @@ export function ArticlesPage(props: Props) {
 
   useEffect(() => {
     setRenderLimit(200);
-  }, [dateFrom, dateTo, language, scoreMax, scoreMin, search, sort, source, status, tag, viewTab]);
+  }, [dateFrom, dateTo, language, scoreMax, scoreMin, search, sort, source, status, tag, viewTab, archiveMonth]);
+
+  // Счётчики над лентой — за тот же месяц, что и сама выдача.
+  useEffect(() => {
+    if (!archiveMonth) {
+      setArchiveStats(null);
+      return;
+    }
+    let cancelled = false;
+    getDashboardStats(archiveMonth)
+      .then((payload) => {
+        if (!cancelled) setArchiveStats(payload);
+      })
+      .catch((error) => {
+        if (!cancelled) handleError(error, "Не удалось загрузить счётчики архива");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [archiveMonth]);
 
   // Реалтайм без перезагрузки: тихо подтягиваем свежие сигналы и счётчики.
   // Без тостов; пауза в фоновой вкладке, во время загрузки и при серверном поиске
@@ -298,7 +346,10 @@ export function ArticlesPage(props: Props) {
 
     // Порядок: общие по базе (всего, обработано) → затем по пользователю (его статусы).
     return [
-      { label: "Всего сигналов", value: total },
+      // «Всего собрано», а не «бизнес-сигналов»: плитка намеренно считает весь объём за период,
+      // включая отсев гейтом (решение владельца 25.07). Бизнес-сигналы — отобранное и
+      // оценённое (документ заказчика 19.09); их число — «N из M» над каталогом.
+      { label: "Всего собрано", value: total },
       { label: "Обработано", value: processedCount },
       { label: "Почищено", value: cleanedCount },
       { label: "В архиве", value: archiveCount },
@@ -379,9 +430,19 @@ export function ArticlesPage(props: Props) {
     <section className="screenStack">
       <header className="screenHeader">
         <div>
-          <h1>Сигналы</h1>
+          <h1>Бизнес-сигналы</h1>
+          {archiveMonth ? null : <p>{windowPeriodText(initialStats?.window)}</p>}
         </div>
       </header>
+
+      {archiveMonth ? (
+        <div className="archiveNotice" role="status">
+          <span>{archiveNoticeText(archiveMonth)}</span>
+          <button type="button" className="ghostButton compactButton" onClick={() => setArchiveMonth("")}>
+            К текущему периоду
+          </button>
+        </div>
+      ) : null}
 
       <section className="statsGridReact">
         {dashboardCards.map((card) => (
@@ -396,21 +457,34 @@ export function ArticlesPage(props: Props) {
         <button type="button" className={viewTab === "withStatus" ? "primaryButton" : "ghostButton"} onClick={() => setViewTab("withStatus")}>
           Со статусом{statusChangedCount > 0 ? ` (${statusChangedCount})` : ""}
         </button>
+        {archiveMonths.length ? (
+          <label className="archiveMonthSelect">
+            <span>Архив</span>
+            <select value={archiveMonth} onChange={(event) => setArchiveMonth(event.target.value)}>
+              <option value="">Текущий период</option>
+              {archiveMonths.map((item) => (
+                <option key={item.month} value={item.month}>
+                  {monthLabel(item.month)} · {item.articles}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
       </div>
 
       <section className="panel">
-        {busy ? <InlineLoader label="Обновляем сигналы…" /> : null}
+        {busy ? <InlineLoader label="Обновляем бизнес-сигналы…" /> : null}
         <div className="panelHeader">
-          <h2>Каталог сигналов</h2>
+          <h2>{archiveMonth ? `Архив бизнес-сигналов · ${monthLabel(archiveMonth)}` : "Каталог бизнес-сигналов"}</h2>
           <div className="settingsActions">
             <span className="badge">
               {searching
-                ? "Обновляем выборку по всей базе…"
+                ? "Обновляем выборку…"
                 : serverResults !== null
-                  ? `Выборка по всей базе: ${filteredArticles.length}`
+                  ? `Выборка по фильтрам: ${filteredArticles.length}`
                   : remaining > 0
-                    ? `${filteredArticles.length} из ${workingTotal} сигналов · показаны ${visibleArticles.length}`
-                    : `${filteredArticles.length} из ${workingTotal} сигналов`}
+                    ? `${filteredArticles.length} из ${workingTotal} бизнес-сигналов · показаны ${visibleArticles.length}`
+                    : `${filteredArticles.length} из ${workingTotal} бизнес-сигналов`}
             </span>
             {filterHint ? <span className="badge filterHintBadge">{filterHint}</span> : null}
             {grouped.length ? (
@@ -432,7 +506,7 @@ export function ArticlesPage(props: Props) {
         <div className="articlesFiltersRow">
           <label className="field">
             <span>Поиск</span>
-            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Поиск по всей базе: название, текст, суть" />
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Поиск за период: название, текст, суть" />
           </label>
           <div className="field sourceComboReact">
             <span>Тег</span>
@@ -617,7 +691,7 @@ export function ArticlesPage(props: Props) {
                     <span className="miniPill muted">{group}</span>
                   </span>
                   <span className="articleGroupHeadMeta">
-                    <span className="metaText">{groupArticles.length} сигналов · средняя</span>
+                    <span className="metaText">{groupArticles.length} бизнес-сигналов · средняя</span>
                     <span className={`miniPill ${scoreClass(groupAvg)}`}>{groupAvg}</span>
                   </span>
                 </button>
@@ -664,16 +738,26 @@ export function ArticlesPage(props: Props) {
                               {Math.round(article.score || 0)}
                             </div>
                             <div className={`miniPill ${ratingClass(article.rating)}`}>{article.rating || "—"}</div>
-                            <label className="field">
-                              <span>Статус</span>
-                              <select value={article.status} onChange={(event) => void handleStatusChange(article.id, event.target.value as Article["status"])}>
-                                {STATUSES.map((option) => (
-                                  <option key={option} value={option}>
-                                    {STATUS_LABELS[option]}
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
+                            {readOnly ? (
+                              // Архив — только просмотр: статус виден, но не меняется.
+                              <div className="field">
+                                <span>Статус</span>
+                                <span className="miniPill muted" title="Архив — только просмотр">
+                                  {STATUS_LABELS[article.status]}
+                                </span>
+                              </div>
+                            ) : (
+                              <label className="field">
+                                <span>Статус</span>
+                                <select value={article.status} onChange={(event) => void handleStatusChange(article.id, event.target.value as Article["status"])}>
+                                  {STATUSES.map((option) => (
+                                    <option key={option} value={option}>
+                                      {STATUS_LABELS[option]}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                            )}
                           </div>
                         </div>
                         {open ? (

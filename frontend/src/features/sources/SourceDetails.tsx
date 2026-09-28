@@ -1,6 +1,6 @@
 import type { Source, SourceDiagnostics, SourceHealth, SourcePatch } from "../../api/types";
 import { FeedbackPanel } from "../feedback/FeedbackPanel";
-import { diagnosticText, diagnosticVerdictClass, diagnosticVerdictLabel, getSourceTriage, healthClass, healthLabel, strategyLabel } from "./sourceUtils";
+import { diagnosticText, diagnosticVerdictClass, diagnosticVerdictLabel, getSourceTriage } from "./sourceUtils";
 
 type Props = {
   source: Source;
@@ -20,16 +20,17 @@ type Props = {
   onUnarchive: () => void;
 };
 
-export function SourceCard(props: Props) {
+// Раскрытая строка таблицы источников. Имя, ссылка, тип и состояние уже видны в самой
+// строке — здесь только то, что нужно, чтобы с источником что-то сделать.
+export function SourceDetails(props: Props) {
   const { source, health, diagnostic, hasDraft, pending, pendingLabel, focused } = props;
   const primaryUrl = source.url || source.rss_url || source.listing_url || "";
   const triage = getSourceTriage(source, health, diagnostic);
 
   return (
-    <article className={focused ? "sourceCardReact focused" : "sourceCardReact"} id={`source-${source.id}`}>
+    <article className={focused ? "sourceCardReact focused" : "sourceCardReact"}>
       <div className="sourceTop">
         <div className="sourceSummary">
-          <div className="sourceName">{source.name}</div>
           <div className="sourceLink">
             {primaryUrl ? (
               <a href={primaryUrl} target="_blank" rel="noreferrer">
@@ -40,10 +41,7 @@ export function SourceCard(props: Props) {
             )}
           </div>
           <div className="sourceMeta">
-            <span className={`miniPill ${healthClass(health?.verdict)}`}>{healthLabel(health?.verdict)}</span>
-            <span className="miniPill muted">{Number(health?.articles || 0)} статей</span>
-            <span className={`typePill ${source.parse_strategy || "none"}`}>{strategyLabel(source.parse_strategy)}</span>
-            {health?.last_article_at ? <span className="metaText">последняя статья {String(health.last_article_at).slice(0, 10)}</span> : null}
+            <span className="miniPill muted">{Number(health?.articles || 0)} материалов всего</span>
             {hasDraft ? <span className="miniPill draft">есть правки</span> : null}
             {pendingLabel ? (
               <span className="miniPill info pendingPill">
@@ -53,10 +51,17 @@ export function SourceCard(props: Props) {
             ) : null}
           </div>
         </div>
-        <label className="toggleLabel">
-          <input type="checkbox" checked={source.enabled} onChange={(event) => props.onToggle(event.target.checked)} />
-          <span>{source.enabled ? "вкл" : "выкл"}</span>
-        </label>
+        {source.archived_at ? null : (
+          <label className="toggleLabel">
+            <input
+              type="checkbox"
+              aria-label={`Сбор: ${source.name}`}
+              checked={source.enabled}
+              onChange={(event) => props.onToggle(event.target.checked)}
+            />
+            <span>{source.enabled ? "сбор вкл" : "сбор выкл"}</span>
+          </label>
+        )}
       </div>
 
       <section className={`sourceTriagePanel ${triage.tone}`}>

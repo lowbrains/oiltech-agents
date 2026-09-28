@@ -34,6 +34,8 @@ export function listSources() {
   return apiFetch<Source[]>("/api/sources?limit=500");
 }
 
+// Порог «Требуют внимания» (stale_days) не передаём намеренно: правило одно, его держит
+// сервер — config.SOURCE_STALE_DAYS. Своя копия числа здесь разошлась бы с CLI и замерами.
 export function listSourceHealth() {
   return apiFetch<SourceHealth[]>("/api/source-health?limit=500");
 }

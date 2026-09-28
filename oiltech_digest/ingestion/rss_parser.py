@@ -8,6 +8,7 @@ pre-filter очевидного шума; спорные материалы ос
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,8 @@ import feedparser
 from oiltech_digest import config
 from oiltech_digest.config import MAX_WORKERS
 from oiltech_digest.db import repository
-from oiltech_digest.ingestion import normalize
+from oiltech_digest.ingestion import normalize, verdicts
+from oiltech_digest.ingestion.verdicts import Step
 from oiltech_digest.ingestion.http_client import fetch
 from oiltech_digest.ingestion import request_parser
 from oiltech_digest.ingestion import telegram_parser
@@ -46,15 +48,31 @@ def extract_articles_from_feed(
     и внешним фетчем `external_fetch._process_rss` (статьи едут на core, там и
     вставляются). Возвращает (recs, stats), где stats — skipped_old/irrelevant.
     """
+    recs: list[dict] = []
+    stats = {"skipped_old": 0, "skipped_irrelevant": 0}
+    for step in feed_entry_steps(source, content, max_age_days):
+        if step.stage == verdicts.OLD:
+            stats["skipped_old"] += 1
+        elif step.stage == verdicts.PREFILTER:
+            stats["skipped_irrelevant"] += 1
+        elif step.stage == verdicts.READY:
+            recs.append(step.record)
+    return recs, stats
+
+
+def feed_entry_steps(source: dict, content: bytes, max_age_days: int | None = None) -> Iterator[Step]:
+    """Рубежи сбора по каждому пункту ленты, в порядке ленты: OLD, PREFILTER или READY.
+
+    Единственная реализация: extract_articles_from_feed берёт из READY записи для
+    вставки, проба источника (`source-probe`) — вердикты. Пункт без заголовка или
+    ссылки сбор пропускает молча — шага у него нет.
+    """
     feed = feedparser.parse(content)
     cutoff = None
     if max_age_days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
 
     language = _guess_language(source)
-    recs: list[dict] = []
-    stats = {"skipped_old": 0, "skipped_irrelevant": 0}
-
     for entry in feed.entries:
         title = normalize.clean_html(entry.get("title", ""))
         url = entry.get("link", "")
@@ -62,23 +80,25 @@ def extract_articles_from_feed(
             continue
 
         published = normalize.parse_date(entry)
+        seen = {"url": url, "title": title[:500], "published_at": published}
         if cutoff is not None and published is not None and published < cutoff:
-            stats["skipped_old"] += 1
+            yield Step(verdicts.OLD, **seen)
             continue
 
         summary = normalize.clean_html(entry.get("summary", entry.get("description", "")))
         pre_filter = should_keep_article(title, summary, source)
         if not pre_filter.keep:
-            stats["skipped_irrelevant"] += 1
             logger.info(
                 "RSS pre-filter skipped %s: %s (%s)",
                 source.get("name"),
                 title,
                 ", ".join(pre_filter.matched_noise[:5]),
             )
+            yield Step(verdicts.PREFILTER, **seen, text_chars=len(summary),
+                       detail=", ".join(pre_filter.matched_noise[:5]))
             continue
 
-        recs.append({
+        yield Step(verdicts.READY, **seen, text_chars=len(summary), record={
             "source_id": source["id"],
             "title": title[:500],
             "url": url,
@@ -89,7 +109,12 @@ def extract_articles_from_feed(
             "content_hash": normalize.compute_content_hash(title, url),
             "image_url": normalize.extract_image(entry) or None,
         })
-    return recs, stats
+
+
+def collected_externally(source: dict) -> bool:
+    """Источник собирает зарубежный воркер, а не этот процесс (гео-роутинг parse_all)."""
+    return (bool(config.FETCH_EXTERNAL_ENABLED and config.EXTERNAL_WORKERS_ENABLED)
+            and str(source.get("network_region") or "auto").strip().lower() == "external")
 
 
 def parse_source(source: dict, max_age_days: int | None = None) -> dict:
@@ -128,8 +153,7 @@ def parse_all(max_age_days: int | None = None, workers: int = MAX_WORKERS,
     # WAF/таймаут), а на зарубежном воркере через enqueue-external-scrape. Чтобы не
     # дублировать работу и не засорять логи их 403/таймаутами — выкидываем из локального
     # прогона. Флаг выключен → ведём себя как раньше (всё локально).
-    if config.FETCH_EXTERNAL_ENABLED and config.EXTERNAL_WORKERS_ENABLED:
-        sources = [s for s in sources if str(s.get("network_region") or "auto").strip().lower() != "external"]
+    sources = [s for s in sources if not collected_externally(s)]
     if source_id is not None:
         sources = [s for s in sources if s["id"] == source_id]
 

@@ -20,14 +20,14 @@ from pydantic import BaseModel
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from oiltech_digest import auth, background_jobs, backlog, config
+from oiltech_digest import auth, background_jobs, backlog, config, feed_window
 from oiltech_digest.benchmarks import run_readiness_benchmark
 from oiltech_digest.config import REPO_ROOT
 from oiltech_digest.db.connection import get_connection
-from oiltech_digest.db import documents_repo, repository
+from oiltech_digest.db import analytics, documents_repo, repository
 from oiltech_digest.logging_utils import setup_logging
 from oiltech_digest.maintenance import maintenance_cleanup, maintenance_status
-from oiltech_digest import network_policy
+from oiltech_digest import contract, lanes, network_policy
 from oiltech_digest.processing.pipeline import (
     make_client,
     process_pipeline_articles,
@@ -39,7 +39,7 @@ from oiltech_digest.documents import external as documents_external
 from oiltech_digest.documents import parsing as doc_parsing
 from oiltech_digest.documents.model import DocumentError
 from oiltech_digest.ingestion.manual_import import ManualImportError, import_article as import_manual_article
-from oiltech_digest.ingestion.source_diagnostics import diagnose_source
+from oiltech_digest.ingestion.source_diagnostics import diagnose_source, probe_strategies
 from oiltech_digest.processing.digest import (
     build_digest_content,
     get_digest_branding,
@@ -355,6 +355,14 @@ class ExternalWorkerFailRequest(ExternalWorkerLeaseRequest):
     error: str
     retryable: bool = True
     retry_after_seconds: int | None = None
+    # Сделанная часть пакета (partial): так зависший ИИ-пакет отдаёт сторож аренды воркера.
+    # Воркер до 28.09 поля не шлёт — тогда это прежний fail.
+    result: dict[str, Any] | None = None
+
+
+class ExternalWorkerReleaseRequest(ExternalWorkerLeaseRequest):
+    reason: str = ""
+    result: dict[str, Any] | None = None
 
 
 class DigestSocialIn(BaseModel):
@@ -428,6 +436,22 @@ class UserUpdate(BaseModel):
     password: str | None = None
 
 
+def require_backlog_module() -> None:
+    """Трекер задач — архивный модуль (решение владельца 23.09): без флага его нет.
+
+    404, а не 403: для посетителя модуль не существует, как и пункт меню. Вернуть —
+    ARCHIVED_MODULES=backlog (у сервиса tasks в профиле compose `archive` он прописан).
+    """
+    if "backlog" not in config.ARCHIVED_MODULES:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _session_payload(user: dict[str, Any]) -> dict[str, Any]:
+    """Ответ входа и проверки сессии. `archived_modules` — архивные модули, включённые
+    флагом: фронт показывает их экраны только из этого списка."""
+    return {"ok": True, "user": _clean(user), "archived_modules": sorted(config.ARCHIVED_MODULES)}
+
+
 @app.get("/", response_model=None)
 def index():
     if os.environ.get("TASKS_APP_MODE") == "1":
@@ -437,8 +461,8 @@ def index():
     return FileResponse(WEB_DIR / "app.html")
 
 
-@app.get("/tasks")
-@app.get("/tasks/")
+@app.get("/tasks", dependencies=[Depends(require_backlog_module)])
+@app.get("/tasks/", dependencies=[Depends(require_backlog_module)])
 def tasks_app() -> FileResponse:
     if (FRONTEND_DIST_DIR / "index.html").exists():
         return FileResponse(FRONTEND_DIST_DIR / "index.html")
@@ -474,11 +498,16 @@ def _set_session_cookie(response: Response, session_token: str) -> None:
 
 @app.get("/api/auth/me")
 def auth_me(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
-    return {"ok": True, "user": _clean(user)}
+    return _session_payload(user)
 
 
 @app.post("/api/auth/register")
 def auth_register(payload: AuthPayload, response: Response) -> dict[str, Any]:
+    if not config.AUTH_ALLOW_SELF_REGISTRATION:
+        # Самостоятельная регистрация закрыта (#33). Учётки заводит администратор:
+        # экран «Пользователи» или CLI create-user. 403, а не 404: путь существует,
+        # просто выключен, и честный код помогает разобраться при настройке.
+        raise HTTPException(status_code=403, detail="Регистрация закрыта, обратитесь к администратору")
     email = auth.normalize_email(payload.email)
     if not auth.validate_email(email):
         raise HTTPException(status_code=400, detail="Некорректный email")
@@ -490,7 +519,7 @@ def auth_register(payload: AuthPayload, response: Response) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc))
     session_token = repository.create_user_session(int(user["id"]))
     _set_session_cookie(response, session_token)
-    return {"ok": True, "user": _clean(user)}
+    return _session_payload(user)
 
 
 @app.post("/api/auth/login")
@@ -500,7 +529,7 @@ def auth_login(payload: AuthPayload, response: Response) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
     session_token = repository.create_user_session(int(user["id"]))
     _set_session_cookie(response, session_token)
-    return {"ok": True, "user": _clean(user)}
+    return _session_payload(user)
 
 
 @app.post("/api/auth/logout")
@@ -596,9 +625,12 @@ def list_articles(
     sort: str = Query("score_desc", pattern="^(date_desc|score_desc|score_asc)$"),
     changed_only: bool = False,
     limit: int = Query(1000, ge=1, le=5000),
+    month: str | None = Query(None, pattern=feed_window.MONTH_PATTERN),
     user: dict[str, Any] = Depends(require_user),
 ) -> list[dict[str, Any]]:
-    clauses = []
+    # Окно месяца (ADR 0001, п. 6): без `month` — открытые месяцы, с `month` — один
+    # месяц, прошлый открывается архивом только на просмотр. Для всех ролей одинаково.
+    clauses = [feed_window.current(month).sql("a")]
     params: list[Any] = []
     if search:
         # Ищем по тому, ЧТО ЧЕЛОВЕК ВИДИТ, и по тегу. Раньше было два расхождения:
@@ -657,16 +689,10 @@ def list_articles(
     if date_to:
         clauses.append("COALESCE(a.published_at::date, a.collected_at::date) <= %s")
         params.append(date_to)
-    # Скрываем отклонённые гейтом релевантности статьи (relevant=false), как это уже
-    # делает дайджест. relevant IS NULL (ещё не проверенные) остаются видны.
-    clauses.append("c.relevant IS NOT FALSE")
-    # Скрываем помеченные на удаление (recheck --mark): исчезают из ленты, но физически
-    # ещё в БД (восстановимы recheck-unmark до recheck-purge).
-    clauses.append("NOT a.pending_deletion")
-    # Архивный источник уносит с собой свои статьи (требование заказчика 12.09).
-    # Именно этого не делало `enabled = FALSE`: сбор прекращался, а накопленный мусор
-    # продолжал висеть в ленте у ВСЕХ пользователей — лента джойнит sources без условия.
-    clauses.append("s.archived_at IS NULL")
+    # Базовая видимость — одно условие с её счётчиками, архивом и сборщиком выпуска
+    # (отсев гейтом, помеченное на удаление, архивный источник, перепечатка): иначе цифры
+    # над лентой расходятся с ней самой (23.09: 2 205 против 1 934). См. feed_window.visible_sql.
+    clauses.append(feed_window.visible_sql())
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     order_by = {
         "date_desc": "a.published_at DESC NULLS LAST, COALESCE(sc.total_score, 0) DESC, a.id DESC",
@@ -714,17 +740,36 @@ def list_articles(
 
 
 @app.get("/api/stats")
-def dashboard_stats(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
-    """Authoritative dashboard counters, computed over the full database."""
-    return _clean(repository.dashboard_stats(int(user["id"])))
+def dashboard_stats(
+    month: str | None = Query(None, pattern=feed_window.MONTH_PATTERN),
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    """Счётчики ленты — по тому же окну месяца, что и сама лента.
+
+    Иначе плитки считали бы всю базу (31 тыс.), а лента показывала бы сентябрь
+    (2 тыс.), и цифры над лентой перестали бы с ней сходиться. `window` сообщает
+    фронту открытые месяцы и признак архива «только просмотр».
+    """
+    window = feed_window.current(month)
+    payload = repository.dashboard_stats(int(user["id"]), window=window)
+    payload["window"] = window.describe()
+    return _clean(payload)
 
 
-@app.get("/api/backlog")
+@app.get("/api/feed-window")
+def feed_window_months(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    """Открытые месяцы ленты и прошлые месяцы для переключателя «Архив» (с числом статей)."""
+    window = feed_window.current()
+    archive = repository.feed_archive_months(window, user_id=int(user["id"]))
+    return _clean({**window.describe(), "archive": archive})
+
+
+@app.get("/api/backlog", dependencies=[Depends(require_backlog_module)])
 def backlog_endpoint(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     return backlog.read_backlog()
 
 
-@app.post("/api/backlog/tasks")
+@app.post("/api/backlog/tasks", dependencies=[Depends(require_backlog_module)])
 def create_backlog_task_endpoint(payload: BacklogTaskCreate, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     try:
         return backlog.create_plan_task(payload.title, priority=payload.priority, status=payload.status, details=payload.details, due_date=payload.due_date)
@@ -732,7 +777,7 @@ def create_backlog_task_endpoint(payload: BacklogTaskCreate, user: dict[str, Any
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.patch("/api/backlog/tasks/{task_id}")
+@app.patch("/api/backlog/tasks/{task_id}", dependencies=[Depends(require_backlog_module)])
 def update_backlog_task_endpoint(
     task_id: str,
     payload: BacklogTaskPatch,
@@ -754,7 +799,7 @@ def update_backlog_task_endpoint(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/backlog/tasks/{task_id}/comments")
+@app.post("/api/backlog/tasks/{task_id}/comments", dependencies=[Depends(require_backlog_module)])
 def create_backlog_task_comment_endpoint(
     task_id: str,
     payload: BacklogTaskCommentCreate,
@@ -779,9 +824,25 @@ def update_article(article_id: int, patch: ArticlePatch, user: dict[str, Any] = 
         # `review`, который ничего не делал). `archive` теперь скрывает статью из ленты.
         target_status = "digest" if patch.selected_for_digest else "archive"
     with get_connection() as conn:
-        exists = conn.execute("SELECT 1 FROM articles WHERE id = %s", (article_id,)).fetchone()
-        if not exists:
+        row = conn.execute(
+            f"SELECT {feed_window.period_month_sql('a')} FROM articles a WHERE a.id = %s",
+            (article_id,),
+        ).fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="Article not found")
+    # Архив — только просмотр (решение владельца 23.09): статус и «в дайджест» у статьи
+    # прошлого месяца не меняются ни из интерфейса, ни прямым запросом. Ради этого и
+    # сделан зазор до FEED_ROLLOVER_DAY: выпуск собирается, пока прошлый месяц виден.
+    window = feed_window.current()
+    if not window.is_open(row[0]):
+        closed = feed_window.month_label(feed_window.parse_month(row[0]))
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Статья относится к архиву за {closed}. Архив открыт только для просмотра: "
+                "статус и отметку «в дайджест» у статей прошлых месяцев менять нельзя."
+            ),
+        )
     previous = repository.get_user_article_status(int(user["id"]), article_id)
     repository.set_user_article_status(
         int(user["id"]), article_id, status=target_status, analyst_comment=patch.analyst_comment
@@ -827,9 +888,10 @@ def list_sources(
 
 @app.get("/api/source-health")
 def source_health(
-    stale_days: int = Query(3, ge=1, le=30),
+    # Экран порог не передаёт: без него отчёт берёт config.SOURCE_STALE_DAYS.
+    stale_days: int | None = Query(None, ge=1, le=30),
     limit: int = Query(500, ge=1, le=1000),
-    verdict: str | None = Query(None, pattern="^(ok|stale|no_articles|disabled)$"),
+    verdict: str | None = Query(None, pattern=f"^({'|'.join(repository.SOURCE_HEALTH_VERDICTS)})$"),
     user: dict[str, Any] = Depends(require_user),
 ) -> list[dict[str, Any]]:
     return [_clean(row) for row in repository.source_health_report(stale_days=stale_days, limit=limit, verdict=verdict)]
@@ -1272,19 +1334,28 @@ def approve_source_candidate(
 
 @app.post("/api/sources")
 def create_source(payload: SourceCreate, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-    # Пользователь вставляет просто ссылку на источник — система сама ищет RSS-ленту.
-    # Нашла → parse_strategy='rss' с найденным фидом; не нашла → 'request' (скрейп
-    # страницы новостей). RSS можно передать и явно (тогда discover пропускается).
+    # Пользователь вставляет просто ссылку — система пробует к ней КАЖДУЮ стратегию:
+    # RSS-ленту (и проверяет, что она не мёртвая), обычный запрос, браузер; если с
+    # РФ-ядра сайт закрыт — ставит сбор через зарубежный воркер. До 18.09 здесь был
+    # только поиск RSS, а без него — молча `request` по введённому адресу: так
+    # заводились источники, не давшие ни одной статьи никогда. RSS, переданный явно,
+    # берётся как есть.
     site_url = (payload.url or payload.rss_url or "").strip()
     rss_url = (payload.rss_url or "").strip()
-    parse_strategy = "rss"
+    parse_strategy, listing_url, network_region, enabled, probe = "rss", None, "auto", True, None
     if not rss_url and site_url:
-        from oiltech_digest.ingestion.rss_discovery import discover_feed
-        found = discover_feed(site_url)
-        if found:
-            rss_url = found
+        probe = probe_strategies(site_url)
+        chosen = probe.get("chosen")
+        if chosen:
+            parse_strategy = chosen["parse_strategy"]
+            rss_url = chosen.get("rss_url") or ""
+            listing_url = chosen.get("listing_url")
+            network_region = chosen.get("network_region") or "auto"
         else:
-            parse_strategy = "request"
+            # Сайт открылся, но статей не дала ни одна стратегия. Заводим выключенным:
+            # включённый он опрашивался бы вечно впустую. Настроить селектор и
+            # включить — руками, отчёт перебора в ответе.
+            parse_strategy, listing_url, enabled = "request", site_url, False
     source_id = repository.add_rss_source(
         name=payload.name,
         rss_url=rss_url,
@@ -1294,7 +1365,11 @@ def create_source(payload: SourceCreate, user: dict[str, Any] = Depends(require_
         update_frequency=payload.update_frequency,
         parse_strategy=parse_strategy,
     )
-    return {"ok": True, "id": source_id, "rss_url": rss_url or None, "parse_strategy": parse_strategy}
+    repository.set_source_collection(source_id, listing_url=listing_url, network_region=network_region,
+                                     enabled=enabled)
+    return {"ok": True, "id": source_id, "rss_url": rss_url or None, "parse_strategy": parse_strategy,
+            "listing_url": listing_url, "network_region": network_region, "enabled": enabled,
+            "probe": _clean(probe) if probe else None}
 
 
 @app.post("/api/articles/import")
@@ -1720,6 +1795,29 @@ def signal_memory(
     return [_clean(row) for row in repository.list_signal_agent_memory(memory_type=memory_type, status=normalized_status, limit=limit)]
 
 
+@app.get("/api/signals/search-health")
+def signal_search_health(user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    """Здоровье поиска последнего ежедневного прогона радара — только админу.
+
+    23–27.09 Brave отвечал 402 во всех темах, задача оставалась ok, и пять дней этого никто
+    не видел. Обычный пользователь сюда не ходит (403), его экран не меняется."""
+    run = repository.latest_signal_generation_run(
+        payload_subset={"schedule": background_jobs.DAILY_SIGNAL_DISCOVERY_MARKER}
+    )
+    result = (run or {}).get("result_json") or {}
+    health = result.get("search_health")
+    if not run or not health:
+        return {"search_health": None}
+    return _clean({"search_health": {
+        **health,
+        "run_id": run["id"],
+        "job_id": run["background_job_id"],
+        "run_at": run["run_at"],
+        "status": run["status"],
+        "signals": result.get("signals"),
+    }})
+
+
 @app.post("/api/jobs/signal-discovery")
 def enqueue_signal_discovery(payload: SignalDiscoveryRequest, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     if payload.days < 1 or payload.days > 90:
@@ -1772,8 +1870,40 @@ def update_digest_branding(payload: DigestBrandingIn, user: dict[str, Any] = Dep
     return {"ok": True, "branding": _clean(save_digest_branding(payload.model_dump()))}
 
 
+def _guard_issue_edit(month: str, article_ids: list[int]) -> None:
+    """Правка черновика выпуска: месяц «ГГГГ-ММ», не архивный, и без статей из архива.
+
+    Решение владельца 23.09: прошлый выпуск — только просмотр и выгрузка. Статью прошлого
+    месяца нельзя провести и в выпуск открытого месяца: PUT принимает готовый список
+    статей, и без этой проверки «из архива в дайджест» проходило бы запросом в обход ленты.
+    """
+    try:
+        issue_month = feed_window.parse_month(month)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Месяц выпуска задаётся как ГГГГ-ММ")
+    window = feed_window.current()
+    if not window.is_open(feed_window.month_key(issue_month)):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Выпуск за {feed_window.month_label(issue_month)} в архиве: "
+                "его можно смотреть и выгружать, но не менять."
+            ),
+        )
+    closed = sorted(m for m in repository.article_period_months(article_ids) if not window.is_open(m))
+    if closed:
+        labels = ", ".join(feed_window.month_label(feed_window.parse_month(m)) for m in closed)
+        raise HTTPException(
+            status_code=409,
+            detail=f"В выпуск нельзя добавить статьи из архива ({labels}): архив открыт только для просмотра.",
+        )
+
+
 @app.post("/api/monthly-digests")
 def create_monthly_digest(payload: DigestRequest, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    # Состав собирается на сервере из выбранного за этот месяц, поэтому архивных статей в
+    # нём не будет, если сам месяц открыт.
+    _guard_issue_edit(payload.month, [])
     return _clean(
         save_digest_draft(
             month=payload.month,
@@ -1797,6 +1927,7 @@ def get_monthly_digest(month: str, user: dict[str, Any] = Depends(require_user))
 
 @app.put("/api/monthly-digests/{month}")
 def update_monthly_digest(month: str, payload: MonthlyDigestUpdateRequest, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    _guard_issue_edit(month, [item.article_id for item in payload.items])
     saved = repository.save_monthly_digest(
         month=month,
         title=payload.title or f"Нефтесервисный дайджест · {month}",
@@ -1929,8 +2060,17 @@ def _lease_seconds(value: int | None) -> int:
 @app.post("/api/external-worker/claim")
 def external_worker_claim(
     payload: ExternalWorkerClaimRequest,
+    x_worker_build: str | None = Header(default=None),
+    x_worker_contract: str | None = Header(default=None),
     _: None = Depends(require_external_worker),
 ) -> dict[str, Any]:
+    try:
+        repository.record_external_consumer(
+            payload.worker_id, queues=payload.queues, build=(x_worker_build or "").strip()[:64] or None,
+            contract_number=contract.parse_contract(x_worker_contract),
+        )
+    except Exception:  # noqa: BLE001 - учёт версий не должен останавливать выдачу задач
+        logger.warning("external_consumer_record_failed worker=%s", payload.worker_id, exc_info=True)
     repository.requeue_expired_external_leases()
     lease_token = secrets.token_urlsafe(32)
     job = repository.claim_external_background_job(
@@ -1942,7 +2082,24 @@ def external_worker_claim(
     )
     if job is None:
         return {"job": None}
-    return {"job": {**_job_payload(job), "payload": _external_worker_payload(job), "lease_token": lease_token}}
+    try:
+        worker_payload = _external_worker_payload(job)
+    except repository.ArticlesBusy:
+        # Статьи явного списка держит соседняя задача: выдадим позже, когда она закончит,
+        # а не параллельно (иначе итог зависел бы от того, чей apply придёт последним).
+        repository.defer_claimed_background_job(int(job["id"]), seconds=120)
+        return {"job": None}
+    except external_ai.InvalidJobPayload as exc:
+        # Не выдаём: воркер оплатил бы ответ модели, а запись отказала бы (ревью 27.09).
+        repository.fail_background_job(int(job["id"]), f"payload: {exc}")
+        return {"job": None}
+    return {"job": {**_job_payload(job), "payload": worker_payload, "lease_token": lease_token}}
+
+
+@app.get("/api/external-worker/consumers")
+def external_worker_consumers(_: None = Depends(require_external_worker)) -> dict[str, Any]:
+    """Сборки и контракты контейнеров NL — для скрипта выката на NL, где базы нет."""
+    return _clean(repository.external_consumers_status())
 
 
 @app.post("/api/external-worker/jobs/{job_id}/progress")
@@ -1998,36 +2155,7 @@ def external_worker_complete(
     if not repository.begin_external_background_job_finalize(job_id, lease_token_hash=lease_token_hash):
         raise HTTPException(status_code=409, detail="Job lease is not active")
     try:
-        if job.get("kind") == "process_articles" and result.get("external_ai"):
-            result = {**result, "applied": external_ai.apply_process_result(result, job_id=job_id)}
-        if job.get("kind") == "recheck_relevance" and result.get("recheck_relevance"):
-            # ИМЕННО payload_json: job приходит из get_background_job (SELECT *), поэтому ключи —
-            # это колонки таблицы (schema.sql:304). Ключа "payload" в строке НЕТ, и чтение его
-            # молча давало {} → mark/dry_run/force всегда False → recheck удалял статьи ФИЗИЧЕСКИ
-            # вопреки запрошенному мягкому режиму (баг T3, так уже потеряли ~2000 статей).
-            job_payload = job.get("payload_json") or {}
-            force = bool(job_payload.get("force", False))
-            dry_run = bool(job_payload.get("dry_run", False))
-            mark = bool(job_payload.get("mark", False))
-            result = {**result, "applied": external_ai.apply_recheck_result(result, force=force, dry_run=dry_run, mark=mark, job_id=job_id)}
-        if job.get("kind") == "translate_titles" and result.get("translate_titles"):
-            result = {**result, "applied": external_ai.apply_translate_result(result, job_id=job_id)}
-        if job.get("kind") == "source_candidate_evaluate" and result.get("source_candidate_evaluate"):
-            result = {**result, "applied": external_ai.apply_source_candidate_result(result, job_id=job_id)}
-        if job.get("kind") == "process_document" and result.get("process_document"):
-            applied = documents_external.apply_document_result(result, job_id=job_id)
-            # Конверт ЗАМЕНЯЕТСЯ вычищенным, а не дополняется: result_json уходит клиенту
-            # через /api/jobs, и админ читает задачи любого пользователя. Карточка и факты
-            # уже применены в таблицы документов, где проверяется владелец.
-            result = {**documents_external.scrub_result(result), "applied": applied}
-        if job.get("kind") == "scrape_source" and result.get("external_fetch"):
-            result = {**result, "applied": external_fetch.apply_scrape_result(result)}
-        if job.get("kind") == "signal_discovery" and result.get("signal_discovery"):
-            from oiltech_digest import signal_discovery
-
-            # Конверт ЗАМЕНЯЕТСЯ итогом: кандидаты с подтверждениями и промптами весят
-            # мегабайты и уже лежат в signal_training_examples — в задаче только счётчики.
-            result = {"signal_discovery": True, "applied": signal_discovery.apply_external_result(result, job_id=job_id)}
+        result = _apply_external_result(job, result, job_id)
     except Exception:
         # apply упал — снять 'finalizing', чтобы задача не залипла (вернётся в очередь по лизу/stale)
         repository.release_external_background_job_finalize(job_id, lease_token_hash=lease_token_hash)
@@ -2042,12 +2170,99 @@ def external_worker_complete(
     return {"ok": True}
 
 
+def _apply_external_result(job: dict[str, Any], result: dict[str, Any], job_id: int) -> dict[str, Any]:
+    """Записать итог внешней задачи в базу ядра — полный (complete) или частичный (release)."""
+    if job.get("kind") == "process_articles" and result.get("external_ai"):
+        # Какие стадии писать — в payload_json задачи (перегенерация сути: только суть и
+        # перевод). Ключа "payload" в строке нет — см. recheck ниже.
+        only = (job.get("payload_json") or {}).get("only")
+        result = {**result, "applied": external_ai.apply_process_result(result, job_id=job_id, only=only)}
+    if job.get("kind") == "recheck_relevance" and result.get("recheck_relevance"):
+        # ИМЕННО payload_json: job приходит из get_background_job (SELECT *), поэтому ключи —
+        # это колонки таблицы (schema.sql:304). Ключа "payload" в строке НЕТ, и чтение его
+        # молча давало {} → mark/dry_run/force всегда False → recheck удалял статьи ФИЗИЧЕСКИ
+        # вопреки запрошенному мягкому режиму (баг T3, так уже потеряли ~2000 статей).
+        job_payload = job.get("payload_json") or {}
+        force = bool(job_payload.get("force", False))
+        dry_run = bool(job_payload.get("dry_run", False))
+        mark = bool(job_payload.get("mark", False))
+        result = {**result, "applied": external_ai.apply_recheck_result(result, force=force, dry_run=dry_run, mark=mark, job_id=job_id)}
+    if job.get("kind") == "translate_titles" and result.get("translate_titles"):
+        result = {**result, "applied": external_ai.apply_translate_result(result, job_id=job_id)}
+    if job.get("kind") == "source_candidate_evaluate" and result.get("source_candidate_evaluate"):
+        result = {**result, "applied": external_ai.apply_source_candidate_result(result, job_id=job_id)}
+    if job.get("kind") == "process_document" and result.get("process_document"):
+        applied = documents_external.apply_document_result(result, job_id=job_id)
+        # Конверт ЗАМЕНЯЕТСЯ вычищенным, а не дополняется: result_json уходит клиенту
+        # через /api/jobs, и админ читает задачи любого пользователя. Карточка и факты
+        # уже применены в таблицы документов, где проверяется владелец.
+        result = {**documents_external.scrub_result(result), "applied": applied}
+    if job.get("kind") == "scrape_source" and result.get("external_fetch"):
+        result = {**result, "applied": external_fetch.apply_scrape_result(result)}
+    if job.get("kind") == "reprint_review" and result.get("reprint_review"):
+        result = {**result, "applied": external_ai.apply_reprint_review_result(result, job_id=job_id)}
+    if job.get("kind") == "refetch_text" and result.get("kind") == "refetch_text":
+        result = {**result, "applied": external_fetch.apply_refetch_text_result(result)}
+    if job.get("kind") == "signal_discovery" and result.get("signal_discovery"):
+        from oiltech_digest import signal_discovery
+
+        # Конверт ЗАМЕНЯЕТСЯ итогом: кандидаты с подтверждениями и промптами весят
+        # мегабайты и уже лежат в signal_training_examples — в задаче только счётчики.
+        result = {"signal_discovery": True, "applied": signal_discovery.apply_external_result(result, job_id=job_id)}
+    return result
+
+
+@app.post("/api/external-worker/jobs/{job_id}/release")
+def external_worker_release(
+    job_id: int,
+    payload: ExternalWorkerReleaseRequest,
+    _: None = Depends(require_external_worker),
+) -> dict[str, Any]:
+    """Воркер останавливается (выкат NL) и возвращает задачу сам, не дожидаясь конца аренды.
+
+    Сделанная часть пакета записывается, как при complete, и вычитается из задачи — при
+    следующей выдаче модель не зовётся за уже оплаченное (contract.remaining_after_partial).
+    Задача сразу в очереди, попытка не списывается."""
+    job = repository.get_background_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    lease_token_hash = _sha256_hex(payload.lease_token)
+    # Застолбить, как complete: пока пишется частичный итог, реапер аренд её не переотдаст.
+    if not repository.begin_external_background_job_finalize(job_id, lease_token_hash=lease_token_hash):
+        raise HTTPException(status_code=409, detail="Job lease is not active")
+    original = dict(job.get("payload_json") or {})
+    partial = payload.result if contract.accepts_partial(job.get("kind"), payload.result, original) else None
+    reason = (payload.reason or "остановка воркера").strip()[:300]
+    try:
+        applied = _apply_external_result(job, partial, job_id) if partial else None
+    except Exception:
+        # Итог не лёг — вернуть задачу сразу и целиком: воркер уходит, ждать аренду незачем.
+        repository.requeue_released_external_job(
+            job_id, lease_token_hash=lease_token_hash, payload=contract.without_reservation(original),
+            note=f"Возвращена воркером ({reason}); частичный итог не записан",
+        )
+        raise
+    remaining = contract.remaining_after_partial(job.get("kind"), original, partial)
+    if remaining is None:
+        ok = repository.finish_external_background_job(job_id, lease_token_hash=lease_token_hash, result=applied)
+    else:
+        ok = repository.requeue_released_external_job(
+            job_id, lease_token_hash=lease_token_hash, payload=remaining,
+            note=f"Возвращена воркером ({reason}); сделано до остановки: {contract.done_count(partial)}",
+        )
+    if not ok:
+        raise HTTPException(status_code=409, detail="Job lease is not active")
+    return {"ok": True, "requeued": remaining is not None}
+
+
 @app.post("/api/external-worker/jobs/{job_id}/fail")
 def external_worker_fail(
     job_id: int,
     payload: ExternalWorkerFailRequest,
     _: None = Depends(require_external_worker),
 ) -> dict[str, Any]:
+    if payload.result and _fail_with_done_part(job_id, payload):
+        return {"ok": True}
     ok = repository.fail_external_background_job(
         job_id,
         lease_token_hash=_sha256_hex(payload.lease_token),
@@ -2058,6 +2273,46 @@ def external_worker_fail(
     if not ok:
         raise HTTPException(status_code=409, detail="Job lease is not active")
     return {"ok": True}
+
+
+def _fail_with_done_part(job_id: int, payload: ExternalWorkerFailRequest) -> bool:
+    """Сбой ИИ-пакета со снимком сделанного (шаг завис — external_worker.LeaseKeeper).
+
+    Сделанное пишется и вычитается из задачи, как при release, — модель не зовётся второй раз
+    за оплаченное. Но попытка списывается (repository.fail_finalizing_external_job): зависание
+    может сидеть в самой задаче. False — снимок не принимается (вид без частичного итога,
+    пробный прогон): тогда это обычный fail."""
+    job = repository.get_background_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    original = dict(job.get("payload_json") or {})
+    if not contract.accepts_partial(job.get("kind"), payload.result, original):
+        return False
+    lease_token_hash = _sha256_hex(payload.lease_token)
+    # Застолбить, как complete и release: пока пишется сделанное, реапер аренд её не переотдаст.
+    if not repository.begin_external_background_job_finalize(job_id, lease_token_hash=lease_token_hash):
+        raise HTTPException(status_code=409, detail="Job lease is not active")
+
+    def fail(rest: dict[str, Any], note: str) -> bool:
+        return repository.fail_finalizing_external_job(
+            job_id, lease_token_hash=lease_token_hash, payload=rest, error_message=f"{payload.error}; {note}",
+            retryable=payload.retryable, retry_delay_seconds=payload.retry_after_seconds,
+        )
+
+    try:
+        remaining = contract.remaining_after_partial(job.get("kind"), original, payload.result)
+        applied = _apply_external_result(job, payload.result, job_id)
+    except Exception:
+        # Снимок не лёг — задача уходит целиком, как обычный fail.
+        fail(contract.without_reservation(original), "частичный итог не записан")
+        raise
+    if remaining is None:
+        ok = repository.finish_external_background_job(job_id, lease_token_hash=lease_token_hash, result=applied)
+    else:
+        ok = fail(remaining, f"сделано до сбоя: {contract.done_count(payload.result)}")
+    if not ok:
+        raise HTTPException(status_code=409, detail="Job lease is not active")
+    return True
 
 
 @app.get("/api/stats/monthly")
@@ -2081,6 +2336,19 @@ def monthly_stats(
             "activity_scope": "all",
         }
     )
+
+
+@app.get("/api/analytics/monthly")
+def analytics_monthly(
+    months: int = Query(6, ge=1, le=24),
+    user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """Месячная аналитика платформы: воронка, источники, темы, скорость, цели ГД.
+
+    Только администратору — решение владельца 19.09 («показываем только админам»):
+    в ответе стоимость ИИ, коммерческая сторона. Гейт на API, а не только во фронте
+    (аудит изоляции 24.07)."""
+    return _clean(analytics.monthly_analytics(months, include_cost=True))
 
 
 @app.get("/api/maintenance/status")
@@ -2413,25 +2681,36 @@ def _get_scoped_background_job(job_id: int, user: dict[str, Any]) -> dict[str, A
     return repository.get_background_job(job_id, user_id=int(user["id"]))
 
 
-def _external_worker_payload(row: dict[str, Any]) -> dict[str, Any]:
-    payload = dict(row.get("payload_json") or {})
-    if row.get("kind") == "process_articles" and row.get("queue_name") == "external-ai":
-        return _clean(external_ai.build_process_articles_payload(payload))
-    if row.get("kind") == "recheck_relevance" and row.get("queue_name") == "external-ai":
-        return _clean(external_ai.build_recheck_payload(payload))
-    if row.get("kind") == "translate_titles" and row.get("queue_name") == "external-ai":
-        return _clean(external_ai.build_translate_payload(payload))
-    if row.get("kind") == "source_candidate_evaluate" and row.get("queue_name") == "external-ai":
-        return _clean(external_ai.build_source_candidate_evaluate_payload(payload))
-    if row.get("kind") == "process_document" and row.get("queue_name") == "external-ai":
-        return _clean(documents_external.build_document_payload(payload))
-    if row.get("kind") == "scrape_source" and str(row.get("queue_name") or "").startswith("external-"):
-        return _clean(external_fetch.build_scrape_source_payload(int(payload["source_id"]), payload))
-    if row.get("kind") == "signal_discovery" and row.get("queue_name") == "external-ai":
-        from oiltech_digest import signal_discovery
+def _signal_discovery_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    from oiltech_digest import signal_discovery
 
-        return _clean(signal_discovery.build_external_payload(payload))
-    return _clean(payload)
+    return signal_discovery.build_external_payload(payload)
+
+
+_EXTERNAL_PAYLOAD_BUILDERS: dict[str, Any] = {
+    "process_articles": lambda payload, job_id: external_ai.build_process_articles_payload(payload, job_id=job_id),
+    "recheck_relevance": lambda payload, job_id: external_ai.build_recheck_payload(payload),
+    "translate_titles": lambda payload, job_id: external_ai.build_translate_payload(payload),
+    "process_document": lambda payload, job_id: documents_external.build_document_payload(payload),
+    "scrape_source": lambda payload, job_id: external_fetch.build_scrape_source_payload(int(payload["source_id"]), payload),
+    "reprint_review": lambda payload, job_id: external_ai.build_reprint_review_payload(payload),
+    "refetch_text": lambda payload, job_id: external_fetch.build_refetch_text_payload(payload),
+    # Агенты (полоса external-agents): снимок базы для радара, статьи кандидата для оценки.
+    "source_candidate_evaluate": lambda payload, job_id: external_ai.build_source_candidate_evaluate_payload(payload),
+    "signal_discovery": lambda payload, job_id: _signal_discovery_payload(payload),
+}
+
+
+def _external_worker_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Payload для воркера — по таблице полос (lanes.py), а не по имени очереди.
+
+    Раньше ИИ-виды собирались только при queue_name == "external-ai": задача той же
+    природы в новой полосе (external-ai-bulk) ушла бы воркеру сырым payload без статей."""
+    payload = dict(row.get("payload_json") or {})
+    builder = _EXTERNAL_PAYLOAD_BUILDERS.get(str(row.get("kind") or ""))
+    if builder is None or not lanes.serves(row.get("queue_name"), row.get("kind")):
+        return _clean(payload)
+    return _clean(builder(payload, int(row["id"])))
 
 
 def _score_items_by_article(conn, article_ids: list[int]) -> dict[int, list[dict[str, Any]]]:

@@ -1,19 +1,36 @@
 #!/bin/sh
 set -u
 
+# Ровно один планировщик (ADR 0001, п. 4): весь процесс — и циклы, и паузы — идёт под
+# advisory lock в Postgres. 21.09 второй планировщик, поднятый лишним `compose up`, 8,5 ч
+# дублировал сбор и ИИ. Второй экземпляр пишет в лог, у кого замок, и ждёт, не делая ни
+# одного шага. Обёртка заодно передаёт SIGTERM шагам: shell под PID 1 его игнорировал.
+if [ "${SCHEDULER_LOCK_HELD:-0}" != "1" ]; then
+  exec python -m oiltech_digest.cli scheduler-lock -- "$0" "$@"
+fi
+
 log() {
   printf '%s %s\n' "$(date -Iseconds)" "$*"
 }
 
+# Шаг идёт под сроком (oiltech_digest/step_timeout.py): дольше STEP_TIMEOUT_SECONDS —
+# SIGTERM, через STEP_KILL_AFTER_SECONDS — SIGKILL, код 124, и цикл идёт дальше. 24.09
+# parse не вернулся 20 ч 45 мин — стоял весь цикл. Код шага берётся до всякого `if`:
+# `code="$?"` после `if …; fi` давал 0 (так по POSIX выходит `if` без ветки) — лог писал
+# «exit=0», а run_required_step не останавливал скрипт никогда.
 run_step() {
   name="$1"
   shift
   log "START ${name}"
-  if "$@"; then
+  python -m oiltech_digest.step_timeout "$STEP_TIMEOUT_SECONDS" "$STEP_KILL_AFTER_SECONDS" -- "$@"
+  code="$?"
+  if [ "$code" -eq 0 ]; then
     log "OK ${name}"
     return 0
   fi
-  code="$?"
+  if [ "$code" -eq 124 ]; then
+    log "TIMEOUT ${name}: дольше ${STEP_TIMEOUT_SECONDS} с — шаг снят"
+  fi
   log "FAIL ${name} exit=${code}"
   return "$code"
 }
@@ -25,6 +42,24 @@ run_required_step() {
 }
 
 CYCLE_INTERVAL_SECONDS="${CYCLE_INTERVAL_SECONDS:-21600}"
+# Потолок шага. Норма на проде (сентябрь): parse 620–744 с, discover-rss ~400 с, прочие
+# до 130 с — час даёт запас впятеро. 0 — без потолка.
+STEP_TIMEOUT_SECONDS="${STEP_TIMEOUT_SECONDS:-3600}"
+STEP_KILL_AFTER_SECONDS="${STEP_KILL_AFTER_SECONDS:-30}"
+# Целые секунды. Сторож с кривым сроком шаг не запускает — опечатка (1h, -5) остановила бы
+# каждый шаг, как 24.09. Поэтому кривое значение — строкой в лог и значение по умолчанию.
+case "$STEP_TIMEOUT_SECONDS" in
+  '' | *[!0-9]*)
+    log "STEP_TIMEOUT_SECONDS=«${STEP_TIMEOUT_SECONDS}» — не целое число секунд, беру 3600"
+    STEP_TIMEOUT_SECONDS=3600
+    ;;
+esac
+case "$STEP_KILL_AFTER_SECONDS" in
+  '' | *[!0-9]*)
+    log "STEP_KILL_AFTER_SECONDS=«${STEP_KILL_AFTER_SECONDS}» — не целое число секунд, беру 30"
+    STEP_KILL_AFTER_SECONDS=30
+    ;;
+esac
 RUN_DISCOVER_ON_START="${RUN_DISCOVER_ON_START:-1}"
 DISCOVER_EVERY_CYCLES="${DISCOVER_EVERY_CYCLES:-4}"
 RUN_MAINTENANCE_ON_START="${RUN_MAINTENANCE_ON_START:-1}"
@@ -49,6 +84,16 @@ FULLTEXT_RETRY_TOO_SHORT="${FULLTEXT_RETRY_TOO_SHORT:-0}"
 # с РФ-сервера) фетчатся через зарубежный воркер. Шаг enqueue-external-scrape ставит
 # их в external-fetch/external-playwright; команда сама no-op при выключенном контуре.
 FETCH_EXTERNAL_ENABLED="${FETCH_EXTERNAL_ENABLED:-0}"
+EXTERNAL_REFETCH_LIMIT="${EXTERNAL_REFETCH_LIMIT:-100}"
+# Перепечатки (№21): одна новость, разошедшаяся по изданиям. Правило сужает корпус
+# до десятков пар, решает модель, копия помечается (не удаляется) и уходит из ленты.
+# Окно намеренно шире периода запуска: уже помеченные пары правило не выдаёт
+# повторно, поэтому перекрытие почти ничего не стоит, а пропуск дубля стоит того,
+# что заказчик снова видит четыре карточки одной новости.
+# Раз в REPRINTS_INTERVAL_HOURS часов по времени прошлого прогона в базе (0 — выключено).
+REPRINTS_INTERVAL_HOURS="${REPRINTS_INTERVAL_HOURS:-12}"
+REPRINTS_DAYS="${REPRINTS_DAYS:-7}"
+REPRINTS_LIMIT="${REPRINTS_LIMIT:-200}"
 SOURCE_DISCOVERY_ENABLED="${SOURCE_DISCOVERY_ENABLED:-0}"
 SOURCE_DISCOVERY_EVERY_CYCLES="${SOURCE_DISCOVERY_EVERY_CYCLES:-24}"
 SOURCE_DISCOVERY_TOPIC_LIMIT="${SOURCE_DISCOVERY_TOPIC_LIMIT:-3}"
@@ -145,6 +190,24 @@ while true; do
     # Западные источники (network_region='external') фетчим через зарубежный воркер —
     # с РФ-сервера к ним нет доступа. Задачи разберёт NL external-worker.
     run_step "enqueue-external-scrape" python -m oiltech_digest.cli enqueue-external-scrape
+    # Обрывки у тех же источников: лента даёт анонс, а локальная дозагрузка их не
+    # берёт (403 с РФ-адреса, попытка одна навсегда). Тело добирает воркер.
+    run_step "enqueue-external-refetch" python -m oiltech_digest.cli enqueue-external-refetch \
+      --limit "$EXTERNAL_REFETCH_LIMIT"
+  fi
+
+  # Срок — от прошлого прогона с записью в базе, а не «каждый 24-й цикл»: счётчик
+  # обнулялся при каждом перезапуске, а цикл идёт ~41 мин, а не 30 — «дважды в сутки»
+  # на деле выходило раз в 16,5 ч и сдвигалось каждым выкатом (19.09). Повтор при
+  # перезапуске исключает та же проверка по базе.
+  if [ "$REPRINTS_INTERVAL_HOURS" != "0" ]; then
+    if [ "$AI_OFFLINE" = "1" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
+      run_step "find-reprints" python -m oiltech_digest.cli find-reprints \
+        --days "$REPRINTS_DAYS" --limit "$REPRINTS_LIMIT" --apply \
+        --min-interval-hours "$REPRINTS_INTERVAL_HOURS"
+    else
+      log "SKIP find-reprints: OPENAI_API_KEY is empty"
+    fi
   fi
 
   if [ "$SOURCE_DISCOVERY_ENABLED" = "1" ]; then
@@ -236,6 +299,10 @@ while true; do
         $_signal_offline_flag
     fi
   fi
+
+  # Сторож полос: застой внешней очереди или очередь без живого воркера — «FAIL
+  # check-lanes» и строки ТРЕВОГА в логе (цикл не прерывается).
+  run_step "check-lanes" python -m oiltech_digest.cli check-lanes
 
   run_step "stats" python -m oiltech_digest.cli stats
   cycle=$((cycle + 1))

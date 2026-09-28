@@ -48,6 +48,10 @@ const ADMIN_SCREENS = new Set<ScreenId>([
   "analytics-preview", "tech-preview",
 ]);
 
+// Архивные модули (утверждены владельцем 23.09): из меню и маршрутов убраны, код оставлен.
+// Экран виден, только если сервер включил его флагом ARCHIVED_MODULES (приходит с сессией).
+const ARCHIVED_SCREENS = new Set<ScreenId>(["analytics-preview", "tech-preview"]);
+
 type ScreenDef = {
   id: ScreenId;
   label: string;
@@ -65,10 +69,12 @@ type NavGroup = {
 const screens: ScreenDef[] = [
   {
     id: "articles",
-    label: "Сигналы",
+    // «Сигналы» → «Бизнес-сигналы» по документу заказчика «Главная страница» (19.09):
+    // бизнес-сигналы — отобранное и оценённое для бизнеса, технологический радар — отдельно.
+    label: "Бизнес-сигналы",
     eyebrow: "Editorial Flow",
-    title: "Поток сигналов",
-    description: "Рабочий каталог сигналов: фильтры, группировка, AI-суть, score и редактор статусов уже живут в новом интерфейсе.",
+    title: "Поток бизнес-сигналов",
+    description: "Рабочий каталог бизнес-сигналов: фильтры, группировка, AI-суть, score и редактор статусов уже живут в новом интерфейсе.",
     status: "Экран активен",
   },
   {
@@ -168,7 +174,7 @@ const appHighlights = [
   "Источники и диагностика",
   "Месячный дайджест и экспорт",
   "Скоринг и дерево тегов",
-  "Каталог сигналов",
+  "Каталог бизнес-сигналов",
 ];
 
 const navGroups: NavGroup[] = [
@@ -184,9 +190,9 @@ const navGroups: NavGroup[] = [
     label: "Администрирование",
     screens: ["users", "statistics", "source-agent"],
   },
-  // Прототипы будущих разделов. Оба экрана в ADMIN_SCREENS, поэтому у не-админа фильтр ниже
-  // (isAdmin || !ADMIN_SCREENS.has(sid)) вычистит их, visibleScreens станет пустым и вся группа
-  // не отрисуется — обычный пользователь даже не увидит, что она существует.
+  // Прототипы будущих разделов — архивные модули с 23.09: без флага ARCHIVED_MODULES фильтр
+  // ниже вычистит оба экрана, visibleScreens станет пустым и группа не отрисуется. Оба экрана
+  // ещё и в ADMIN_SCREENS: даже включённые флагом, они не видны обычному пользователю.
   {
     label: "Прототипы",
     screens: ["tech-preview", "analytics-preview"],
@@ -214,12 +220,22 @@ export function App() {
   const [toast, setToast] = useState<{ text: string; tone: "default" | "error" } | null>(null);
   const [articles, setArticles] = useState<Article[]>([]);
   const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [archivedModules, setArchivedModules] = useState<string[]>([]);
+  const screenEnabled = (screenId: ScreenId) => !ARCHIVED_SCREENS.has(screenId) || archivedModules.includes(screenId);
   const active = screens.find((screen) => screen.id === activeScreen) ?? screens[0];
   const isAdmin = (user?.role ?? "user") === "admin";
+  // Пункт меню виден: роль пускает и модуль не в архиве (или включён флагом).
+  const screenInMenu = (screenId: ScreenId) => (isAdmin || !ADMIN_SCREENS.has(screenId)) && screenEnabled(screenId);
 
   useEffect(() => {
     void loadSession();
   }, []);
+
+  // Прямая ссылка на архивный экран (?screen=tech-preview) без флага ведёт в ленту:
+  // модуля для посетителя нет, как нет и пункта меню.
+  useEffect(() => {
+    if (user && !screenEnabled(activeScreen)) switchScreen("articles");
+  }, [user, archivedModules, activeScreen]);
 
   useEffect(() => {
     if (!toast) return;
@@ -328,7 +344,8 @@ export function App() {
   }
 
   // Статичные прототипы будущих разделов (демо-данные, без логики и без обращений к API).
-  if (activeScreen === "analytics-preview") {
+  // Архивные модули: рисуются, только если включены флагом.
+  if (activeScreen === "analytics-preview" && screenEnabled("analytics-preview")) {
     currentScreen = (
       <Suspense fallback={<div className="splashScreen">Загружаем прототип…</div>}>
         <AnalyticsPreview />
@@ -336,7 +353,7 @@ export function App() {
     );
   }
 
-  if (activeScreen === "tech-preview") {
+  if (activeScreen === "tech-preview" && screenEnabled("tech-preview")) {
     currentScreen = (
       <Suspense fallback={<div className="splashScreen">Загружаем прототип…</div>}>
         <TechnologiesPreview />
@@ -381,6 +398,7 @@ export function App() {
     try {
       setAuthLoading(true);
       const payload = await getSession();
+      setArchivedModules(payload.archived_modules ?? []);
       setUser(payload.user);
       if (!isTasksApp) {
         await loadDashboardData();
@@ -398,6 +416,7 @@ export function App() {
   async function submitAuth() {
     try {
       const payload = authMode === "register" ? await register(email.trim(), password) : await login(email.trim(), password);
+      setArchivedModules(payload.archived_modules ?? []);
       setUser(payload.user);
       if (!isTasksApp) {
         await loadDashboardData();
@@ -417,6 +436,7 @@ export function App() {
     setUser(null);
     setArticles([]);
     setStats(null);
+    setArchivedModules([]);
   }
 
   async function handleLogout() {
@@ -425,6 +445,7 @@ export function App() {
       setUser(null);
       setArticles([]);
       setStats(null);
+      setArchivedModules([]);
       showToast("Сессия завершена");
     } catch (error) {
       showToast(error instanceof Error ? error.message : "Не удалось выйти", "error");
@@ -476,15 +497,11 @@ export function App() {
               {authMode === "register" ? "Зарегистрироваться" : "Войти"}
             </button>
           </div>
+          {/* Переключателя «Зарегистрироваться» больше нет: самостоятельная
+              регистрация закрыта (#33), и кнопка вела в 403. Учётки заводит
+              администратор — экран «Пользователи» или CLI create-user. */}
           <div className="authSwitchText">
-            {authMode === "login" ? "Нет аккаунта?" : "Уже есть аккаунт?"}{" "}
-            <button
-              type="button"
-              className="authSwitchLink"
-              onClick={() => setAuthMode((mode) => (mode === "login" ? "register" : "login"))}
-            >
-              {authMode === "login" ? "Зарегистрироваться" : "Войти"}
-            </button>
+            Нет доступа? Обратитесь к администратору платформы.
           </div>
         </div>
         {toast ? <div className={`toastReact ${toast.tone === "error" ? "error" : ""}`}>{toast.text}</div> : null}
@@ -535,7 +552,7 @@ export function App() {
 
         <div className="sidebarGroups">
           {navGroups.map((group) => {
-            const visibleScreens = group.screens.filter((sid) => isAdmin || !ADMIN_SCREENS.has(sid));
+            const visibleScreens = group.screens.filter(screenInMenu);
             if (!visibleScreens.length) return null;
             return (
             <section className="sidebarGroup" key={group.label}>
@@ -601,7 +618,7 @@ export function App() {
 
       <main className="content">{currentScreen}</main>
       <nav className="mobileNav">
-        {screens.filter((screen) => isAdmin || !ADMIN_SCREENS.has(screen.id)).map((screen) => (
+        {screens.filter((screen) => screenInMenu(screen.id)).map((screen) => (
           <button
             key={screen.id}
             type="button"

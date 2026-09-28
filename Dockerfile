@@ -39,6 +39,11 @@ COPY data/seed ./data/seed
 RUN mkdir -p /app/exports \
     && chmod +x ./scripts/docker-scheduler.sh
 
+# Сборка кода (git SHA) — воркер NL сообщает её ядру вместе с номером контракта
+# (contract.py). Последним слоем: смена SHA не пересобирает зависимости и Chromium.
+ARG GIT_SHA=unknown
+ENV OILTECH_BUILD=$GIT_SHA
+
 EXPOSE 8000
 
 CMD ["uvicorn", "oiltech_digest.api:app", "--host", "0.0.0.0", "--port", "8000"]

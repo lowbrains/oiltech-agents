@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { listArticles, updateArticle } from "../../api/articles";
 import { enqueueDigestExport, getDigestBranding, getDigestContent, getDigestEmailHtml, getMonthlyDigest, saveDigestBranding, updateMonthlyDigest } from "../../api/digest";
 import { downloadJobResult, getJob } from "../../api/jobs";
 import type { Article, DigestBranding, DigestBrandingSocial, DigestContent, DigestDraftSaveResult, DigestHighlightCard, MonthlyDigestDraft } from "../../api/types";
+import { monthLabel, useFeedWindow } from "../articles/feedWindow";
 
 type ToastWriter = (text: string, tone?: "default" | "error") => void;
 
@@ -14,6 +15,10 @@ type Props = {
 };
 
 const DIGEST_PREVIEW_LIMIT = 500;
+// Один и тот же пустой массив, пока грузится архивный выпуск. Новый `[]` на каждом рендере
+// пересоздавал бы цепочку useMemo до previewCandidateIds, а эффект синхронизации очереди
+// звал бы setManualOrderIds снова и снова — бесконечный цикл рендеров.
+const NO_ARTICLES: Article[] = [];
 
 export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdmin = false }: Props) {
   const [articles, setArticles] = useState<Article[]>([]);
@@ -41,10 +46,56 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
   // «задача/очередь/№N»: пользователь видит процесс и результат, а не job-runner.
   const [exporting, setExporting] = useState<string | null>(null);
   const activeMonth = month || new Date().toISOString().slice(0, 7);
+  // Окно месяца (ADR 0001, п. 6): открытые месяцы и прошлые выпуски с выбранными статьями.
+  // Прошлый выпуск — только просмотр и выгрузка (решение владельца 23.09): статусы и
+  // черновик не меняются, сервер такие правки отклоняет.
+  const feedWindow = useFeedWindow();
+  const firstOpenMonth = feedWindow?.months?.[0] ?? "";
+  const archiveIssueMonths = useMemo(
+    () => (feedWindow?.archive ?? []).filter((item) => item.digest > 0).map((item) => item.month),
+    [feedWindow],
+  );
+  const [archiveArticles, setArchiveArticles] = useState<Article[] | null>(null);
+  const isArchiveMonth = Boolean(month) && Boolean(firstOpenMonth) && month < firstOpenMonth;
+  // Лента (/api/articles) без месяца отдаёт только открытые месяцы — для прошлого выпуска
+  // выбранные статьи приходят отдельным запросом с `month`.
+  const sourceArticles = isArchiveMonth ? archiveArticles ?? NO_ARTICLES : articles;
+
+  // Окно сменилось, пока вкладка была открыта (наступило 5-е): выбранное за закрывшийся
+  // месяц ушло в архив. Перечитываем список, иначе в очереди остались бы статьи, которые
+  // уже нельзя сохранить в черновик (сервер ответит 409).
+  const loadedOpenMonth = useRef("");
+  useEffect(() => {
+    if (!firstOpenMonth) return;
+    if (loadedOpenMonth.current && loadedOpenMonth.current !== firstOpenMonth) {
+      listArticles({ status: "digest", limit: 5000 })
+        .then(setArticles)
+        .catch((error) => handleError(error, "Не удалось обновить выбранное в дайджест"));
+    }
+    loadedOpenMonth.current = firstOpenMonth;
+  }, [firstOpenMonth]);
 
   useEffect(() => {
     void reload();
   }, []);
+
+  useEffect(() => {
+    if (!isArchiveMonth) {
+      setArchiveArticles(null);
+      return;
+    }
+    let cancelled = false;
+    listArticles({ status: "digest", month, limit: 5000 })
+      .then((rows) => {
+        if (!cancelled) setArchiveArticles(rows);
+      })
+      .catch((error) => {
+        if (!cancelled) handleError(error, "Не удалось загрузить архивный выпуск");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isArchiveMonth, month]);
 
   useEffect(() => {
     if (loading) return;
@@ -200,7 +251,7 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
 
   const digestCandidates = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return articles.filter((article) => {
+    return sourceArticles.filter((article) => {
       const hay = [article.title, article.tag, article.summary].join(" ").toLowerCase();
       return (
         article.digest &&
@@ -211,23 +262,28 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
         (!month || String(article.date || "").startsWith(month))
       );
     });
-  }, [articles, month, scoreMax, scoreMin, search, tag]);
+  }, [sourceArticles, month, scoreMax, scoreMin, search, tag]);
 
+  // Месяцы выпуска: открытые (по выбранным статьям ленты) плюс прошлые выпуски, в которых
+  // у этого человека есть выбранные статьи.
   const months = useMemo(() => {
-    return [...new Set(articles.filter((article) => article.digest).map((article) => String(article.date || "").slice(0, 7)).filter(Boolean))]
-      .sort()
-      .reverse();
-  }, [articles]);
+    const open = articles.filter((article) => article.digest).map((article) => String(article.date || "").slice(0, 7));
+    return [...new Set([...open, ...archiveIssueMonths].filter(Boolean))].sort().reverse();
+  }, [articles, archiveIssueMonths]);
 
   const topTags = useMemo(() => {
-    const names = [...new Set(articles.map((article) => article.tag).filter(Boolean))].sort();
+    const names = [...new Set(sourceArticles.map((article) => article.tag).filter(Boolean))].sort();
     return [...new Set(names.map((name) => name.split(" / ")[0]))];
-  }, [articles]);
+  }, [sourceArticles]);
   const filteredTagOptions = useMemo(() => {
     const q = tagQuery.trim().toLowerCase();
     return topTags.filter((option) => !q || option.toLowerCase().includes(q));
   }, [tagQuery, topTags]);
-  const exportPreviewItems = digestPreview?.news || [];
+  // useMemo обязателен: пока превью не пришло, `|| []` давал НОВЫЙ массив на каждом рендере,
+  // цепочка useMemo до previewCandidateIds пересчитывалась, а эффект синхронизации очереди
+  // звал setManualOrderIds с новым массивом — рендер за рендером, пока не придёт превью.
+  // В браузере это крутило процессор на время загрузки, в тестах — вешало прогон (23.09).
+  const exportPreviewItems = useMemo(() => digestPreview?.news || [], [digestPreview]);
   const previewOrderedCandidates = useMemo(() => {
     const byId = new Map(digestCandidates.map((article) => [article.id, article]));
     const ordered = exportPreviewItems
@@ -381,6 +437,8 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
   }
 
   async function handleSaveDraft() {
+    // Прошлый выпуск — только просмотр и выгрузка; кнопки в архиве нет, это страховка.
+    if (isArchiveMonth) return;
     try {
       setDraftBusy(true);
       const draftMonth = month || new Date().toISOString().slice(0, 7);
@@ -465,6 +523,12 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
           {previewLoading ? <span className="metaText">Обновляем preview выпуска…</span> : null}
         </div>
 
+        {isArchiveMonth ? (
+          <div className="archiveNotice" role="status">
+            <span>Выпуск за {monthLabel(month)} в архиве: его можно смотреть и выгружать, но не менять.</span>
+          </div>
+        ) : null}
+
         <div className="digestRunSummary">
           <div className="digestRunCard">
             <div className="metaText">Текущий выпуск</div>
@@ -548,7 +612,7 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
               <option value="">Все месяцы</option>
               {months.map((option) => (
                 <option key={option} value={option}>
-                  {option}
+                  {firstOpenMonth && option < firstOpenMonth ? `${option} · архив` : option}
                 </option>
               ))}
             </select>
@@ -564,7 +628,7 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
         </div>
 
         {loading ? (
-          <div className="emptyState"><LoadingState label="Загружаем сигналы…" /></div>
+          <div className="emptyState"><LoadingState label="Загружаем бизнес-сигналы…" /></div>
         ) : digestCandidates.length ? (
             <div className="digestQueuePanel">
               <div className="digestQueueHeader">
@@ -593,6 +657,7 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
                         <strong>{article.title}</strong>
                       </a>
                     </div>
+                    {isArchiveMonth ? null : (
                     <div className="digestPickActions">
                       <button
                         type="button"
@@ -619,6 +684,7 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
                         Из дайджеста
                       </button>
                     </div>
+                    )}
                   </div>
                   <div className="digestPickSummary">{article.summary || branding?.issue.empty_summary_text || "Суть ещё не сформирована."}</div>
                   <div className="digestPickFooter">
@@ -629,7 +695,7 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
                 </article>
               ))}
             </div>
-            {availableDigestCandidates.length ? (
+            {availableDigestCandidates.length && !isArchiveMonth ? (
               <div className="digestAvailablePanel">
                 <div className="panelHeader">
                   <h3>Доступные материалы</h3>
@@ -663,15 +729,17 @@ export function DigestPage({ onUnauthorized, showToast, onArticlesChanged, isAdm
             <span className="metaText">Draft и экспорт работают по текущей выборке</span>
           </div>
           <div className="digestToolbar digestToolbarStack">
-            <div className="digestActionGroup">
-              <span className="digestGroupLabel">Сохранение</span>
-              <button type="button" className="ghostButton" disabled={draftBusy} onClick={() => void handleSaveDraft()}>
-                {draftBusy ? "Сохраняем draft…" : "Сохранить draft"}
-              </button>
-              <button type="button" className="ghostButton" disabled={!hasManualChanges} onClick={resetDraftQueue}>
-                Сбросить изменения
-              </button>
-            </div>
+            {isArchiveMonth ? null : (
+              <div className="digestActionGroup">
+                <span className="digestGroupLabel">Сохранение</span>
+                <button type="button" className="ghostButton" disabled={draftBusy} onClick={() => void handleSaveDraft()}>
+                  {draftBusy ? "Сохраняем draft…" : "Сохранить draft"}
+                </button>
+                <button type="button" className="ghostButton" disabled={!hasManualChanges} onClick={resetDraftQueue}>
+                  Сбросить изменения
+                </button>
+              </div>
+            )}
             <div className="digestActionGroup">
               <span className="digestGroupLabel">Экспорт</span>
               <button type="button" className="primaryButton" onClick={() => void handleDigestExport("pdf")}>

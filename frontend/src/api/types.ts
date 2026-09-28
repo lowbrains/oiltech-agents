@@ -34,8 +34,12 @@ export type Source = {
 
 export type SourceHealth = {
   id: number;
-  verdict: "ok" | "stale" | "no_articles" | "disabled";
+  // archived — источник в архиве: сбор выключен и статьи скрыты из ленты. Отдельно от
+  // disabled, иначе плитки экрана (с архивом) расходились со списком (без архива).
+  verdict: "ok" | "stale" | "no_articles" | "disabled" | "archived";
   articles: number | null;
+  // Материалы за 30 дней по дате сбора. Необязательное: старый сервер его не отдаёт.
+  articles_30d?: number | null;
   last_article_at: string | null;
 };
 
@@ -655,6 +659,29 @@ export type DashboardStats = {
   sources: number;
   // Счётчики по статусам — по ВСЕЙ базе (а не по загруженной странице), пер-юзерно.
   status_counts?: Record<Article["status"], number>;
+  // Окно месяца, по которому посчитаны счётчики (и отдана лента).
+  window?: FeedWindowInfo;
+};
+
+// Окно месяца ленты (ADR 0001, п. 6): открытые месяцы «ГГГГ-ММ»; month — запрошенный
+// месяц; read_only — это архив прошлого месяца, только просмотр.
+export type FeedWindowInfo = {
+  months: string[];
+  month: string | null;
+  read_only: boolean;
+  rollover_day: number;
+};
+
+// Прошлый месяц для переключателя «Архив»: статей в месяце и сколько из них выбрано
+// «в дайджест» текущим пользователем (по нему конструктор выпуска строит архив выпусков).
+export type ArchiveMonth = {
+  month: string;
+  articles: number;
+  digest: number;
+};
+
+export type FeedWindowPayload = FeedWindowInfo & {
+  archive: ArchiveMonth[];
 };
 
 export type BacklogTaskStatus = "new" | "in_progress" | "done" | "paused" | "rejected";
@@ -732,6 +759,16 @@ export type ExternalQueueRow = {
   last_heartbeat_at: string | null;
 };
 
+// Тревоги сторожа полос (lanes.py): застой, очередь без живого воркера, истёкшие аренды.
+export type LaneAlert = {
+  queue: string | null;
+  kind: "stale" | "no_consumer" | "unknown_queue" | "expired_leases" | "contract_mismatch" | string;
+  count: number;
+  minutes?: number;
+  consumer?: string;
+  message: string;
+};
+
 export type ExternalQueueStatus = {
   totals: {
     queued: number;
@@ -743,6 +780,20 @@ export type ExternalQueueStatus = {
     expired_leases: number;
   };
   queues: ExternalQueueRow[];
+  alerts?: LaneAlert[];
+  // Контракт версий РФ↔NL (contract.py): номер ядра и что сообщил каждый контейнер NL.
+  contract?: number;
+  consumers?: ExternalConsumer[];
+};
+
+export type ExternalConsumer = {
+  consumer: string;
+  queues: string[];
+  build: string | null;
+  contract: number | null;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  mismatch?: boolean;
 };
 
 export type MaintenanceCleanupResult = {
@@ -928,6 +979,9 @@ export type Tag = {
   negative_keywords_json?: string[];
   enabled: boolean;
   sort_order: number;
+  // Только на клиенте: стабильный ключ ещё не сохранённого тега (у него нет id, а
+  // позиция в списке сдвигается при удалении). Перед сохранением вырезается.
+  client_key?: string;
 };
 
 export type CreateSourcePayload = {
@@ -973,6 +1027,9 @@ export type ManualArticleImportResult = {
 export type AuthResponse = {
   ok: boolean;
   user: User;
+  // Архивные модули, включённые флагом ARCHIVED_MODULES на сервере (по умолчанию пусто):
+  // только их экраны показываются в меню и открываются по ссылке.
+  archived_modules?: string[];
 };
 
 // --- Месячная статистика платформы (раздел «Статистика», admin-only) ---
@@ -1009,6 +1066,57 @@ export type MonthlyStats = {
   ai_cost: MonthlyAiCostRow[];
   activity: MonthlyActivityRow[];
   activity_scope: string;
+};
+
+// --- Аналитика платформы (экран «Статистика», /api/analytics/monthly) ---
+export type AnalyticsCounters = {
+  month: string;
+  collected: number;
+  en: number;
+  full_text: number;
+  relevant: number;
+  rejected: number;
+  summarized: number;
+  scored: number;
+  strong: number;
+  top: number;
+  hidden: number;
+  reprints: number;
+  digest_selected: number;
+  sources_active: number;
+  sources_relevant: number;
+  sources_strong: number;
+  speed_p50_hours: number | null;
+  speed_p90_hours: number | null;
+};
+
+export type AnalyticsMonth = AnalyticsCounters & { digest_exports: number; complete: boolean };
+
+export type AnalyticsCost = {
+  month: string;
+  calls: number;
+  articles: number;
+  cost_usd: number;
+  // Курс ЦБ РФ на последний день месяца (у текущего — на сегодня); «допущение» — ЦБ недоступен.
+  usd_rub: number;
+  usd_rub_date: string | null;
+  usd_rub_source: "ЦБ РФ" | "допущение" | string;
+};
+
+export type MonthlyAnalytics = {
+  timezone: string;
+  today: string;
+  current_month: string;
+  current_day: number;
+  months: AnalyticsMonth[];
+  previous_same_period: AnalyticsCounters & { days: number };
+  themes: { month: string; tag_id: number; tag: string; relevant: number; strong: number }[];
+  top_sources: { month: string; source_id: number; source: string; strong: number; relevant: number; collected: number }[];
+  sources_enabled: number;
+  targets: { sources: number; articles_month: number; ai_rub_month: number };
+  // Только администратору: стоимость — коммерческая сторона.
+  ai_cost?: AnalyticsCost[];
+  ai_cost_previous_same_period?: AnalyticsCost & { days: number };
 };
 
 // --- Приём файлов: документы пользователя (экран «Материалы») ---

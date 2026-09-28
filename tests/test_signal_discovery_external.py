@@ -195,10 +195,14 @@ def test_core_applies_external_result_and_records_generation_run(monkeypatch):
     assert created["background_job_id"] == 55
     assert [signal["title"] for signal in upserted] == ["Accepted"]  # отказ судьи не пишется в радар
     assert len(examples) == 2  # но в обучающие примеры идут оба
-    assert finished == [(77, {"status": "ok", "result": {"topics": 1, "signals": 1, "returned_signals": 1}})]
+    assert finished == [(77, {"status": "ok", "result": {
+        "topics": 1, "signals": 1, "returned_signals": 1,
+        "search_health": {"topics": 1, "failed": 0, "first_error": None, "http_status": None, "provider": None,
+                          "cause": None},
+    }})]
     assert summary["signals"] == 1
     assert summary["topics"][0] == {
-        "topic": DRILLING, "web_status": "ok", "queries": 2, "results": 3, "total_evidence": 2,
+        "topic": DRILLING, "web_status": "ok", "web_error": None, "queries": 2, "results": 3, "total_evidence": 2,
         "skipped_reviewed": 0, "clusters": 2, "signals": 1, "duplicates": 0,
         # Старая сборка NL не шлёт раунды, докачку и ревью пачки — поля пустые, не ошибка.
         "research_modes": [], "fulltext": None, "batch_review": None,

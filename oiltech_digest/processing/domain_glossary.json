@@ -11,7 +11,10 @@
     {
       "source_terms": ["well completion", "completion", "completions", "well completions", "intelligent completion", "smart completion"],
       "preferred_ru": "заканчивание скважины",
-      "forbidden_ru": ["завершение скважины", "завершения скважины", "завершении скважины"],
+      "forbidden_ru": ["завершение скважины"],
+      "phrase_repairs": [
+        ["\\bзавершени(е|я|ю|ем|и)\\s+(скважин(?:а|ы|е|у|ой|ам|ами|ах)?)\\b", "заканчивани\\1 \\2"]
+      ],
       "note": "Completion в контексте скважин переводится как заканчивание."
     },
     {
@@ -21,6 +24,14 @@
       "forbidden_ru": ["ворковер"],
       "forbidden_patterns": ["\\bворковер(?:а|ов|ом|е|ы)?\\b"],
       "note": "Workover в нефтегазовом контексте — КРС."
+    },
+    {
+      "source_terms": ["spud", "spudded", "spudding", "spuds", "spud-in", "spud in"],
+      "preferred_ru": "забуривание",
+      "full_ru": "забуривание (начало бурения) скважины",
+      "forbidden_ru": ["спудинг"],
+      "warn_patterns": ["(?<!под\\s)\\bспуд\\w*", "\\bspud\\w*"],
+      "note": "spud a well — забурить скважину, spud date — дата забуривания; не «спуд», «спудил», «спудинг» и не латиницей (замечание заказчика 22.09)."
     },
     {
       "source_terms": ["enhanced oil recovery", "eor", "improved oil recovery", "ior"],
@@ -82,9 +93,12 @@
     {
       "source_terms": ["offshore", "offshore drilling", "offshore production"],
       "preferred_ru": "шельфовый",
-      "forbidden_ru": ["оффшорный", "оффшоре", "оффшора"],
-      "forbidden_patterns": ["\\bоффшор(?:ный|ная|ное|ные|е|а|ом)?\\b"],
-      "note": "В нефтегазовом контексте обычно шельфовый/морской."
+      "phrase_repairs": [
+        ["\\bна\\s+оффшор(е|ах)\\b", "на шельф\\1"],
+        ["\\bоффшорн(ый|ая|ое|ые|ого|ой|ому|ым|ом|ых|ыми|ую)\\b(?!\\s+(?:компани|фирм|юрисдикци|зон|счет|счёт|структур|схем))", "шельфов\\1"]
+      ],
+      "source_warn_patterns": ["\\bоффшор\\w*"],
+      "note": "В нефтегазовом контексте — шельфовый/морской, не «оффшорный»; «оффшор» — налоговая юрисдикция."
     },
     {
       "source_terms": ["upstream"],
@@ -136,7 +150,8 @@
     {
       "source_terms": ["rate of penetration", "rop"],
       "preferred_ru": "механическая скорость проходки",
-      "forbidden_ru": ["ROP", "rate of penetration"]
+      "warn_patterns": ["\\bROP\\b", "\\brate of penetration\\b"],
+      "note": "ROP — механическая скорость проходки (склонять по месту). Автозамены нет: именительный падеж ломал «рост ROP»."
     },
     {
       "source_terms": ["wellbore", "well bore"],
@@ -162,11 +177,12 @@
       "forbidden_patterns": ["\\bстимуляци(?:я|и|ю|ей)\\s+скважин(?:ы|е|ой)?\\b"]
     },
     {
-      "source_terms": ["reservoir", "reservoir management"],
+      "source_terms": ["reservoir", "reservoirs", "reservoir management"],
       "preferred_ru": "пласт",
-      "forbidden_ru": ["резервуар"],
-      "forbidden_patterns": ["\\bрезервуар(?:а|у|ом|е|ы|ов|ам|ами|ах)?\\b"],
-      "note": "Reservoir в добыче — пласт, не резервуар."
+      "full_ru": "пласт, коллектор",
+      "note": "reservoir в геологии и добыче — пласт или коллектор; резервуар — только ёмкость (storage tank, LNG tank, full containment). Автозамены нет: в русском тексте «резервуар» почти всегда ёмкость, а замена не держит падеж («с качественным пласт»).",
+      "source_warn_patterns": ["\\bрезервуар\\w*"],
+      "warn_unless_source": ["tank", "tanks", "tankage", "tank farm", "containment", "terminal", "terminals"]
     },
     {
       "source_terms": ["digital twin", "digital twins"],
@@ -179,33 +195,52 @@
     {
       "source_terms": ["condition monitoring"],
       "preferred_ru": "мониторинг состояния оборудования"
+    },
+    {
+      "source_terms": ["granular", "granularity"],
+      "preferred_ru": "детальный",
+      "full_ru": "детальный, детализированный; granular activated carbon — гранулированный активированный уголь",
+      "warn_patterns": ["\\bgranular\\w*"],
+      "note": "granular data/controls/analytics — детальные данные/настройки/аналитика; не оставлять латиницей и не склонять латинский корень (замечание заказчика 22.09)."
     }
   ],
+  "mixed_script_allow": ["PROНЕФТЬ", "PROНефть", "Farш", "Dostaевский", "Dостаевский"],
   "phrase_repairs": [
-    ["\\bмощност(?:и|ей|ям|ями|ях)\\s+LNG\\b", "мощности СПГ"],
+    ["\\bмощност(и|ей|ям|ями|ях)\\s+LNG\\b", "мощност\\1 СПГ"],
     ["\\bLNG-инфраструктур([а-я]*)\\b", "СПГ-инфраструктур\\1"],
     ["\\bLNG-проект([а-я]*)\\b", "СПГ-проект\\1"],
     ["\\bLNG-рынк([а-я]*)\\b", "СПГ-рынк\\1"],
     ["\\bнов(?:ая|ую)\\s+буров(?:ая|ую)\\s+грязь\\s+снизил[ао]?\\b", "новый буровой раствор снизил"],
     ["\\bнов(?:ая|ую)\\s+буров(?:ая|ую)\\s+грязь\\b", "новый буровой раствор"],
     ["\\bискусственн(?:ый|ого|ому|ым|ом)\\s+лифт\\s+повысил\\b", "механизированная добыча повысила"],
-    ["\\bповысил[а]?\\s+ROP\\b", "повысила механическую скорость проходки"],
-    ["\\bпров[её]л(?:а|и)?\\s+стимуляци(?:ю|и)\\s+скважин(?:ы|е|ой)?\\b", "провел интенсификацию притока"],
-    ["\\bстимуляци(?:я|и|ю|ей)\\s+скважин(?:ы|е|ой)?\\b", "интенсификация притока"],
-    ["\\bдля\\s+резервуар(?:а|ов)?\\b", "для пласта"],
-    ["\\bв\\s+резервуар(?:е|ах)?\\b", "в пласте"],
-    ["\\bиз\\s+резервуар(?:а|ов)?\\b", "из пласта"],
-    ["\\bрезервуар(?:а|у|ом|е|ы|ов|ам|ами|ах)?\\b", "пласт"],
-    ["\\bна\\s+оффшор(?:е|е)?\\b", "на шельфе"],
-    ["\\bоффшорн(?:ый|ая|ое|ые)\\s+проект\\b", "шельфовый проект"],
-    ["\\bоффшорн(?:ая)\\s+добыч[а-я]*\\b", "шельфовая добыча"],
-    ["\\bоффшорн(?:ое)\\s+бурени[а-я]*\\b", "шельфовое бурение"],
+    ["\\b(повысил[аио]?)\\s+ROP\\b", "\\1 механическую скорость проходки"],
+    ["\\b(пров[её]л(?:а|и|о)?)\\s+стимуляци(?:ю|и)\\s+скважин(?:ы|е|ой)?\\b", "\\1 интенсификацию притока"],
+    ["\\bстимуляци(я|и|ю|ей)\\s+скважин(?:ы|е|ой|ам|ами|ах)?\\b", "интенсификаци\\1 притока"],
     ["\\bпосле\\s+фрак(?:инга|инге|ингом)\\b", "после ГРП"],
     ["\\bфрак(?:инговый|инговая|инговое|инговые)\\s+флот(?:ы|ов|ами|ом)?\\b", "флот ГРП"],
     ["\\bэлектрическ(?:ий|ая|ое|ие)\\s+фрак(?:инг|инга|инговый|инговая|инговое|инговые)?\\b", "электрический флот ГРП"],
     ["\\bфлоубэк(?:а|ом|е)?\\s+анализ\\b", "анализ жидкости обратного притока"],
+    ["\\bфлоубэком\\b", "жидкостью обратного притока"],
+    ["\\bфлоубэк(?:а|у|е)\\b", "жидкости обратного притока"],
+    ["\\bфлоубэк\\b", "жидкость обратного притока"],
     ["\\bворковер(?:ов|а)?\\s+программ[а-я]*\\b", "программа КРС"],
-    ["\\bзавершени(?:е|я|ю|ем|и)\\s+скважин(?:ы|е|ой)?\\b", "заканчивание скважины"]
+    ["\\bспудинг\\s+(\\S+\\s+)?начался\\b", "забуривание \\1началось"],
+    ["\\bспудирован(а|о|ы)?\\b", "забурен\\1"],
+    ["\\bспудирова(л|ла|ли|ло|ть)\\b", "забури\\1"],
+    ["\\bспуд(?:р)?(ил|ила|или|ило|ит|ят|ить|ив)\\b", "забур\\1"],
+    ["\\bспудинга\\b", "забуривания"],
+    ["\\bспудингу\\b", "забуриванию"],
+    ["\\bспудингом\\b", "забуриванием"],
+    ["\\bспудинге\\b", "забуривании"],
+    ["\\bспудинг\\b", "забуривание"],
+    ["(?<!под\\s)\\bспуда\\b", "забуривания"],
+    ["(?<!под\\s)\\bспуду\\b", "забуриванию"],
+    ["(?<!под\\s)\\bспудом\\b", "забуриванием"],
+    ["(?<!под\\s)\\bспуде\\b", "забуривании"],
+    ["(?<!под\\s)\\bспуд-ина\\b", "забуривания"],
+    ["(?<!под\\s)\\bспуд-ин\\b", "забуривание"],
+    ["(?<!под\\s)\\bспуд\\b(?!-)", "забуривание"],
+    ["\\bgranular(?:н)?(ый|ая|ое|ые|ого|ой|ому|ым|ом|ых|ыми|ую)\\b", "детальн\\1"]
   ],
   "golden_cases": [
     {
@@ -228,13 +263,6 @@
       "bad": "Завершение скважины ускорило ввод.",
       "must_have": ["Заканчивание скважины"],
       "must_not": ["завершение скважины"]
-    },
-    {
-      "name": "Пласт / reservoir",
-      "article": {"title": "Reservoir output improved", "raw_text": "Reservoir output improved after optimization.", "language": "en"},
-      "bad": "Добыча из резервуара выросла.",
-      "must_have": ["пласта"],
-      "must_not": ["резервуар"]
     },
     {
       "name": "Интенсификация / stimulation",
@@ -284,6 +312,104 @@
       "bad": "Оптимизация bottomhole assembly повысила ROP.",
       "must_have": ["КНБК", "механическую скорость проходки"],
       "must_not": ["bottomhole assembly", "ROP"]
+    },
+    {
+      "name": "забуривание / spud (радар 22.09)",
+      "article": {"title": "Global Land Drilling Rigs Tracker", "raw_text": "In Egypt, NDC 9 spudded the vertical well T-200 targeting Abu Roash F.", "language": "en"},
+      "bad": "В Египте NDC 9 спудрил вертикальную скважину T-200.",
+      "must_have": ["забурил вертикальную скважину"],
+      "must_not": ["спуд"]
+    },
+    {
+      "name": "забуривание / spudding (карточка 28.08)",
+      "article": {"title": "Texas oil company launches a 92-well drilling program", "raw_text": "EON highlighted that the spudding, or the official start of the drilling process, of the first well began on August 24.", "language": "en"},
+      "bad": "Первые три скважины уже бурятся, спудинг первой начался 24 августа.",
+      "must_have": ["забуривание первой началось"],
+      "must_not": ["спудинг"]
+    },
+    {
+      "name": "забуривание / spud (карточка 08.09)",
+      "article": {"title": "Santos starts appraisal drilling", "raw_text": "Santos prepared the pad and key road intersection upgrades ahead of the spud.", "language": "en"},
+      "bad": "Santos подготовила площадку и обновила дорожное пересечение перед спудом.",
+      "must_have": ["перед забуриванием"],
+      "must_not": ["спудом"]
+    },
+    {
+      "name": "детальный / granular (радар 22.09)",
+      "article": {"title": "Global Land Drilling Rigs Tracker", "raw_text": "The tracker complements the international review with more granular field data.", "language": "en"},
+      "bad": "Трекер дополняет международный обзор более granularными полевыми данными.",
+      "must_have": ["более детальными полевыми данными"],
+      "must_not": ["granular"]
+    },
+    {
+      "name": "резервуар / LNG tank (карточка 6618899)",
+      "article": {"title": "Argent LNG selects CB&I", "raw_text": "CB&I will build three full containment LNG storage tanks; the reservoir of gas supply is the Haynesville.", "language": "en"},
+      "bad": "CB&I станет подрядчиком EPC для трёх резервуаров полного ограждения.",
+      "must_have": ["для трёх резервуаров полного ограждения"],
+      "must_not": ["пласт"]
+    },
+    {
+      "name": "двойники: латиница в русском слове",
+      "article": {"title": "Trio Petroleum enters partnership", "raw_text": "Trio Petroleum enters a partnership.", "language": "en"},
+      "bad": "Trio Petroleum вхoдит в партнёрство, итоги 1-гo полугодия — рост сбытa.",
+      "must_have": ["входит", "1-го", "сбыта"],
+      "must_not": ["вхoдит", "сбытa"]
+    },
+    {
+      "name": "двойники: кириллица в латинском слове",
+      "article": {"title": "Argent LNG signs MoU with Albania", "raw_text": "Argent LNG signed an MoU; OPEX and CCS were discussed.", "language": "en"},
+      "bad": "Argent LNG подписала МoU; обсуждали ОPEX и СCS.",
+      "must_have": ["MoU", "OPEX", "CCS"],
+      "must_not": ["МoU", "ОPEX", "СCS"]
+    },
+    {
+      "name": "склейка слов разных алфавитов",
+      "article": {"title": "Honeywell expands presence", "raw_text": "Honeywell expands its presence in the Permian.", "language": "en"},
+      "bad": "Компания расширяет присутствиеHoneywell вPermian.",
+      "must_have": ["присутствие Honeywell", "в Permian"],
+      "must_not": ["присутствиеHoneywell", "вPermian"]
+    },
+    {
+      "name": "интенсификация / stimulation — род глагола сохраняется",
+      "article": {"title": "Well stimulation", "raw_text": "The company performed well stimulation.", "language": "en"},
+      "bad": "Компания провела стимуляцию скважины, после стимуляции скважины приток вырос.",
+      "must_have": ["Компания провела интенсификацию притока", "после интенсификации притока"],
+      "must_not": ["стимуляц", "провёл интенсификацию"]
+    },
+    {
+      "name": "заканчивание / completion — падеж сохраняется",
+      "article": {"title": "Well completion", "raw_text": "After well completion the field started.", "language": "en"},
+      "bad": "После завершения скважины началась добыча.",
+      "must_have": ["После заканчивания скважины"],
+      "must_not": ["завершени", "заканчивание скважины"]
+    },
+    {
+      "name": "шельф / offshore — падеж, род и заглавная",
+      "article": {"title": "Offshore platform", "raw_text": "The offshore platform works offshore.", "language": "en"},
+      "bad": "Оффшорная платформа работает на оффшоре, оффшорного опыта хватает.",
+      "must_have": ["Шельфовая платформа", "на шельфе", "шельфового опыта"],
+      "must_not": ["оффшор", "шельфовый платформа"]
+    },
+    {
+      "name": "жидкость обратного притока / flowback — падеж",
+      "article": {"title": "Flowback", "raw_text": "Flowback volume was measured.", "language": "en"},
+      "bad": "Объём флоубэка измерили, с флоубэком справились.",
+      "must_have": ["Объём жидкости обратного притока", "с жидкостью обратного притока"],
+      "must_not": ["флоубэк"]
+    },
+    {
+      "name": "СПГ / LNG — падеж «мощностей»",
+      "article": {"title": "LNG capacity", "raw_text": "LNG capacity grows.", "language": "en"},
+      "bad": "Компания расширилась с мощностями LNG.",
+      "must_have": ["с мощностями СПГ"],
+      "must_not": ["мощности СПГ"]
+    },
+    {
+      "name": "провёл — заглавная в начале предложения",
+      "article": {"title": "Well stimulation", "raw_text": "Well stimulation tests.", "language": "en"},
+      "bad": "Итоги. Провел испытания.",
+      "must_have": ["Провёл испытания"],
+      "must_not": ["провел"]
     }
   ]
 }

@@ -375,3 +375,55 @@ def test_apply_overrides_sets_listing_selector(isolated_db, monkeypatch):
 
     # Идемпотентность: селектор не должен провоцировать «изменено» на каждом деплое.
     assert source_overrides.apply_overrides()["changed"] == 0
+
+
+def test_apply_overrides_sets_listing_strategy(isolated_db, monkeypatch):
+    """Реестр умеет задавать `listing_strategy` — иначе порядок ленты Petronas не починить.
+
+    Свежайший релиз Petronas стоит первым в ленте, но без даты, и общее правило порядка
+    (датированные вперёд) уводило его за лимит 12. Лечится признаком источника «порядок
+    страницы и есть свежесть» — `listing_strategy='page_order'`. Колонка в `sources` есть
+    давно (правится и в админке), но реестр её не знал: прописанная, она молча не доехала
+    бы до базы — так уже было с селекторами JPT.
+    """
+    with connection.get_connection() as conn:
+        source_id = _add_source(
+            conn, "Petronas", source_type="Company / NOC", url="https://www.petronas.com",
+            parse_strategy="request", listing_url="https://www.petronas.com/media/media-releases",
+            last_listing_hash="старый-хэш",
+        )
+        conn.commit()
+
+    monkeypatch.setattr(
+        source_overrides,
+        "SOURCE_OVERRIDES",
+        {"Petronas": {"parse_strategy": "request",
+                      "listing_url": "https://www.petronas.com/media/media-releases",
+                      "article_link_selector": 'div[role="article"] a[href*="/media/media-releases/"]',
+                      "listing_strategy": "page_order"}},
+    )
+
+    stats = source_overrides.apply_overrides()
+    assert stats["changed"] == 1
+
+    with connection.get_connection() as conn:
+        row = conn.execute(
+            "SELECT listing_strategy, article_link_selector, last_listing_hash FROM sources WHERE id = %s",
+            (source_id,),
+        ).fetchone()
+    assert row == ("page_order", 'div[role="article"] a[href*="/media/media-releases/"]', None)
+
+    # Идемпотентность: повторный деплой не сбрасывает дедуп-состояние заново.
+    assert source_overrides.apply_overrides()["changed"] == 0
+
+
+def test_page_order_in_registry_always_comes_with_a_selector():
+    """`page_order` без селектора ничего не делает: без него первыми на странице идут
+    шапка и меню, и разбор его намеренно не слушает. Запись без селектора — ошибка реестра."""
+    for name, fields in source_overrides.SOURCE_OVERRIDES.items():
+        strategy = fields.get("listing_strategy")
+        if strategy is None:
+            continue
+        assert strategy == "page_order", f"{name!r}: неизвестный listing_strategy {strategy!r}"
+        assert fields.get("listing_selector") or fields.get("article_link_selector"), (
+            f"{name!r}: page_order без селектора ленты не работает")

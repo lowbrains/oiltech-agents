@@ -32,7 +32,12 @@ RETRY_BACKOFF_BASE = 1.0      # базовая задержка backoff (1с, 2�
 HTTP_MIN_INTERVAL_SECONDS = float(os.environ.get("HTTP_MIN_INTERVAL_SECONDS", "1.5"))
 HTTP_JITTER_SECONDS = float(os.environ.get("HTTP_JITTER_SECONDS", "0.4"))
 HTTP_BLOCK_COOLDOWN_SECONDS = int(os.environ.get("HTTP_BLOCK_COOLDOWN_SECONDS", "900"))
-REQUEST_ARTICLE_LIMIT = int(os.environ.get("REQUEST_ARTICLE_LIMIT", "6"))
+# Хост, который МОЛЧИТ (таймаут), должен стоить столько же, сколько хост, который
+# отказал вслух (403). Пауза короче, чем при блокировке: таймаут бывает разовым,
+# а бан — нет. Ставится только после исчерпания всех попыток, т.е. когда хост не
+# ответил три раза подряд.
+HTTP_DEAD_HOST_COOLDOWN_SECONDS = int(os.environ.get("HTTP_DEAD_HOST_COOLDOWN_SECONDS", "300"))
+REQUEST_ARTICLE_LIMIT = int(os.environ.get("REQUEST_ARTICLE_LIMIT", "12"))
 # Минимум значимого текста для первичной вставки request/playwright-статей.
 # Корпоративные новости и press release бывают короткими; старый порог 200 символов
 # отбрасывал часть релевантных заметок ещё до AI-гейта.
@@ -59,11 +64,21 @@ BACKGROUND_JOB_RETRY_BASE_SECONDS = int(os.environ.get("BACKGROUND_JOB_RETRY_BAS
 EXPORT_JOB_RETENTION_DAYS = int(os.environ.get("EXPORT_JOB_RETENTION_DAYS", "30"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
+# Сборка кода: git SHA, вшитый при сборке образа (Dockerfile, ARG GIT_SHA). Воркер NL
+# сообщает её ядру вместе с номером контракта (contract.py) — «пересобран ли NL» видно
+# в check-lanes, а не по косвенным полям.
+OILTECH_BUILD = os.environ.get("OILTECH_BUILD", "").strip() or "unknown"
+
 # --- Геораспределенное исполнение ---
 # По умолчанию внешний контур выключен: routing helper сохраняет старые локальные
 # очереди, чтобы обновление кода не остановило текущий single-server deployment.
 EXTERNAL_WORKERS_ENABLED = os.environ.get("EXTERNAL_WORKERS_ENABLED", "0").lower() in {"1", "true", "yes"}
 AI_EXECUTION_REGION = os.environ.get("AI_EXECUTION_REGION", "ru").strip().lower()
+# Пересчёты корпуса (перекачка тел, перепроверка релевантности, перевод заголовков) —
+# своей полосой external-ai-bulk, чтобы не стоять перед потоком дня (18.09: 28 пакетов
+# пересчёта задержали обычную обработку на 4,5 ч). Включать, только когда на NL поднят
+# воркер этой очереди, — иначе задачи будут ждать (сторож очередей это покажет).
+AI_BULK_LANE_ENABLED = os.environ.get("AI_BULK_LANE_ENABLED", "0").lower() in {"1", "true", "yes"}
 FETCH_EXTERNAL_ENABLED = os.environ.get("FETCH_EXTERNAL_ENABLED", "0").lower() in {"1", "true", "yes"}
 EXTERNAL_WORKER_TOKEN_HASH = os.environ.get("EXTERNAL_WORKER_TOKEN_HASH", "").strip()
 EXTERNAL_WORKER_DEFAULT_LEASE_SECONDS = int(os.environ.get("EXTERNAL_WORKER_DEFAULT_LEASE_SECONDS", "600"))
@@ -81,6 +96,28 @@ EXTERNAL_WORKER_CAPABILITIES = [
     if item.strip()
 ]
 EXTERNAL_WORKER_POLL_SECONDS = float(os.environ.get("EXTERNAL_WORKER_POLL_SECONDS", "3"))
+# Пустая очередь — пауза растёт от EXTERNAL_WORKER_POLL_SECONDS вдвое до этого потолка и
+# сбрасывается на первой задаче. 21.09 при постоянных 3 с шесть потоков NL слали ядру
+# 582 claim за 5 мин простоя; с потолком 30 с — около 60, новая задача ждёт не дольше 30 с.
+EXTERNAL_WORKER_POLL_MAX_SECONDS = float(os.environ.get("EXTERNAL_WORKER_POLL_MAX_SECONDS", "30"))
+# Потоков выдачи в одном процессе воркера: полоса сбора запросом — I/O, ей хватает
+# потоков (http_client потокобезопасен: пауза на хост под замком, сессия на поток).
+# Браузер и ИИ — по одному.
+EXTERNAL_WORKER_CONCURRENCY = int(os.environ.get("EXTERNAL_WORKER_CONCURRENCY", "1"))
+# Аренду задачи продлевает фоновый поток раз в столько секунд — независимо от того,
+# зовёт ли код обработчика heartbeat (24.07, 17.09, 21.09 — трижды забывали).
+EXTERNAL_WORKER_HEARTBEAT_SECONDS = float(os.environ.get("EXTERNAL_WORKER_HEARTBEAT_SECONDS", "60"))
+# Сколько задача может не подавать признаков продвижения, если для её вида нет своего
+# предела (external_worker._JOB_STALL_SECONDS). Не общее время: большая пачка идёт долго.
+EXTERNAL_JOB_MAX_SECONDS = int(os.environ.get("EXTERNAL_JOB_MAX_SECONDS", "1200"))
+# Мягкая остановка воркера (SIGTERM при выкате NL): столько секунд задачам в работе на то,
+# чтобы закончить. Дальше обработчик останавливается на ближайшем шаге (статья, страница,
+# кусок документа) и возвращает задачу ядру с тем, что успел.
+EXTERNAL_WORKER_STOP_GRACE_SECONDS = float(os.environ.get("EXTERNAL_WORKER_STOP_GRACE_SECONDS", "30"))
+# Сколько ещё ждать, пока шаг дойдёт до границы: не дошёл (висит в вызове модели) —
+# задачу возвращает сам процесс, без частичного итога. stop_grace_period контейнеров в
+# docker-compose.external-worker.yml обязан покрывать оба срока с запасом на запросы к ядру.
+EXTERNAL_WORKER_STOP_STEP_SECONDS = float(os.environ.get("EXTERNAL_WORKER_STOP_STEP_SECONDS", "60"))
 
 # --- Прокси для парсинга (residential, напр. 2captcha) ---
 # PROXY_URL — полная строка подключения: "http://user:pass@host:port"
@@ -107,7 +144,6 @@ def _parse_proxy_host_overrides(raw: str) -> dict[str, str]:
         if host and proxy_url:
             overrides[host] = proxy_url
     return overrides
-
 
 # Карта "домен → строка прокси". Совпавший суффикс хоста имеет приоритет
 # над PROXY_URL: например, override для "rbc.ru" сработает и для "www.rbc.ru".
@@ -233,6 +269,15 @@ SIGNAL_RADAR_TOPIC_SOURCE = os.environ.get("SIGNAL_RADAR_TOPIC_SOURCE", "tags").
 # воркеру в снимке задачи — менять можно без пересборки NL.
 SIGNAL_DEDUP_MAX_PAIRS = int(os.environ.get("SIGNAL_DEDUP_MAX_PAIRS", "400"))
 
+# Целевые показатели экрана «Статистика» — из презентации ГД «Нефтесервисный радар»
+# (июль 2026): >120 источников (слайды 4–5); бюджет ИИ ≈10 000 ₽/мес при потоке
+# 5 000 статей/мес (слайд 7). Курс для пересчёта cost_usd в рубли берётся у ЦБ РФ
+# (fx.py); ANALYTICS_USD_RUB — только запасной, если ЦБ недоступен, и на экране он
+# подписан как допущение.
+ANALYTICS_TARGET_SOURCES = int(os.environ.get("ANALYTICS_TARGET_SOURCES", "120"))
+ANALYTICS_TARGET_ARTICLES_MONTH = int(os.environ.get("ANALYTICS_TARGET_ARTICLES_MONTH", "5000"))
+ANALYTICS_TARGET_AI_RUB_MONTH = float(os.environ.get("ANALYTICS_TARGET_AI_RUB_MONTH", "10000"))
+ANALYTICS_USD_RUB = float(os.environ.get("ANALYTICS_USD_RUB", "85"))
 
 def price_for_model(model: str | None) -> tuple[float, float]:
     """USD/1М-токенов (input, output) для модели по префиксу имени.
@@ -243,7 +288,6 @@ def price_for_model(model: str | None) -> tuple[float, float]:
                 return OPENAI_MODEL_PRICES[prefix]
     return (OPENAI_INPUT_USD_PER_MTOK, OPENAI_OUTPUT_USD_PER_MTOK)
 
-
 # --- Брендинг дайджеста ---
 # Путь к digest_branding.json. Пусто — файл берётся из пакета (локальная разработка,
 # тесты). На сервере ОБЯЗАН указывать на общий том, смонтированный во ВСЕ контейнеры.
@@ -253,10 +297,55 @@ def price_for_model(model: str | None) -> tuple[float, float]:
 # пересборка образа возвращала git-версию поверх правок.
 DIGEST_BRANDING_PATH = os.environ.get("DIGEST_BRANDING_PATH", "").strip()
 
+# --- Окно месяца ленты (ADR 0001, п. 6; oiltech_digest/feed_window.py) ---
+# Пока день месяца по МСК меньше этого числа, лента показывает ещё и прошлый месяц:
+# выпуск за месяц собирается в первые дни следующего. Решение владельца 21.09 — 5.
+# Держим в пределах 1..28: 1 — прошлый месяц не виден никогда, больше 28 — виден
+# почти всегда, и окно перестаёт быть окном.
+FEED_ROLLOVER_DAY = min(28, max(1, int(os.environ.get("FEED_ROLLOVER_DAY", "5"))))
+
+# --- Здоровье источников: «Требуют внимания» (вердикт stale) ---
+# Источник требует внимания, если последний материал собран столько и больше календарных
+# дней назад по Москве — как «N дн. назад» в колонке «Последняя загрузка»: при 7 «7 дн.
+# назад» уже требует внимания, «6 дн. назад» — ещё нет. Одно правило для всех источников —
+# решение владельца 28.09: при 3 днях под порог попадали и редко пишущие, в плитке было
+# 58 из 129. Число живёт только здесь: отчёт source_health_report, /api/source-health
+# (экран «Источники») и CLI source-health / source-retry без явного порога берут его
+# отсюда. Меньше 1 правило теряет смысл: при 0 требует внимания каждый источник.
+SOURCE_STALE_DAYS = max(1, int(os.environ.get("SOURCE_STALE_DAYS", "7")))
+
+# --- Архивные модули (ADR 0001 п. 7 — lowbrains/oiltech-agents, docs/adr/0001-single-contour.md;
+#     список утверждён владельцем 23.09) ---
+# Убраны из меню, маршрутов и контейнеров, но не удалены из кода. По умолчанию все
+# выключены. Вернуть модуль — перечислить его ключ в ARCHIVED_MODULES через запятую и
+# перезапустить app:
+#   analytics-preview — макет «Аналитика для БРБ»;
+#   tech-preview      — макет «Технологии»;
+#   backlog           — трекер задач: /tasks и /api/backlog* (сервис tasks — профиль
+#                       compose `archive`, флаг у него уже прописан).
+# У справки /help (сервис docs) кода в приложении нет: она возвращается профилем compose
+# `archive` и блоком /help* в Caddyfile. Незнакомые ключи игнорируются.
+ARCHIVED_MODULE_KEYS = ("analytics-preview", "tech-preview", "backlog")
+
+
+def parse_archived_modules(raw: str) -> frozenset[str]:
+    return frozenset(key for key in (item.strip() for item in raw.split(",")) if key in ARCHIVED_MODULE_KEYS)
+
+
+ARCHIVED_MODULES = parse_archived_modules(os.environ.get("ARCHIVED_MODULES", ""))
+
 # --- Auth ---
 AUTH_COOKIE_NAME = os.environ.get("AUTH_COOKIE_NAME", "oiltech_session")
 AUTH_SESSION_DAYS = int(os.environ.get("AUTH_SESSION_DAYS", "30"))
 # Флаг Secure на сессионной cookie. Прод за HTTPS (Caddy) → должно быть True (тех-долг T8).
 # Для локальной разработки по http:// выставить AUTH_COOKIE_SECURE=0, иначе браузер
 # не сохранит cookie и вход не сработает.
+# Открытая регистрация: по умолчанию ЗАКРЫТА. Платформа выходит на корпоративный
+# портал заказчика, и /api/auth/register позволял любому завести себе учётку —
+# предусловие релиза #33. Пользователей заводит администратор: экран «Пользователи»
+# или CLI create-user. Первый администратор создаётся так же, до открытия доступа.
+AUTH_ALLOW_SELF_REGISTRATION = os.environ.get(
+    "AUTH_ALLOW_SELF_REGISTRATION", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
 AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "true").strip().lower() in ("1", "true", "yes", "on")

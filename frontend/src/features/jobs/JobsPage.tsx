@@ -10,7 +10,7 @@ type Props = {
 };
 
 const statuses: Array<BackgroundJob["status"] | ""> = ["", "queued", "running", "ok", "failed"];
-const queues = ["", "default", "ai", "playwright", "ru-fetch", "ru-playwright", "external-ai", "external-fetch", "external-playwright"];
+const queues = ["", "default", "ai", "playwright", "ru-fetch", "ru-playwright", "external-ai", "external-fetch", "external-playwright", "external-agents"];
 
 const statusLabels: Record<BackgroundJob["status"], string> = {
   queued: "В очереди",

@@ -6,6 +6,7 @@ Telegram API credentials or a user session.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -17,7 +18,8 @@ from dateutil import parser as dateparser
 from lxml import etree, html
 
 from oiltech_digest.db import repository
-from oiltech_digest.ingestion import normalize
+from oiltech_digest.ingestion import normalize, verdicts
+from oiltech_digest.ingestion.verdicts import Step
 from oiltech_digest.ingestion.http_client import fetch
 from oiltech_digest.ingestion.relevance_filter import should_keep_article
 
@@ -25,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 _CHANNEL_RE = re.compile(r"^[A-Za-z0-9_]{3,64}$")
 _POST_RE = re.compile(r"^([A-Za-z0-9_]{3,64})/(\d+)$")
+# Граница строк поста: `<br>` и концы блоков. Переносы в исходнике HTML — не граница.
+_LINE_BREAK = "\u2028"
+_BLOCK_TAGS = ("p", "div", "blockquote", "li")
+# Первая строка короче — рубрика («#ЦифраДня», «⚡️ Энергофакт»), а не заголовок.
+MIN_TITLE_CHARS = 25
 
 
 @dataclass(frozen=True)
@@ -35,7 +42,11 @@ class TelegramPost:
     published_at: datetime | None
 
 
-def parse_source(source: dict, max_age_days: int | None = None, post_limit: int = 20) -> dict:
+# Сколько постов превью берёт сбор за раз.
+POST_LIMIT = 20
+
+
+def parse_source(source: dict, max_age_days: int | None = None, post_limit: int = POST_LIMIT) -> dict:
     """Fetch a public Telegram channel preview and insert new posts as articles."""
     preview_url = preview_url_for_source(source)
     if not preview_url:
@@ -48,72 +59,29 @@ def parse_source(source: dict, max_age_days: int | None = None, post_limit: int 
 
     posts = extract_posts(content, limit=post_limit)
     listing_hash = _listing_hash(posts)
-    if posts and source.get("last_listing_hash") and listing_hash == source.get("last_listing_hash"):
+    if listing_unchanged(source, posts):
         repository.touch_last_parsed(source["id"])
         return {**_empty_stats(), "skipped_known": len(posts)}
 
-    cutoff = None
-    if max_age_days is not None:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-
-    last_seen_url = source.get("last_seen_article_url") or ""
-    last_seen_published = source.get("last_seen_published_at")
-    if isinstance(last_seen_published, str):
-        last_seen_published = _parse_datetime(last_seen_published)
-
     added = attempted = skipped_old = skipped_irrelevant = skipped_known = 0
-    newest_seen_url: str | None = None
-    newest_seen_published: datetime | None = None
-
-    for post in posts:
-        if newest_seen_url is None:
-            newest_seen_url = post.url
-            newest_seen_published = post.published_at
-
-        if last_seen_url and post.url == last_seen_url:
+    for step in post_steps(source, posts, max_age_days):
+        if step.stage == verdicts.KNOWN:
             skipped_known += 1
-            break
-        if repository.article_exists(post.url):
-            skipped_known += 1
-            continue
-        if cutoff is not None and post.published_at and post.published_at < cutoff:
+        elif step.stage == verdicts.OLD:
             skipped_old += 1
-            continue
-        if last_seen_published and post.published_at and post.published_at <= last_seen_published:
-            skipped_old += 1
-            continue
-
-        pre_filter = should_keep_article(post.title, post.text, source)
-        if not pre_filter.keep:
+        elif step.stage == verdicts.PREFILTER:
             skipped_irrelevant += 1
-            logger.info(
-                "Telegram pre-filter skipped %s: %s (%s)",
-                source.get("name"),
-                post.title,
-                ", ".join(pre_filter.matched_noise[:5]),
-            )
-            continue
+        elif step.stage == verdicts.READY:
+            attempted += 1
+            if repository.insert_article(step.record):
+                added += 1
 
-        attempted += 1
-        if repository.insert_article(
-            {
-                "source_id": source["id"],
-                "title": post.title[:500],
-                "url": post.url,
-                "published_at": post.published_at,
-                "raw_text": post.text,
-                "text_truncated": False,
-                "language": "ru",
-                "content_hash": normalize.compute_content_hash(post.title, post.url),
-            }
-        ):
-            added += 1
-
+    newest = posts[0] if posts else None
     repository.touch_last_parsed(source["id"])
     repository.update_source_request_state(
         source["id"],
-        last_seen_article_url=newest_seen_url,
-        last_seen_published_at=newest_seen_published,
+        last_seen_article_url=newest.url if newest else None,
+        last_seen_published_at=newest.published_at if newest else None,
         last_listing_hash=listing_hash,
     )
     return {
@@ -123,6 +91,70 @@ def parse_source(source: dict, max_age_days: int | None = None, post_limit: int 
         "skipped_irrelevant": skipped_irrelevant,
         "skipped_known": skipped_known,
     }
+
+
+def listing_unchanged(source: dict, posts: list[TelegramPost]) -> bool:
+    """Превью то же, что при прошлом сборе: тогда сбор не смотрит посты вовсе."""
+    return bool(posts) and bool(source.get("last_listing_hash")) \
+        and _listing_hash(posts) == source.get("last_listing_hash")
+
+
+def post_steps(source: dict, posts: list[TelegramPost], max_age_days: int | None = None) -> Iterator[Step]:
+    """Рубежи сбора по каждому посту превью (от новых к старым) — как их проходит сбор.
+
+    Единственная реализация: parse_source вставляет READY, проба источника
+    (`source-probe`) печатает вердикты. Последний пост прошлого сбора останавливает
+    просмотр: он и всё, что ниже, — KNOWN, сбор их не смотрит.
+    """
+    cutoff = None
+    if max_age_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+    last_seen_url = source.get("last_seen_article_url") or ""
+    last_seen_published = source.get("last_seen_published_at")
+    if isinstance(last_seen_published, str):
+        last_seen_published = _parse_datetime(last_seen_published)
+
+    for index, post in enumerate(posts):
+        seen = {"url": post.url, "title": post.title, "published_at": post.published_at,
+                "text_chars": len(post.text)}
+        if last_seen_url and post.url == last_seen_url:
+            yield Step(verdicts.KNOWN, **seen, detail="последний пост прошлого сбора — ниже сбор не смотрит")
+            for older in posts[index + 1:]:
+                yield Step(verdicts.KNOWN, older.url, older.title, older.published_at, len(older.text),
+                           detail="ниже последнего поста прошлого сбора")
+            return
+        if repository.article_exists(post.url):
+            yield Step(verdicts.KNOWN, **seen)
+            continue
+        if cutoff is not None and post.published_at and post.published_at < cutoff:
+            yield Step(verdicts.OLD, **seen)
+            continue
+        if last_seen_published and post.published_at and post.published_at <= last_seen_published:
+            yield Step(verdicts.OLD, **seen, detail="не новее последнего поста прошлого сбора")
+            continue
+
+        pre_filter = should_keep_article(post.title, post.text, source)
+        if not pre_filter.keep:
+            logger.info(
+                "Telegram pre-filter skipped %s: %s (%s)",
+                source.get("name"),
+                post.title,
+                ", ".join(pre_filter.matched_noise[:5]),
+            )
+            yield Step(verdicts.PREFILTER, **seen, detail=", ".join(pre_filter.matched_noise[:5]))
+            continue
+
+        yield Step(verdicts.READY, **seen, record={
+            "source_id": source["id"],
+            "title": post.title[:500],
+            "url": post.url,
+            "published_at": post.published_at,
+            "raw_text": post.text,
+            "text_truncated": False,
+            "language": "ru",
+            "content_hash": normalize.compute_content_hash(post.title, post.url),
+        })
 
 
 def preview_url_for_source(source: dict) -> str | None:
@@ -155,7 +187,7 @@ def channel_from_url(raw_url: str) -> str | None:
 def extract_posts(content: bytes | str, limit: int = 20) -> list[TelegramPost]:
     try:
         doc = html.fromstring(content)
-    except (ValueError, TypeError, etree.ParserError):
+    except (ValueError, TypeError, etree.ParserError):  # пустое тело — «Document is empty»
         return []
 
     posts: list[TelegramPost] = []
@@ -176,7 +208,8 @@ def _post_from_node(node) -> TelegramPost | None:
     url = f"https://t.me/{channel}/{post_id}"
 
     text_nodes = node.xpath(".//*[contains(concat(' ', normalize-space(@class), ' '), ' tgme_widget_message_text ')]")
-    text = normalize.clean_html(text_nodes[0].text_content()) if text_nodes else ""
+    lines = _message_lines(text_nodes[0]) if text_nodes else []
+    text = " ".join(lines)
     if not text:
         return None
 
@@ -186,17 +219,32 @@ def _post_from_node(node) -> TelegramPost | None:
             node.xpath("string(.//a[contains(@class, 'tgme_widget_message_date')][1]/@href)"),
         )
     )
-    title = _title_from_text(text)
+    title = title_from_text("\n".join(lines))
     return TelegramPost(url=url, title=title, text=text, published_at=published_at)
 
 
-def _title_from_text(text: str) -> str:
-    compact = re.sub(r"\s+", " ", text).strip()
-    if not compact:
+def _message_lines(node) -> list[str]:
+    """Строки поста. `text_content()` теряет `<br>` и склеивает строки: до 25.09 так
+    вышло «в Иллинойсе<br>ExxonMobil…» → «ИллинойсеExxonMobil», и заголовок захватывал
+    начало второй строки (862 из 3423 заголовков Telegram)."""
+    for element in node.iter():
+        if element.tag == "br" or element.tag in _BLOCK_TAGS:
+            element.tail = _LINE_BREAK + (element.tail or "")
+    parts = (normalize.clean_html(part) for part in node.text_content().split(_LINE_BREAK))
+    return [part for part in parts if part]
+
+
+def title_from_text(text: str) -> str:
+    """Заголовок поста: первая строка (строки — через перевод строки), в ней — первое
+    предложение. Короткая первая строка — рубрика: тогда первое предложение всего текста."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").split("\n")]
+    lines = [line for line in lines if line]
+    if not lines:
         return "Telegram post"
-    sentence = re.split(r"(?<=[.!?])\s+", compact, maxsplit=1)[0]
-    if len(sentence) < 25:
-        sentence = compact
+    head = lines[0] if len(lines[0]) >= MIN_TITLE_CHARS else " ".join(lines)
+    sentence = re.split(r"(?<=[.!?])\s+", head, maxsplit=1)[0]
+    if len(sentence) < MIN_TITLE_CHARS:
+        sentence = head
     return sentence[:140].strip()
 
 

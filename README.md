@@ -60,10 +60,12 @@ POSTGRES_PASSWORD=сложный_пароль
 OPENAI_API_KEY=sk-...        # без ключа сбор работает, AI-обработка пропускается (AI_OFFLINE=1)
 ```
 
-Запуск всего стека (БД, админка, авто-сбор по расписанию):
+Запуск всего стека (БД, админка, авто-сбор по расписанию). Конвейер (`scheduler`,
+`worker`, `playwright-worker`) стоит за профилем `pipeline` — без него поднимаются
+только БД, админка и Caddy (архивные `tasks` и `docs` — профиль `archive`):
 
 ```bash
-docker compose up -d --build
+docker compose --profile pipeline up -d --build
 ```
 
 Откройте интерфейс: **http://127.0.0.1:8000** (при первом входе зарегистрируйтесь —
@@ -172,6 +174,7 @@ uvicorn oiltech_digest.api:app --reload --port 8000
 | `external-queues-status` | состояние внешних очередей и heartbeat воркера |
 | `digest-content` / `digest-save` | собрать/сохранить выпуск дайджеста |
 | `source-health` / `source-diagnose` | диагностика покрытия источников |
+| `source-probe <id>` | почему источник молчит: путь сбора и вердикт рубежей вставки по каждому кандидату (`known`, `too_short`, `prefilter`, `DUP_URL_KEY_SAME/OTHER`, `DUP_BODY_HASH`, `WOULD_INSERT`); ничего не пишет, `--json` — полный список |
 | `stats` / `ai-cost-report` | статистика и стоимость AI |
 
 `python -m oiltech_digest.cli <команда> --help` — подробности по любой команде.

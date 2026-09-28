@@ -1,15 +1,11 @@
-import { TRIAGE_FILTER_OPTIONS } from "./sourceUtils";
+import { strategyLabel, TRIAGE_FILTER_OPTIONS } from "./sourceUtils";
 
 type Props = {
   search: string;
   strategy: string;
-  enabled: string;
-  healthVerdict: string;
   triageKey: string;
   onSearchChange: (value: string) => void;
   onStrategyChange: (value: string) => void;
-  onEnabledChange: (value: string) => void;
-  onHealthChange: (value: string) => void;
   onTriageChange: (value: string) => void;
   onReset: () => void;
 };
@@ -19,13 +15,8 @@ type Props = {
 // а фильтр сравнивает строгим равенством, поэтому опция была мёртвой.
 const STRATEGY_OPTIONS = ["rss", "request", "playwright", "telegram"];
 
-const STRATEGY_LABELS: Record<string, string> = {
-  rss: "RSS-лента",
-  request: "Разбор страницы",
-  playwright: "Браузер",
-  telegram: "Telegram",
-};
-
+// Состояние (штатно / требует внимания / …) выбирается плитками над таблицей: два
+// списка «Статус» и «Покрытие» дублировали их и делали экран «административным».
 export function SourceFilters(props: Props) {
   return (
     <div className="sourceFiltersGrid">
@@ -34,32 +25,14 @@ export function SourceFilters(props: Props) {
         <input value={props.search} onChange={(event) => props.onSearchChange(event.target.value)} placeholder="Название или ссылка" />
       </label>
       <label className="field">
-        <span>Стратегия</span>
+        <span>Тип</span>
         <select value={props.strategy} onChange={(event) => props.onStrategyChange(event.target.value)}>
           <option value="">Все</option>
           {STRATEGY_OPTIONS.map((option) => (
             <option key={option} value={option}>
-              {STRATEGY_LABELS[option] ?? option}
+              {strategyLabel(option)}
             </option>
           ))}
-        </select>
-      </label>
-      <label className="field">
-        <span>Статус</span>
-        <select value={props.enabled} onChange={(event) => props.onEnabledChange(event.target.value)}>
-          <option value="">Все</option>
-          <option value="on">Включены</option>
-          <option value="off">Выключены</option>
-        </select>
-      </label>
-      <label className="field">
-        <span>Покрытие</span>
-        <select value={props.healthVerdict} onChange={(event) => props.onHealthChange(event.target.value)}>
-          <option value="">Все</option>
-          <option value="ok">ОК</option>
-          <option value="stale">Застой</option>
-          <option value="no_articles">0 статей</option>
-          <option value="disabled">Выкл</option>
         </select>
       </label>
       <label className="field">

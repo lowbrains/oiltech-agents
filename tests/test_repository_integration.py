@@ -183,6 +183,57 @@ def test_repository_dashboard_health_and_digest_queries_use_real_schema(isolated
     assert repository.digest_candidates(month=now.strftime("%Y-%m"), min_score=95) == []
 
 
+def test_source_health_report_separates_archive_and_counts_last_30_days(isolated_db):
+    """Архив — свой вердикт, а не «Выкл».
+
+    Архив выключает сбор (enabled = FALSE), и в «Выкл» он тонул: экран считал плитки
+    по отчёту с архивом, а список — без него, и 19.09 заказчик видел «133 источника» и
+    «173» на одном экране. «Материалов за 30 дней» — по дате сбора: колонка таблицы
+    источников отвечает на вопрос «что источник принёс за месяц».
+    """
+    now = datetime.now(timezone.utc)
+    with connection.get_connection() as conn:
+        rows = conn.execute(
+            """
+            INSERT INTO sources (name, source_type, url, enabled, parse_strategy, category, archived_at)
+            VALUES
+              ('Working', 'News', 'https://example.com/w', TRUE, 'rss', 'международные', NULL),
+              ('Switched off', 'News', 'https://example.com/off', FALSE, 'rss', 'международные', NULL),
+              ('Archived', 'News', 'https://example.com/arch', FALSE, 'rss', 'международные', now())
+            RETURNING id, name
+            """
+        ).fetchall()
+        ids = {name: source_id for source_id, name in rows}
+        conn.execute(
+            """
+            INSERT INTO articles (source_id, title, url, published_at, collected_at, raw_text, language, content_hash)
+            VALUES
+              (%s, 'Fresh', 'https://example.com/w/1', %s, %s, 'Text one', 'en', 'health-1'),
+              (%s, 'Month old', 'https://example.com/w/2', %s, %s, 'Text two', 'en', 'health-2'),
+              (%s, 'Archived fresh', 'https://example.com/arch/1', %s, %s, 'Text three', 'en', 'health-3')
+            """,
+            (
+                ids["Working"], now - timedelta(days=1), now - timedelta(days=1),
+                ids["Working"], now - timedelta(days=40), now - timedelta(days=40),
+                ids["Archived"], now - timedelta(days=2), now - timedelta(days=2),
+            ),
+        )
+        conn.commit()
+
+    report = repository.source_health_report(stale_days=3, limit=10)
+    by_name = {row["name"]: row for row in report}
+    assert by_name["Working"]["verdict"] == "ok"
+    assert by_name["Switched off"]["verdict"] == "disabled"
+    assert by_name["Archived"]["verdict"] == "archived"
+    assert (by_name["Working"]["articles"], by_name["Working"]["articles_30d"]) == (2, 1)
+    assert by_name["Archived"]["articles_30d"] == 1
+    assert by_name["Archived"]["archived_at"] is not None
+    # Архив — в конце выдачи, после выключенных, и фильтруется своим вердиктом.
+    assert [row["verdict"] for row in report] == ["ok", "disabled", "archived"]
+    assert [row["name"] for row in repository.source_health_report(verdict="archived")] == ["Archived"]
+    assert repository.source_health_report(verdict="disabled")[0]["name"] == "Switched off"
+
+
 def test_dashboard_all_articles_counts_whole_base_not_just_signals(isolated_db):
     """Плитка «Всего» (all_articles) считает ВЕСЬ объём базы, а total_articles — только сигналы.
 

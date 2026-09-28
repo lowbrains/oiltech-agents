@@ -1,0 +1,101 @@
+/* Экран «Источники». Таблица — на общем стиле таблиц продукта (.jobsTable в
+   globals.css), здесь только своё: имя со ссылкой, числа по правому краю, раскрытая
+   строка, свёрнутый блок добавления, плитка архива. */
+.table {
+  min-width: 920px;
+}
+
+.nameCell {
+  max-width: 280px;
+}
+
+.name {
+  font-weight: 800;
+  font-size: 0.86rem;
+  color: #0f172a;
+}
+
+.link {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  text-decoration: none;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.num {
+  text-align: right !important;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.muted {
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+
+.problem {
+  color: var(--text-soft);
+  max-width: 260px;
+}
+
+/* Тип и состояние — одной строкой: «Требует внимания» в две строки читалось как две метки. */
+.nowrap {
+  white-space: nowrap;
+}
+
+.actionCell {
+  text-align: right !important;
+  white-space: nowrap;
+}
+
+.rowExpanded > td {
+  background: var(--brand-soft);
+  border-bottom-color: transparent !important;
+}
+
+.detailsRow > td {
+  padding: 0 10px 14px !important;
+  background: var(--brand-soft);
+}
+
+/* Свёрнутый блок «Добавить источник или статью по ссылке» над таблицей. */
+.addPanel > summary {
+  cursor: pointer;
+  font-weight: 800;
+  color: var(--brand);
+  list-style-position: inside;
+}
+
+.addPanel[open] > summary {
+  margin-bottom: 6px;
+}
+
+.addSection + .addSection {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.addSection {
+  margin-top: 10px;
+}
+
+/* «В архиве» отделена от плиток каталога: архив не входит во «Всего источников». */
+.archiveTile {
+  border-style: dashed !important;
+}
+
+.viewNote {
+  margin: 10px 0 0;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}

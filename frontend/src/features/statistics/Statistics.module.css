@@ -1,0 +1,122 @@
+/* Экран «Статистика». Цвета — роли на корне экрана (скилл dataviz): категории —
+   слоты 1–3 эталонной палитры (проверены валидатором на белом фоне, все пары),
+   «контекст» — приглушённый серый для отсеянного, ступени балла — одна синяя шкала
+   (проверена как порядковая). Тёмной темы у продукта нет. */
+.viz {
+  --viz-surface: #ffffff;
+  --viz-ink: #0f172a;
+  --viz-ink-2: #475569;
+  --viz-muted: #64748b;
+  --viz-grid: #e2e8f0;
+  --viz-axis: #cbd5e1;
+  --viz-s1: #2a78d6;
+  --viz-s2: #eb6834;
+  --viz-s3: #1baf7a;
+  --viz-context: #cbd5e1;
+  --viz-context-ink: #94a3b8;
+  --viz-tier-light: #86b6ef;
+  --viz-tier-dark: #1c5cab;
+  --viz-good: #166534;
+  --viz-bad: #b91c1c;
+}
+
+.hero { display: flex; flex-direction: column; gap: 6px; }
+.heroLine { margin: 0; font-size: 18px; line-height: 1.45; color: var(--viz-ink); }
+.heroLine b { font-weight: 600; }
+.heroNote { margin: 0; font-size: 13px; color: var(--viz-muted); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  border: 1px solid var(--viz-axis); background: var(--viz-surface); color: var(--viz-ink-2);
+  border-radius: 999px; padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer;
+}
+.chip:hover { background: #f1f5f9; }
+.chipActive { background: var(--viz-ink); border-color: var(--viz-ink); color: #ffffff; }
+.chipActive:hover { background: var(--viz-ink); }
+
+.kpiGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.tile {
+  display: flex; flex-direction: column; gap: 4px; padding: 14px 16px;
+  background: var(--viz-surface); border: 1px solid var(--viz-grid); border-radius: 14px; min-width: 0;
+}
+.tileLabel { font-size: 13px; color: var(--viz-ink-2); }
+.tileValue { font-size: 28px; font-weight: 600; color: var(--viz-ink); line-height: 1.15; }
+.tileSub { font-size: 12px; color: var(--viz-muted); }
+.tileFoot { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; margin-top: auto; padding-top: 4px; font-size: 12px; }
+.spark { width: 96px; height: 28px; flex: none; }
+.delta_good { color: var(--viz-good); }
+.delta_bad { color: var(--viz-bad); }
+.delta_flat, .delta_neutral { color: var(--viz-ink-2); }
+.deltaBase { color: var(--viz-muted); }
+
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; }
+@media (max-width: 520px) { .grid2 { grid-template-columns: 1fr; } }
+.card {
+  background: var(--viz-surface); border: 1px solid var(--viz-grid); border-radius: 14px;
+  padding: 16px; min-width: 0; display: flex; flex-direction: column; gap: 10px;
+}
+.cardTitle { margin: 0; font-size: 15px; font-weight: 600; color: var(--viz-ink); }
+.cardNote { margin: 0; font-size: 13px; color: var(--viz-muted); line-height: 1.45; }
+
+.chart { margin: 0; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.chartTitle { font-size: 15px; font-weight: 600; color: var(--viz-ink); }
+.plot { position: relative; }
+.plot svg { width: 100%; height: auto; display: block; overflow: visible; }
+.grid { stroke: var(--viz-grid); stroke-width: 1; }
+.axis { stroke: var(--viz-axis); stroke-width: 1; }
+.tick { fill: var(--viz-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.valueLabel { fill: var(--viz-ink-2); font-size: 11px; font-weight: 600; }
+.reference { stroke: var(--viz-ink-2); stroke-width: 1.5; }
+.referenceLabel { fill: var(--viz-ink-2); font-size: 11px; }
+.crosshair { stroke: var(--viz-axis); stroke-width: 1; }
+.footnote { margin: 0; font-size: 12px; color: var(--viz-muted); line-height: 1.4; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--viz-ink-2); }
+.legendItem { display: inline-flex; align-items: center; gap: 6px; }
+.legendBox { width: 10px; height: 10px; border-radius: 3px; flex: none; display: inline-block; }
+.legendLine { width: 14px; height: 2px; border-radius: 1px; flex: none; display: inline-block; }
+
+.tooltip {
+  position: absolute; top: 0; pointer-events: none; z-index: 2;
+  display: flex; flex-direction: column; gap: 3px; padding: 8px 10px;
+  background: var(--viz-surface); border: 1px solid var(--viz-grid); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12); font-size: 12px; color: var(--viz-ink-2); white-space: nowrap;
+}
+.tooltip strong { color: var(--viz-ink); font-weight: 600; }
+.tooltipRow { display: inline-flex; align-items: center; gap: 6px; }
+.tooltipRow b { color: var(--viz-ink); font-weight: 600; }
+
+.tableToggle { font-size: 12px; color: var(--viz-muted); }
+.tableToggle summary { cursor: pointer; width: fit-content; }
+.dataTable { border-collapse: collapse; margin-top: 6px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.dataTable th, .dataTable td { padding: 3px 10px 3px 0; text-align: right; color: var(--viz-ink-2); }
+.dataTable th:first-child, .dataTable td:first-child { text-align: left; }
+.dataTable th { font-weight: 600; color: var(--viz-ink); }
+
+.barList { display: flex; flex-direction: column; gap: 7px; }
+.barRow {
+  display: grid; grid-template-columns: minmax(120px, 38%) 1fr auto minmax(0, auto);
+  align-items: center; gap: 10px; font-size: 13px;
+}
+.barLabel { color: var(--viz-ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.barTrack { height: 14px; display: flex; }
+.barFill { height: 100%; border-radius: 0 4px 4px 0; min-width: 2px; }
+.barValue { color: var(--viz-ink); font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
+.barNote { color: var(--viz-muted); font-size: 12px; white-space: nowrap; }
+@media (max-width: 520px) {
+  .barRow { grid-template-columns: 1fr auto; }
+  .barTrack { grid-column: 1 / -1; order: 3; }
+  .barNote { grid-column: 1 / -1; order: 4; }
+}
+
+.split { display: flex; gap: 2px; height: 14px; }
+.split span { display: block; min-width: 2px; }
+.split span:first-child { border-radius: 4px 0 0 4px; }
+.split span:last-child { border-radius: 0 4px 4px 0; }
+
+.qualityGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+
+.srOnly {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}

@@ -130,3 +130,58 @@ def test_strip_emoji_collapses_gap_and_handles_empty():
     assert normalize.strip_emoji("Роснефть 🔥 — запустила") == "Роснефть — запустила"
     assert normalize.strip_emoji("") == ""
     assert normalize.strip_emoji(None) == ""
+
+
+# Адреса — с прода 25.09: у этих источников статья опознаётся ТОЛЬКО по query, а ключ
+# без query склеивал все их статьи в одну. Проба на ядре: Минэнерго — 25 пунктов ленты
+# из 25 отбиты как «дубль» чужой статьи, EIA — 17 из 18, РГУ Губкина — 257 из 260,
+# свежие релизы Лукойла и Новатэка — тоже.
+QUERY_IDENTIFIED = [
+    ("https://lukoil.ru/PressCenter/Pressreleases/Pressrelease?rid=740957",
+     "https://lukoil.ru/PressCenter/Pressreleases/Pressrelease?rid=739353"),
+    ("https://www.eia.gov/todayinenergy/detail.php?id=68184",
+     "https://www.eia.gov/todayinenergy/detail.php?id=68164"),
+    ("https://minenergo.gov.ru/press-center/news-and-events?news-item=minenergo-rossii-i-obshchestvo-znanie",
+     "https://minenergo.gov.ru/press-center/news-and-events?news-item=sergey-tsivilev-voprosy-osvoeniya"),
+    ("https://www.novatek.ru/ru/press/releases/index.php?id_4=7882",
+     "https://www.novatek.ru/ru/press/releases/index.php?id_4=7850"),
+    ("https://en.antonoil.com/index.php?m=content&c=index&a=show&catid=90&id=4023",
+     "https://en.antonoil.com/index.php?m=content&c=index&a=show&catid=88&id=4022"),
+    ("https://gubkin.ru/news/detail.php?ID=57931", "https://gubkin.ru/news/detail.php?ID=57075"),
+]
+
+
+def test_url_key_separates_articles_identified_by_query():
+    for first, second in QUERY_IDENTIFIED:
+        assert normalize.url_key(first) != normalize.url_key(second), first
+
+
+def test_url_key_still_collapses_spellings_of_one_article():
+    """Три причины 940 копий (13.09) по-прежнему дают один ключ, и к ним — хвосты,
+    найденные замером параметров прода 25.09: `ysclid` (Яндекс) и подписи `gaa_*`."""
+    same = [
+        "https://www.rbc.ru/politics/24/08/2026/6a8c1725?from=newsfeed",
+        "https://www.rbc.ru/politics/24/08/2026/6a8c1725?from=main_lines_11",
+        "http://rbc.ru/politics/24/08/2026/6a8c1725/",
+        "https://rbc.ru/politics/24/08/2026/6a8c1725?utm_source=telegram&utm_medium=social",
+        "https://rbc.ru/politics/24/08/2026/6a8c1725?ysclid=m3c6ls3kqj386163690",
+        "https://rbc.ru/politics/24/08/2026/6a8c1725?gaa_at=eafs&gaa_n=AWEts&gaa_ts=69c4&gaa_sig=I_rv",
+        "https://rbc.ru/politics/24/08/2026/6a8c1725#comments",
+    ]
+    assert len({normalize.url_key(url) for url in same}) == 1
+
+
+def test_url_key_ignores_parameter_order_and_tracking_next_to_identity():
+    assert normalize.url_key("https://en.antonoil.com/index.php?id=4023&catid=90&a=show") == \
+        normalize.url_key("https://en.antonoil.com/index.php?a=show&catid=90&id=4023")
+    assert normalize.url_key("https://lukoil.ru/Pressrelease?rid=740957&utm_source=tg") == \
+        normalize.url_key("https://lukoil.ru/Pressrelease?rid=740957")
+
+
+def test_fetch_url_tracking_params_are_also_stripped_from_identity_key():
+    """`request_parser` чистит адрес для скачивания своим списком. Имя, которое там срезается,
+    а в ключе остаётся, развело бы одну статью из ленты и из листинга на два ключа."""
+    from oiltech_digest.ingestion import request_parser
+
+    for name in request_parser._TRACKING_PARAMS:
+        assert name in normalize._TRACKING_QUERY_PARAMS or name.startswith(normalize._TRACKING_QUERY_PREFIXES), name

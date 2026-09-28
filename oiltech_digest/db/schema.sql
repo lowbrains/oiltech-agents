@@ -107,6 +107,30 @@ CREATE INDEX IF NOT EXISTS idx_articles_published_at ON articles(published_at DE
 -- =========================================================================
 -- Карточки статей (рабочее представление в «Все статьи») — будущее
 -- =========================================================================
+-- Перепечатки: одна публикация, разошедшаяся по нескольким изданиям. Таблица
+-- ГЛОБАЛЬНАЯ, в отличие от user_article_states.status='duplicate': перепечатка —
+-- факт о материале, а не мнение конкретного пользователя.
+--
+-- Почему отдельная таблица, а не флаг в articles: запись обратима и объяснима.
+-- Храним, ЧЕГО копия, чем измерено сходство и почему судья решил именно так —
+-- без этого разбор жалобы «почему статья пропала» превращается в гадание, а
+-- заказчик уже жаловался на исчезновение материалов.
+--
+-- Идёт ПОСЛЕ articles: обе ссылки ведут туда, и порядок блоков в этом файле
+-- значим — блок исполняется сверху вниз одной транзакцией.
+CREATE TABLE IF NOT EXISTS article_reprints (
+  article_id     BIGINT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  primary_id     BIGINT NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  similarity     NUMERIC,
+  reason         TEXT,
+  decided_by     TEXT NOT NULL DEFAULT 'ai',
+  model          TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT article_reprints_not_self CHECK (article_id <> primary_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_article_reprints_primary ON article_reprints(primary_id);
+
 CREATE TABLE IF NOT EXISTS article_cards (
   id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   article_id          BIGINT NOT NULL REFERENCES articles(id),
@@ -768,12 +792,25 @@ CREATE INDEX IF NOT EXISTS idx_articles_pending_deletion ON articles(pending_del
 --   /topics/x против /topics/x/        (Wood Mackenzie)— хвостовой слэш
 -- Каждая копия проходила полный ИИ-конвейер заново и занимала отдельную карточку —
 -- ровно то, на что жаловался заказчик 08.09 («все 4 новости об одном»).
--- Ключ = host+path без схемы, www, query и слэша (normalize.url_key).
+-- Ключ = host+path без схемы, www и слэша + значимый query (normalize.url_key).
+-- 25.09: query сначала срезался целиком и склеил все статьи сайтов, где номер статьи
+-- живёт в query (Минэнерго ?news-item=, EIA ?id=, Лукойл ?rid=, Новатэк ?id_4=).
+-- Теперь срезаются только трекинговые параметры — тот же список, что в Python.
 ALTER TABLE articles ADD COLUMN IF NOT EXISTS url_key TEXT;
 
--- Бэкфилл: считаем тем же правилом, что и Python-функция.
+-- Бэкфилл: считаем тем же правилом, что и Python-функция (тест сверяет до символа).
 UPDATE articles
-SET url_key = rtrim(regexp_replace(regexp_replace(lower(url), '^https?://(www\.)?', ''), '[?#].*$', ''), '/')
+SET url_key = rtrim(regexp_replace(regexp_replace(lower(regexp_replace(url, '^\s+|\s+$', '', 'g')), '^https?://(www\.)?', ''), '[?#].*$', ''), '/')
+    || COALESCE('?' || (
+         SELECT string_agg(p, '&' ORDER BY p COLLATE "C")
+         FROM regexp_split_to_table(
+                substring(split_part(lower(regexp_replace(url, '^\s+|\s+$', '', 'g')), '#', 1) from '\?(.*)$'), '&') AS p
+         WHERE p <> ''
+           AND split_part(p, '=', 1) NOT IN ('from', 'ysclid', 'yclid', 'ymclid', 'fbclid', 'gclid',
+                                             'igshid', '_openstat', 'mc_cid', 'mc_eid')
+           AND split_part(p, '=', 1) NOT LIKE 'utm\_%'
+           AND split_part(p, '=', 1) NOT LIKE 'gaa\_%'
+       ), '')
 WHERE url_key IS NULL;
 
 -- Схлопывание УЖЕ накопленных дублей: оставляем самую полную копию (длиннее тело,
@@ -850,6 +887,17 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_background_jobs_external_ready ON background_jobs(execution_region, queue_name, status, run_after, created_at);
 CREATE INDEX IF NOT EXISTS idx_background_jobs_lease_expires ON background_jobs(status, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_background_jobs_user_created ON background_jobs(user_id, created_at DESC);
+-- Потребители внешних очередей — контейнеры NL (23.09, контракт версий, contract.py):
+-- какую сборку и номер контракта каждый сообщил при последнем claim. 18.09 и 21.09
+-- «пересобран ли NL» выясняли по косвенным полям; теперь расхождение — тревога сторожа.
+CREATE TABLE IF NOT EXISTS external_worker_consumers (
+  consumer       TEXT PRIMARY KEY,           -- EXTERNAL_WORKER_ID без #потока
+  queues         TEXT[] NOT NULL DEFAULT '{}',
+  build          TEXT,                       -- git SHA образа; NULL — сборка до контракта
+  contract       INTEGER,                    -- NULL — воркер номер не прислал
+  first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 -- Идемпотентность биллинга AI (баг H1/T2): один (job_id, article_id, stage) — одна строка.
 -- Повторное применение результата задачи (ретрай/переотдача воркера) НЕ двоит ai_processing_runs
 -- → нет двойного счёта OpenAI. NULL job_id (локальный путь) и NULL article_id (дайджест) не

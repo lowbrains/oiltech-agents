@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 from dateutil import parser as dateparser
+from lxml import etree
+from lxml import html as lxml_html
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
@@ -99,8 +101,40 @@ def _normalize_url(url: str) -> str:
         return (url or "").strip().lower()
 
 
+# Параметры query, которые говорят, ОТКУДА пришёл читатель, а не КАКАЯ это статья.
+# Список — по замеру всех адресов прода 25.09, а не «из общих соображений»: `from` у РБК
+# (1935 адресов, 18 значений на одни и те же статьи), `ysclid` (Яндекс), подписи `gaa_*`;
+# остальное — общеизвестная метка рекламных систем. Всё прочее в query — номер статьи:
+# `id`, `ID`, `rid`, `news-item`, `id_4`, `ELEMENT_ID`, `itemid`…
+# Список продублирован в бэкфилле `url_key` в schema.sql — правка здесь без правки там
+# даёт красный тест (тест строит адреса из этого самого списка).
+# У `request_parser._TRACKING_PARAMS` другая задача — чистит адрес, по которому качаем
+# страницу, — и там список уже; ключу тождества это не мешает, пока там нет имён, которых
+# нет здесь.
+_TRACKING_QUERY_PARAMS = frozenset({
+    "from", "ysclid", "yclid", "ymclid", "fbclid", "gclid", "igshid", "_openstat",
+    "mc_cid", "mc_eid",
+})
+_TRACKING_QUERY_PREFIXES = ("utm_", "gaa_")
+
+
+def _identity_query(query: str) -> str:
+    """Значимая часть query: без трекинговых параметров, в порядке по алфавиту.
+
+    Пары берутся как есть, без раскодирования, — тем же правилом считает бэкфилл в
+    schema.sql, и ключи из Python и из SQL обязаны совпадать до символа.
+    """
+    pairs = []
+    for pair in query.split("&"):
+        name = pair.split("=", 1)[0]
+        if not pair or name in _TRACKING_QUERY_PARAMS or name.startswith(_TRACKING_QUERY_PREFIXES):
+            continue
+        pairs.append(pair)
+    return "&".join(sorted(pairs))
+
+
 def url_key(url: str) -> str:
-    """Ключ тождества статьи по адресу: host+path, без схемы, www, query и слэша.
+    """Ключ тождества статьи по адресу: host+path+значимый query, без схемы, www и слэша.
 
     Замер прода 13.09: за 90 дней 940 лишних статей — это ОДИН И ТОТ ЖЕ адрес в разных
     написаниях. Три причины поимённо: query-хвосты (`?from=main_lines_11` против
@@ -109,13 +143,27 @@ def url_key(url: str) -> str:
     занимала отдельную карточку в ленте — ровно то, на что жаловался заказчик
     («все 4 новости об одном»).
 
+    Query 13.09 срезался ЦЕЛИКОМ — и это склеило все статьи сайтов, где номер статьи
+    живёт в query: 25.09 у Минэнерго отбивались 25 пунктов ленты из 25, у EIA 17 из 18,
+    у РГУ Губкина 257 из 260, свежие релизы Лукойла и Новатэка — как «дубль» статьи
+    месячной давности; схема 13.09 заодно спрятала уже собранные. Теперь срезаются только
+    трекинговые параметры (`_TRACKING_QUERY_PARAMS`), остальные остаются в ключе.
+
     ОТДЕЛЬНАЯ функция, а не вызов `_normalize_url`, по двум причинам: здесь дополнительно
     снимается `www.` (тот же материал приходит и с ним, и без), и по этому ключу строится
     уникальность в БД — менять `_normalize_url` нельзя, на нём висят уже посчитанные
     `content_hash` всего корпуса.
     """
     base = _normalize_url(url)
-    return base[4:] if base.startswith("www.") else base
+    base = base[4:] if base.startswith("www.") else base
+    try:
+        parts = urlsplit((url or "").strip().lower())
+    except ValueError:
+        return base
+    if not parts.netloc:
+        return base  # не адрес — _normalize_url уже вернул строку целиком
+    identity = _identity_query(parts.query)
+    return f"{base}?{identity}" if identity else base
 
 
 def compute_content_hash(title: str, url: str) -> str:
@@ -326,3 +374,59 @@ def strip_emoji(text: str | None) -> str:
     cleaned = _EMOJI_MODIFIER_RE.sub("", cleaned)
     cleaned = _EMOJI_GAP_RE.sub(" ", cleaned)
     return cleaned.strip(" \t  ")
+
+
+_META_CHARSET_RE = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([a-zA-Z0-9_\-]+)""", re.I)
+_XML_DECLARATION_RE = re.compile(r"^\s*<\?xml[^>]*\?>")
+
+
+def decode_html(content: bytes | str) -> str:
+    """Байты страницы → текст. Всегда сами, а не силами lxml.
+
+    Загрузчик отдаёт сырые байты. lxml (libxml2 2.13) при разборе байтов НЕ учитывает
+    HTML5-форму `<meta charset="utf-8">` — проверено на проде 18.09 на Сколтехе и
+    Белоруснефти: кодировка объявлена на 481-м и 1387-м байте, а заголовок всё равно
+    «Ð\x9dÐ¾Ð²Ð¾…». Из уже декодированной строки те же страницы разбираются верно.
+    Итог на проде до правки: 58 статей с испорченными заголовком и текстом.
+
+    Объявлена кодировка — декодируем ею (несколько битых байтов не повод сменить
+    кодировку всей страницы — их заменяем). Не объявлена — строгий UTF-8, затем
+    cp1251 (старые российские сайты), затем Latin-1.
+    """
+    if isinstance(content, str):
+        return content
+    raw = bytes(content)
+    declared = _META_CHARSET_RE.search(raw[:16384])
+    if declared:
+        encoding = declared.group(1).decode("ascii", "ignore").lower()
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            return raw.decode(encoding, errors="replace")
+        except LookupError:
+            pass  # кодировка с опечаткой — определяем сами
+    for encoding in ("utf-8", "cp1251"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
+def parse_html(content: bytes | str):
+    """lxml-документ страницы с верной кодировкой (см. decode_html).
+
+    Пустое тело при 200 (или одни пробелы/комментарий) lxml встречает ParserError
+    «Document is empty» — это НЕ ValueError, и все места разбора, ловящие ValueError,
+    пропускали его: одна пустая страница обрывала весь источник (у агентов 21.09 —
+    весь прогон радара). Здесь он становится ValueError — один шов на всех вызывающих."""
+    text = decode_html(content)
+    try:
+        try:
+            return lxml_html.fromstring(text)
+        except ValueError:
+            # «Unicode strings with encoding declaration are not supported» — XML-декларация
+            # в строке lxml не принимает; кодировку мы уже применили, декларация не нужна.
+            return lxml_html.fromstring(_XML_DECLARATION_RE.sub("", text, count=1))
+    except etree.ParserError as exc:
+        raise ValueError(f"empty document: {exc}") from exc

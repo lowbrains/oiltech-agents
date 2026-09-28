@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { getMonthlyStats } from "../../api/stats";
-import type { MonthlyStats } from "../../api/types";
+import { getMonthlyAnalytics, getMonthlyStats } from "../../api/stats";
+import type { MonthlyAnalytics, MonthlyStats } from "../../api/types";
+import { AnalyticsOverview } from "./AnalyticsOverview";
+import { monthLabel, trimLeadingEmpty } from "./analytics";
+import styles from "./Statistics.module.css";
 
 type ToastWriter = (text: string, tone?: "default" | "error") => void;
 
@@ -28,7 +31,9 @@ function pct(part: number, total: number): string {
 
 export function StatisticsPage({ onUnauthorized, showToast }: Props) {
   const [data, setData] = useState<MonthlyStats | null>(null);
+  const [analytics, setAnalytics] = useState<MonthlyAnalytics | null>(null);
   const [months, setMonths] = useState<number>(6);
+  const [month, setMonth] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -38,7 +43,9 @@ export function StatisticsPage({ onUnauthorized, showToast }: Props) {
   async function reload(period: number) {
     try {
       setLoading(true);
-      setData(await getMonthlyStats(period));
+      const [stats, overview] = await Promise.all([getMonthlyStats(period), getMonthlyAnalytics(period)]);
+      setData(stats);
+      setAnalytics(overview);
     } catch (error) {
       if (error instanceof Error && error.message.includes("401")) {
         onUnauthorized();
@@ -101,6 +108,10 @@ export function StatisticsPage({ onUnauthorized, showToast }: Props) {
   }, [platform]);
 
   const totalCost = [...costByMonth.values()].reduce((acc, v) => acc + v.cost, 0);
+  const shownMonths = useMemo(() => trimLeadingEmpty(analytics?.months ?? []), [analytics]);
+  const selectedMonth = month && shownMonths.some((m) => m.month === month)
+    ? month
+    : shownMonths[shownMonths.length - 1]?.month ?? null;
 
   return (
     <section className="screenStack">
@@ -123,13 +134,27 @@ export function StatisticsPage({ onUnauthorized, showToast }: Props) {
         </div>
       </header>
 
-      {loading && <div className="emptyState">Считаем статистику…</div>}
+      {loading && !analytics && <div className="emptyState">Считаем статистику…</div>}
+      {analytics && selectedMonth && (
+        <div className={styles.viz} style={{ display: "flex", flexDirection: "column", gap: 16, opacity: loading ? 0.6 : 1 }}>
+          <div className={styles.chips} role="group" aria-label="Месяц">
+            {shownMonths.map((m) => (
+              <button key={m.month} type="button" aria-pressed={m.month === selectedMonth}
+                className={`${styles.chip} ${m.month === selectedMonth ? styles.chipActive : ""}`}
+                onClick={() => setMonth(m.month)}>
+                {monthLabel(m.month)}{m.complete ? "" : " · идёт"}
+              </button>
+            ))}
+          </div>
+          <AnalyticsOverview data={analytics} months={shownMonths} month={selectedMonth} />
+        </div>
+      )}
 
-      {!loading && data && (
+      {data && (
         <>
           <section className="panel">
             <div className="panelHeader">
-              <h3>Воронка: от сбора до дайджеста</h3>
+              <h3>Воронка по месяцам — таблица</h3>
               <div className="statusPill">
                 {grand.collected} собрано · {grand.digest_ready} годных
               </div>

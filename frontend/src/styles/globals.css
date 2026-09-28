@@ -589,7 +589,7 @@ button {
 .sourceFiltersGrid {
   margin-top: 12px;
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 150px 150px 170px 190px 120px;
+  grid-template-columns: minmax(220px, 1fr) 180px 230px 120px;
   gap: 8px;
   align-items: end;
 }
@@ -1264,6 +1264,19 @@ button {
   font-weight: 700;
 }
 
+.laneAlerts {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--sem-bad-border);
+  background: var(--sem-bad-bg);
+  color: var(--sem-bad-fg);
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+
 .externalQueueList {
   margin-top: 12px;
   display: grid;
@@ -1285,6 +1298,12 @@ button {
 .externalQueueRow span {
   color: var(--text-muted);
   font-weight: 700;
+}
+
+/* Воркер NL с другим номером контракта, чем у ядра: пересобран не тот или не весь NL. */
+.externalQueueRow.contractMismatch {
+  border-color: var(--sem-bad-border);
+  background: var(--sem-bad-bg);
 }
 
 .compactEmptyState {
@@ -1996,6 +2015,37 @@ button {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Окно месяца: переключатель архива и плашка «только просмотр» (ADR 0001, п. 6). */
+.archiveMonthSelect {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.archiveMonthSelect span {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.archiveNotice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border: 1px solid var(--sem-warn-border);
+  border-radius: 12px;
+  background: var(--sem-warn-bg);
+  color: var(--sem-warn-fg);
+  font-weight: 600;
 }
 
 .articlesAdvancedGrid {
@@ -2394,6 +2444,21 @@ button {
   flex-wrap: wrap;
 }
 
+/* Шапка панели настроек с кнопками («Сохранить», «Нормализовать»): отступ от первой
+   карточки — кнопки прилипали к ней (документ заказчика 19.09, «Теги» и «Скоринг»). */
+.settingsHeader {
+  margin-bottom: 14px;
+}
+
+/* «Удалить» внизу карточки — справа и за линией, а не вплотную под полем. */
+.settingsCardFoot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
 .dangerButton {
   color: var(--sem-bad-fg);
   border-color: rgba(239, 68, 68, 0.26);
@@ -2403,38 +2468,6 @@ button {
 .warningPill {
   color: var(--sem-warn-fg);
   background: var(--sem-warn-bg);
-}
-
-.tagRowRoot,
-.tagRowChild {
-  display: grid;
-  grid-template-columns: 64px minmax(160px, 0.8fr) minmax(240px, 1.6fr) auto;
-  gap: 12px;
-  align-items: end;
-}
-
-/* Родительский тег — выделенная «шапка» группы с бренд-акцентом (видно иерархию). */
-.tagRowRoot {
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: var(--brand-soft);
-  border: 1px solid rgba(37, 99, 235, 0.16);
-}
-
-/* Дети — с визуальной направляющей (рельсой) и отступом: явная вложенность. */
-.tagChildrenList {
-  margin: 12px 0 0 18px;
-  padding-left: 16px;
-  display: grid;
-  gap: 10px;
-  border-left: 2px dashed rgba(37, 99, 235, 0.22);
-}
-
-.tagRowChild {
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: rgba(248, 250, 252, 0.92);
-  border: 1px solid var(--line);
 }
 
 /* Пользователи (админ): форма добавления + строки списка — выровнены по сетке,
@@ -2455,13 +2488,6 @@ button {
   grid-template-columns: minmax(0, 1.6fr) minmax(150px, 0.5fr) auto;
   gap: 12px 16px;
   align-items: end;
-}
-
-.sourceCardGrid {
-  margin-top: 12px;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 12px;
 }
 
 .sourceCardReact {
@@ -2787,20 +2813,6 @@ button {
   background: var(--sem-muted-bg);
 }
 
-/* Вид источника (ЧЕМ читаем: RSS / страница / браузер / Telegram).
-   НАМЕРЕННО нейтральный, без семантики .ok/.warn/.bad: у вида источника нет
-   качества, и покрасить «telegram» в красный значило бы сказать, что он сломан.
-   Семантические токены выше означают «работает / застой / сломан» — их не трогаем. */
-.typePill {
-  border-radius: 999px;
-  padding: 5px 8px;
-  font-size: 0.72rem;
-  font-weight: 700;
-  color: var(--text-muted);
-  background: transparent;
-  border: 1px solid var(--sem-muted-bg);
-}
-
 /* draft/info = намеренный «info»-токен (требует действия), не случайный цвет. */
 .miniPill.draft,
 .miniPill.info {
@@ -2994,8 +3006,6 @@ button {
   .digestBrandingWorkspace,
   .digestSocialRow,
   .digestLayout,
-  .tagRowRoot,
-  .tagRowChild,
   .userAddGrid,
   .userRow,
   .articleDetailGrid {
@@ -5435,25 +5445,6 @@ button {
   .documentUploadGrid {
     grid-template-columns: 1fr;
   }
-}
-
-/* Архив источников — отдельный свёрнутый раздел внизу каталога. */
-.sourceArchiveSection {
-  margin-top: 24px;
-  border-top: 1px solid var(--sem-muted-bg);
-  padding-top: 16px;
-}
-
-.sourceArchiveSection > summary {
-  cursor: pointer;
-  font-weight: 800;
-  color: var(--text-muted);
-  padding: 8px 0;
-}
-
-.sourceArchiveSection > .sourceCardGrid {
-  margin-top: 12px;
-  opacity: 0.75;
 }
 
 /* ---------------------------------------------------------------------------

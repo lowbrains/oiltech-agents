@@ -28,6 +28,14 @@
 
 ## ⚠️ Выкат ядра агентов на РФ — только так (инцидент 20–21.09)
 
+**Код единого контура (сессия A, PR #1) до переключения D не выкатывать — ни командами ниже, ни
+пересборкой NL.** В нём радар и оценка кандидата встают в полосу `external-agents`, а воркер агентов
+на NL слушает только `external-ai`: радар молча встанет в очереди (сторожа `check-lanes` на агентном
+стеке нет). Compose NL в нём — пять полос с именами контейнеров MVP-1: пересборка остановит
+`oiltech_agents_external_worker` и упрётся в имя работающего воркера заказчика `oiltech_external_worker`.
+Выкат — только окном D
+(`docs/handoff_2026-09-21_single-contour-sessions.md`, «Сессия D»).
+
 ```bash
 cd /root/oiltech-agents && git fetch origin && git reset --hard origin/main
 docker compose -f docker-compose.yml -f docker-compose.server.yml build agents-app
@@ -37,7 +45,7 @@ docker compose -f docker-compose.yml -f docker-compose.server.yml up -d --no-dep
 - **Никогда** `up -d --build` без имени сервиса: 20.09 так поднялся планировщик агентов,
   за 8,5 ч задублировал сбор MVP-1 ($4,48 ИИ, 208 задач без потребителя) и выполнил радар
   дня на РФ-ядре (OpenAI 403 → радар 21.09 потерян). Теперь конвейер (`tasks`, `worker`,
-  `playwright-worker`, `scheduler`) — под профилем `pipeline`, `docs` — под `docs`: голый
+  `playwright-worker`, `scheduler`) — под профилем `pipeline`, `docs` — под `archive` (сессия B): голый
   `up` поднимает только `db`, `bootstrap`, `agents-app` (сторож — `tests/test_signal_radar_robustness.py`).
 - Внешние очереди (`external-*`) не исполняются в процессе, который ставит задачу, даже при
   `BACKGROUND_JOB_INLINE=1` (`background_jobs.runs_inline`).
@@ -46,6 +54,10 @@ docker compose -f docker-compose.yml -f docker-compose.server.yml up -d --no-dep
 - Проверка радара — только через очередь (`enqueue-signal-discovery … --dry-run`), не
   `discover-signals`: тот исполняется на РФ и всегда получает 403 от OpenAI.
 - NL-воркер пересобирает владелец (команда — в разделе «Радар сигналов через NL»).
+- Выкат NL (`scripts/deploy-nl.sh`) — не во время ежедневного радара (в едином контуре его ставит планировщик на первом цикле после 00:00 МСК, до D — крон 07:15 МСК; прогон до ~20 мин):
+  перезапускается и `external-worker-agents`, а прогон радара по частям не сохраняется (`signal_discovery`
+  не в `PARTIAL_KINDS`) — начнётся заново, с повторными запросами к Brave и судье. Проверка на ядре:
+  `cli external-queues-status` (у `external-agents` running=0) или `cli live-ai-leases`. Страж в скрипте — задача D.
 
 ## Развязка и выкат (18.09)
 
@@ -101,6 +113,7 @@ Encrypt, отдаётся фронтенд агентов с новым рада
 `SOURCE_DISCOVERY_SEARCH_PROVIDER=brave` и ключ Brave — без них поиск вернёт 0 и радар молча
 не найдёт ничего. Пересборка после правок воркерной части (например, дедупа):
 `cd /root/oiltech-agents && git fetch origin && git reset --hard origin/main && docker compose -p oiltech-agents-worker -f docker-compose.external-worker.yml up -d --build`.
+⚠️ Не для кода единого контура до D — см. предупреждение в разделе «Выкат ядра агентов на РФ».
 
 ## Дедуп радара (18.09, `b1a73df`)
 
